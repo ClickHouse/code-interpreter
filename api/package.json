@@ -1,0 +1,24 @@
+{
+  "name": "sandbox-api",
+  "version": "2.0.0",
+  "description": "NsJail-based sandbox API for code execution",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "build": "bun build ./src/index.ts --minify --outdir .build --target bun",
+    "start": "bun run .build/index.js",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "express": "^4.22.1",
+    "nanoid": "^3.3.7",
+    "pino": "^10.3.0",
+    "semver": "^7.7.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.13",
+    "@types/express": "^5.0.0",
+    "@types/semver": "^7.5.8",
+    "typescript": "^5.7.3"
+  }
+}

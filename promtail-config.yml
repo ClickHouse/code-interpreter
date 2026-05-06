@@ -1,0 +1,49 @@
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions_${HOSTNAME}.yaml
+
+clients:
+  - url: http://10.136.0.25:3100/loki/api/v1/push
+    backoff_config:
+      min_period: 1s
+      max_period: 5s
+      max_retries: 10
+    timeout: 10s
+
+scrape_configs:
+  - job_name: docker_logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: docker
+          instance: ${HOSTNAME}
+          __path__: /var/lib/docker/containers/*/*-json.log
+    pipeline_stages:
+      - json:
+          expressions:
+            log: log
+      - output:
+          source: log
+
+  - job_name: file_server_logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: app_logs
+          service: file_server
+          instance: ${HOSTNAME}
+          __path__: /logs/file-server/combined-*.log
+
+  - job_name: service_logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: app_logs
+          service: service
+          instance: ${HOSTNAME}
+          __path__: /logs/service/combined-*.log

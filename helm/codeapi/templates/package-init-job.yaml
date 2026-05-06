@@ -1,0 +1,73 @@
+{{/*
+Package Init Job
+Runs as a Helm pre-install/pre-upgrade hook to populate the packages PVC
+with Python, Node, Bun, and Bash runtimes for the NsJail sandbox.
+*/}}
+{{- if and .Values.workerSandbox.enabled .Values.workerSandbox.packages.initJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "codeapi.fullname" . }}-package-init
+  labels:
+    {{- include "codeapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: package-init
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.workerSandbox.packages.initJob.backoffLimit }}
+  {{- if .Values.workerSandbox.packages.initJob.ttlSecondsAfterFinished }}
+  ttlSecondsAfterFinished: {{ .Values.workerSandbox.packages.initJob.ttlSecondsAfterFinished }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "codeapi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: package-init
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Never
+      containers:
+        - name: package-init
+          image: "{{ .Values.workerSandbox.packages.initJob.image.repository }}:{{ .Values.workerSandbox.packages.initJob.image.tag }}"
+          imagePullPolicy: {{ .Values.workerSandbox.packages.initJob.image.pullPolicy }}
+          env:
+            - name: PYTHON_VERSION
+              value: {{ .Values.workerSandbox.packages.initJob.pythonVersion | quote }}
+            - name: NODE_VERSION
+              value: {{ .Values.workerSandbox.packages.initJob.nodeVersion | quote }}
+            - name: BUN_VERSION
+              value: {{ .Values.workerSandbox.packages.initJob.bunVersion | quote }}
+            - name: BASH_PACKAGE_VERSION
+              value: {{ .Values.workerSandbox.packages.initJob.bashPackageVersion | quote }}
+            - name: FORCE_REBUILD
+              value: {{ .Values.workerSandbox.packages.initJob.forceRebuild | quote }}
+          volumeMounts:
+            - name: packages
+              mountPath: /piston/packages
+          resources:
+            {{- toYaml .Values.workerSandbox.packages.initJob.resources | nindent 12 }}
+      volumes:
+        - name: packages
+          {{- if .Values.workerSandbox.packages.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.workerSandbox.packages.persistence.existingClaim }}
+          {{- else if .Values.workerSandbox.packages.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "codeapi.fullname" . }}-piston-packages
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

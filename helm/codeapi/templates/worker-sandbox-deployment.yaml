@@ -1,0 +1,207 @@
+{{/*
+Worker-Sandbox Deployment (MicroVM)
+Each pod runs a single combined container with:
+  - libkrun microVM launcher (boots sandbox with its own guest kernel)
+  - Worker process (job processor)
+  - supervisor.sh manages both processes
+
+Only requires /dev/kvm — no privileged mode, no Linux capabilities.
+
+Default: 3 replicas = 15 concurrent Python jobs (3 pods × 5 concurrency)
+*/}}
+{{- if .Values.workerSandbox.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codeapi.fullname" . }}-worker-sandbox
+  labels:
+    {{- include "codeapi.workerSandbox.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.workerSandbox.autoscaling.enabled }}
+  replicas: {{ .Values.workerSandbox.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "codeapi.workerSandbox.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "codeapi.workerSandbox.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      
+      initContainers:
+        - name: wait-for-redis
+          image: busybox:1.36.1
+          command: ['sh', '-c', 'until nc -z {{ include "codeapi.redis.host" . }} {{ include "codeapi.redis.port" . }}; do echo waiting for redis; sleep 2; done']
+      
+      {{- if .Values.workerSandbox.kvmEnabled }}
+      securityContext:
+        supplementalGroups: [{{ .Values.workerSandbox.kvmGid | default 108 }}]
+      {{- end }}
+      
+      containers:
+        - name: worker-sandbox
+          image: "{{ .Values.workerSandbox.image.repository }}:{{ .Values.workerSandbox.image.tag }}"
+          imagePullPolicy: {{ .Values.workerSandbox.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.workerSandbox.healthPort }}
+              protocol: TCP
+            - name: sandbox
+              containerPort: {{ .Values.workerSandbox.sandbox.port }}
+              protocol: TCP
+          env:
+            # KVM / microVM mode
+            - name: KVM_ENABLED
+              value: {{ .Values.workerSandbox.kvmEnabled | quote }}
+            # Launcher config (microVM, only used when KVM_ENABLED=true)
+            - name: LAUNCHER_VCPUS
+              value: {{ .Values.workerSandbox.launcher.vcpus | default 2 | quote }}
+            - name: LAUNCHER_RAM_MIB
+              value: {{ .Values.workerSandbox.launcher.ramMib | default 2048 | quote }}
+            - name: LAUNCHER_LOG_LEVEL
+              value: {{ .Values.workerSandbox.launcher.logLevel | default 3 | quote }}
+            # Sandbox config (passed through to microVM guest)
+            - name: SANDBOX_LOG_LEVEL
+              value: "INFO"
+            - name: SANDBOX_MAX_PROCESS_COUNT
+              value: {{ .Values.workerSandbox.sandbox.maxProcessCount | quote }}
+            - name: SANDBOX_RUN_CPU_TIME
+              value: {{ .Values.workerSandbox.sandbox.runCpuTime | quote }}
+            - name: SANDBOX_RUN_TIMEOUT
+              value: {{ .Values.workerSandbox.sandbox.runTimeout | quote }}
+            - name: SANDBOX_OUTPUT_MAX_SIZE
+              value: {{ .Values.workerSandbox.sandbox.outputMaxSize | quote }}
+            - name: SANDBOX_DISABLE_NETWORKING
+              value: {{ .Values.workerSandbox.sandbox.disableNetworking | quote }}
+            - name: FILE_SERVER_URL
+              value: "http://{{ include "codeapi.fullname" . }}-file-server:{{ .Values.fileServer.service.port }}"
+            - name: SANDBOX_ALLOWED_LOCAL_NETWORK_PORT
+              value: {{ .Values.toolCallServer.service.port | quote }}
+            - name: SANDBOX_FORWARD_TARGET
+              value: "{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
+            # Worker config
+            - name: SANDBOX_ENDPOINT
+              value: "http://localhost:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
+            - name: REDIS_HOST
+              value: {{ include "codeapi.redis.host" . }}
+            - name: REDIS_PORT
+              value: {{ include "codeapi.redis.port" . | quote }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: redis-password
+            - name: TOOL_CALL_SERVER_URL
+              value: "http://{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: codeapi-internal-service-token
+            - name: PYTHON_CONCURRENCY
+              value: {{ .Values.workerSandbox.config.pythonConcurrency | quote }}
+            - name: OTHER_CONCURRENCY
+              value: {{ .Values.workerSandbox.config.otherConcurrency | quote }}
+            - name: JOB_WINDOW
+              value: {{ .Values.workerSandbox.config.jobWindow | quote }}
+            - name: JOB_TIMEOUT
+              value: {{ .Values.workerSandbox.config.jobTimeout | quote }}
+            - name: WORKER_HEALTH_PORT
+              value: {{ .Values.workerSandbox.healthPort | quote }}
+            {{- with .Values.workerSandbox.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: piston-packages
+              mountPath: /host-packages
+              readOnly: true
+            {{- if .Values.workerSandbox.kvmEnabled }}
+            - name: dev-kvm
+              mountPath: /dev/kvm
+            {{- end }}
+          {{- if .Values.workerSandbox.kvmEnabled }}
+          securityContext:
+            privileged: false
+          {{- else }}
+          securityContext:
+            privileged: false
+            seccompProfile:
+              type: Unconfined  # nsjail applies its own per-execution seccomp filter
+            capabilities:
+              add:
+                - SYS_ADMIN      # bind-mount /proc,/sys,/dev into rootfs
+                - SYS_CHROOT     # chroot into sandbox rootfs
+                - SYS_PTRACE     # nsjail namespace tracing
+                - SETUID
+                - SETGID
+                - NET_ADMIN
+                - DAC_OVERRIDE
+                - DAC_READ_SEARCH
+                - CHOWN
+                - FOWNER
+                - FSETID
+                - KILL
+                - SETFCAP
+                - MKNOD
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.workerSandbox.resources.requests.cpu }}
+              memory: {{ .Values.workerSandbox.resources.requests.memory }}
+            {{- with .Values.workerSandbox.resources.limits }}
+            limits:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      
+      volumes:
+        - name: piston-packages
+          {{- if .Values.workerSandbox.packages.hostPath }}
+          hostPath:
+            path: {{ .Values.workerSandbox.packages.hostPath }}
+            type: Directory
+          {{- else if .Values.workerSandbox.packages.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.workerSandbox.packages.persistence.existingClaim }}
+          {{- else if .Values.workerSandbox.packages.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "codeapi.fullname" . }}-piston-packages
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.workerSandbox.kvmEnabled }}
+        - name: dev-kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        {{- end }}
+      
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

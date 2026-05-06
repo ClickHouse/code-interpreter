@@ -1,0 +1,71 @@
+import express from 'express';
+import { loadPackages } from './runtime';
+import { logger } from './logger';
+import { config } from './config';
+import v2Router from './api/v2';
+
+const app = express();
+
+app.use(express.urlencoded({ extended: true }));
+/** No global `express.json()` is registered here on purpose. A global parser
+ * runs *before* any route-level middleware, so its limit is the effective
+ * cap for every endpoint regardless of any per-route override (a global
+ * default-limit parser would always reject `/api/v2/execute`'s large replay
+ * payloads with `PayloadTooLargeError` before the route's 50mb parser could
+ * fire). Each route brings its own JSON parser with the right limit:
+ *   - `/api/v2/execute` -> `express.json({ limit: '50mb' })` (replay PTC)
+ *   - other POSTs       -> default `express.json()`
+ *   - `GET /api/v2/runtimes`, `GET /` -> no body -> no parser needed.
+ * `services/codeapi/api/src/api/v2.ts` is responsible for installing the
+ * right parser per route. */
+
+loadPackages(config.data_directory);
+
+logger.info('Registering routes');
+app.use('/api/v2', v2Router);
+
+app.get('/', (_req, res) => {
+  return res.status(200).json({ message: 'Sandbox v2.0.0 (nsjail)' });
+});
+
+app.use((_req, res) => {
+  return res.status(404).json({ message: 'Not Found' });
+});
+
+/** Express resolves error handlers strictly *forward* from the position
+ * where `next(err)` was called, so this MUST be the last `app.use` for it
+ * to catch errors from the v2 router (e.g. body-parser's
+ * `PayloadTooLargeError` from the route-level `express.json({ limit: '50mb' })`
+ * on `/execute`, or `SyntaxError` from malformed JSON). When this lived
+ * before the router it was effectively dead code for route-originated
+ * errors, and Express's built-in handler (plain text body) was firing
+ * instead — breaking clients that rely on the structured JSON shape.
+ *
+ * `err.status` is set by `body-parser` (413 for oversize, 400 for bad
+ * JSON) and we forward it verbatim so callers can distinguish; legacy
+ * `err.statusCode` is also honored for forward compatibility. */
+interface HttpError extends Error {
+  status?: number;
+  statusCode?: number;
+}
+app.use((err: HttpError, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error({ err }, 'Unhandled error');
+  const status = err.status ?? err.statusCode ?? 400;
+  return res.status(status).json({ message: err.message || 'Bad request' });
+});
+
+const [address, port] = config.bind_address.split(':');
+
+const server = app.listen(Number(port), address, () => {
+  logger.info({ address: config.bind_address }, 'Sandbox API started');
+});
+
+process.on('SIGTERM', () => {
+  server.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  server.close();
+  process.exit(0);
+});

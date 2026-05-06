@@ -1,0 +1,29 @@
+# Package Init Dockerfile
+# Builds Python, Node, Bun, and Bash runtime packages for the NsJail sandbox.
+# Runs as a Kubernetes init job to populate the packages PVC.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.package-init -t codeapi-package-init .
+#   docker run -v packages:/piston/packages codeapi-package-init
+
+FROM buildpack-deps:bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl unzip wget ca-certificates \
+    build-essential libssl-dev libffi-dev libsqlite3-dev \
+    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
+    tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
+    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+    libfreetype6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /piston/packages
+
+COPY docker/package-init.sh /package-init.sh
+COPY javascript-packages.txt /javascript-packages.txt
+RUN chmod +x /package-init.sh
+
+CMD ["/package-init.sh"]

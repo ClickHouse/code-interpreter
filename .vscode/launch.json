@@ -1,0 +1,46 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug API",
+      "type": "node",
+      "request": "attach",
+      "remoteRoot": "/sandbox_api/src",
+      "localRoot": "${workspaceFolder}/api/src",
+      "port": 9229,
+      "restart": true,
+      "address": "localhost",
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "docker-compose-debug-up"
+    },
+    {
+      "name": "Debug File Server (Docker)",
+      "type": "node",
+      "request": "attach",
+      "remoteRoot": "/app",
+      "localRoot": "${workspaceFolder}/../code-execution-lambda",
+      "port": 9230,
+      "restart": true,
+      "address": "localhost",
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "docker-compose-debug-up"
+    },
+    {
+      "name": "Debug File Server (Local)",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["--nolazy", "-r", "ts-node/register/transpile-only"],
+      "args": ["src/files/server.ts"],
+      "cwd": "${workspaceFolder}/../code-execution-lambda",
+      "internalConsoleOptions": "openOnSessionStart",
+      "skipFiles": ["<node_internals>/**", "node_modules/**"]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Debug All",
+      "configurations": ["Debug API", "Debug File Server (Docker)"]
+    }
+  ]
+}

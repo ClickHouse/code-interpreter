@@ -1,0 +1,388 @@
+use std::env;
+use std::ffi::CString;
+use std::process;
+
+#[allow(non_camel_case_types)]
+mod ffi {
+    use libc::{c_char, c_int};
+
+    extern "C" {
+        pub fn krun_set_log_level(level: u32) -> i32;
+        pub fn krun_create_ctx() -> i32;
+        pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
+        pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> i32;
+        pub fn krun_add_virtiofs(
+            ctx_id: u32,
+            c_tag: *const c_char,
+            c_path: *const c_char,
+        ) -> i32;
+        pub fn krun_set_port_map(ctx_id: u32, port_map: *const *const c_char) -> i32;
+        pub fn krun_set_exec(
+            ctx_id: u32,
+            exec_path: *const c_char,
+            argv: *const *const c_char,
+            envp: *const *const c_char,
+        ) -> i32;
+        pub fn krun_start_enter(ctx_id: u32) -> i32;
+    }
+
+    pub fn check(name: &str, ret: c_int) {
+        if ret < 0 {
+            eprintln!("[launcher] {name} failed: error {ret}");
+            std::process::exit(1);
+        }
+    }
+}
+
+mod seccomp {
+    use std::mem;
+
+    const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const EPERM: u32 = 1;
+
+    const BPF_LD: u16 = 0x00;
+    const BPF_W: u16 = 0x00;
+    const BPF_ABS: u16 = 0x20;
+    const BPF_JMP: u16 = 0x05;
+    const BPF_JEQ: u16 = 0x10;
+    const BPF_K: u16 = 0x00;
+    const BPF_RET: u16 = 0x06;
+
+    #[repr(C)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+
+    fn bpf_stmt(code: u16, k: u32) -> SockFilter {
+        SockFilter { code, jt: 0, jf: 0, k }
+    }
+
+    fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
+        SockFilter { code, jt, jf, k }
+    }
+
+    /// Syscalls the VMM needs (from strace profiling of comprehensive workloads).
+    /// Default action: ERRNO(EPERM) for anything not on this list.
+    /// Note: ioctl is handled separately with argument filtering.
+    fn allowed_syscalls() -> Vec<u32> {
+        let mut v = vec![
+            libc::SYS_read as u32,
+            libc::SYS_write as u32,
+            libc::SYS_openat as u32,
+            libc::SYS_close as u32,
+            libc::SYS_fstat as u32,
+            libc::SYS_newfstatat as u32,
+            libc::SYS_statx as u32,
+            libc::SYS_lseek as u32,
+            libc::SYS_mmap as u32,
+            libc::SYS_mprotect as u32,
+            libc::SYS_munmap as u32,
+            libc::SYS_madvise as u32,
+            libc::SYS_brk as u32,
+            libc::SYS_dup as u32,
+            libc::SYS_socket as u32,
+            libc::SYS_connect as u32,
+            libc::SYS_accept as u32,
+            libc::SYS_sendto as u32,
+            libc::SYS_recvfrom as u32,
+            libc::SYS_bind as u32,
+            libc::SYS_listen as u32,
+            libc::SYS_setsockopt as u32,
+            libc::SYS_getpeername as u32,
+            libc::SYS_shutdown as u32,
+            libc::SYS_clone as u32,
+            libc::SYS_clone3 as u32,
+            libc::SYS_execve as u32,
+            libc::SYS_exit as u32,
+            libc::SYS_exit_group as u32,
+            libc::SYS_futex as u32,
+            libc::SYS_epoll_create1 as u32,
+            libc::SYS_epoll_ctl as u32,
+            libc::SYS_eventfd2 as u32,
+            libc::SYS_rt_sigaction as u32,
+            libc::SYS_rt_sigprocmask as u32,
+            libc::SYS_rt_sigreturn as u32,
+            libc::SYS_sigaltstack as u32,
+            libc::SYS_tgkill as u32,
+            libc::SYS_getpid as u32,
+            libc::SYS_getrandom as u32,
+            libc::SYS_sched_getaffinity as u32,
+            libc::SYS_sched_yield as u32,
+            libc::SYS_set_robust_list as u32,
+            libc::SYS_set_tid_address as u32,
+            libc::SYS_rseq as u32,
+            libc::SYS_prctl as u32,
+            libc::SYS_prlimit64 as u32,
+            libc::SYS_fcntl as u32,
+            libc::SYS_ftruncate as u32,
+            libc::SYS_pread64 as u32,
+            libc::SYS_preadv as u32,
+            libc::SYS_pwritev as u32,
+            libc::SYS_readlinkat as u32,
+            libc::SYS_getdents64 as u32,
+            libc::SYS_fstatfs as u32,
+            libc::SYS_fchmodat as u32,
+            libc::SYS_mkdirat as u32,
+            libc::SYS_mknodat as u32,
+            libc::SYS_unlinkat as u32,
+            libc::SYS_umask as u32,
+            libc::SYS_capget as u32,
+            libc::SYS_setresuid as u32,
+            libc::SYS_setresgid as u32,
+            libc::SYS_fgetxattr as u32,
+            libc::SYS_flistxattr as u32,
+        ];
+
+        #[cfg(target_arch = "x86_64")]
+        v.extend_from_slice(&[
+            libc::SYS_access as u32,
+            libc::SYS_epoll_wait as u32,
+            libc::SYS_poll as u32,
+            libc::SYS_arch_prctl as u32,
+        ]);
+
+        #[cfg(target_arch = "aarch64")]
+        v.extend_from_slice(&[
+            libc::SYS_faccessat as u32,
+            libc::SYS_epoll_pwait as u32,
+            libc::SYS_ppoll as u32,
+        ]);
+
+        v
+    }
+
+    pub fn apply_vmm_filter() -> Result<usize, String> {
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err("PR_SET_NO_NEW_PRIVS failed".into());
+            }
+        }
+
+        let nr_offset = memoffset_nr();
+        let arg1_offset = memoffset_args() + 8; // args[1] = ioctl request code
+
+        // Build the filter in two passes: first compute layout, then emit.
+        // Layout:
+        //   [0]        LD syscall nr
+        //   [1]        JEQ ioctl -> ioctl_block, else fall through
+        //   [2..2+N-1] JEQ allowed[i] -> allow, else fall through
+        //   [2+N]      RET ERRNO (default deny)
+        //   [2+N+1]    RET ALLOW
+        //   [2+N+2]    LD ioctl arg1 (request code)
+        //   [2+N+3]    AND 0xFF00 (mask to magic byte)
+        //   [2+N+4]    JEQ 0xAE00 (KVM) -> ioctl_allow, else fall through
+        //   [2+N+5]    JEQ 0x5400 (terminal) -> ioctl_allow, else ioctl_deny
+        //   [2+N+6]    RET ALLOW (ioctl_allow)
+        //   [2+N+7]    RET ERRNO (ioctl_deny)
+
+        let syscalls = allowed_syscalls();
+        let n = syscalls.len();
+        let idx_ioctl_jmp = 1;
+        let idx_checks    = 2;                // 2 .. 2+N-1
+        let idx_deny      = idx_checks + n;   // 2+N
+        let idx_allow     = idx_deny + 1;     // 2+N+1
+        let idx_ioctl_ld  = idx_allow + 1;    // 2+N+2
+        let idx_ioctl_and = idx_ioctl_ld + 1;
+        let idx_kvm_chk   = idx_ioctl_and + 1;
+        let idx_term_chk  = idx_kvm_chk + 1;
+        let idx_ioctl_ok  = idx_term_chk + 1;
+        let idx_ioctl_no  = idx_ioctl_ok + 1;
+
+        let mut f: Vec<SockFilter> = Vec::with_capacity(idx_ioctl_no + 1);
+
+        // [0] Load syscall number
+        f.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, nr_offset));
+
+        // [1] If ioctl, jump to ioctl arg filter block
+        f.push(bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_ioctl as u32,
+            (idx_ioctl_ld - idx_ioctl_jmp - 1) as u8,
+            0,
+        ));
+
+        // [2..2+N-1] Allowlist checks
+        for (i, &nr) in syscalls.iter().enumerate() {
+            let my_idx = idx_checks + i;
+            f.push(bpf_jump(
+                BPF_JMP | BPF_JEQ | BPF_K,
+                nr,
+                (idx_allow - my_idx - 1) as u8,
+                0,
+            ));
+        }
+
+        // [2+N] Default deny
+        f.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM));
+
+        // [2+N+1] Allow
+        f.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+
+        // [2+N+2] Load ioctl request code (arg1, lower 32 bits)
+        f.push(bpf_stmt(BPF_LD | BPF_W | BPF_ABS, arg1_offset));
+
+        // [2+N+3] Mask to magic byte: request & 0xFF00
+        f.push(bpf_stmt(0x54, 0x0000_FF00)); // BPF_ALU | BPF_AND | BPF_K
+
+        // [2+N+4] KVM magic (0xAE)
+        f.push(bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            0xAE00,
+            (idx_ioctl_ok - idx_kvm_chk - 1) as u8,
+            0,
+        ));
+
+        // [2+N+5] Terminal magic (0x54: TCGETS, TIOCGWINSZ, FIONREAD)
+        f.push(bpf_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            0x5400,
+            (idx_ioctl_ok - idx_term_chk - 1) as u8,
+            (idx_ioctl_no - idx_term_chk - 1) as u8,
+        ));
+
+        // [2+N+6] ioctl allow
+        f.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+
+        // [2+N+7] ioctl deny
+        f.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM));
+
+        assert_eq!(f.len(), idx_ioctl_no + 1);
+
+        let prog = SockFprog {
+            len: f.len() as u16,
+            filter: f.as_ptr(),
+        };
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER as libc::c_ulong,
+                0 as libc::c_ulong,
+                &prog as *const SockFprog as libc::c_ulong,
+            )
+        };
+
+        if ret != 0 {
+            return Err(format!("seccomp(SECCOMP_SET_MODE_FILTER) failed: {}", ret));
+        }
+
+        Ok(syscalls.len() + 1) // +1 for ioctl (arg-filtered)
+    }
+
+    fn memoffset_nr() -> u32 {
+        mem::offset_of!(SeccompData, nr) as u32
+    }
+
+    fn memoffset_args() -> u32 {
+        mem::offset_of!(SeccompData, args) as u32
+    }
+
+    #[repr(C)]
+    struct SeccompData {
+        nr: i32,
+        arch: u32,
+        instruction_pointer: u64,
+        args: [u64; 6],
+    }
+}
+
+fn cstr(s: &str) -> CString {
+    CString::new(s).expect("CString::new failed")
+}
+
+fn null_term(v: &[CString]) -> Vec<*const libc::c_char> {
+    let mut ptrs: Vec<*const libc::c_char> = v.iter().map(|s| s.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    ptrs
+}
+
+fn main() {
+    let vcpus: u8 = env::var("LAUNCHER_VCPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    let ram_mib: u32 = env::var("LAUNCHER_RAM_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    let rootfs = env::var("LAUNCHER_ROOTFS").unwrap_or_else(|_| "/sandbox-rootfs".into());
+    let exec_path = env::var("LAUNCHER_EXEC").unwrap_or_else(|_| "/sandbox_api/entrypoint.sh".into());
+    let log_level: u32 = env::var("LAUNCHER_LOG_LEVEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+
+    eprintln!("[launcher] Booting microVM: vcpus={vcpus} ram={ram_mib}MiB rootfs={rootfs}");
+    eprintln!("[launcher] Guest entrypoint: {exec_path}");
+
+    let rootfs_c = cstr(&rootfs);
+    let exec_c = cstr(&exec_path);
+
+    let port_map_strs = vec![cstr("2000:2000")];
+    let port_map_ptrs = null_term(&port_map_strs);
+
+    let env_strs: Vec<CString> = env::vars()
+        .filter(|(k, _)| !k.starts_with("LAUNCHER_"))
+        .map(|(k, v)| cstr(&format!("{k}={v}")))
+        .collect();
+    let env_ptrs = null_term(&env_strs);
+
+    let argv_strs: Vec<CString> = vec![cstr(&exec_path)];
+    let argv_ptrs = null_term(&argv_strs);
+
+    let packages_host = env::var("LAUNCHER_PACKAGES_HOST")
+        .unwrap_or_else(|_| "/host-packages".into());
+
+    unsafe {
+        ffi::check("set_log_level", ffi::krun_set_log_level(log_level));
+
+        let ctx = ffi::krun_create_ctx();
+        if ctx < 0 {
+            eprintln!("[launcher] krun_create_ctx failed: {ctx}");
+            process::exit(1);
+        }
+        let ctx = ctx as u32;
+
+        ffi::check("set_vm_config", ffi::krun_set_vm_config(ctx, vcpus, ram_mib));
+        ffi::check("set_root", ffi::krun_set_root(ctx, rootfs_c.as_ptr()));
+
+        if std::path::Path::new(&packages_host).exists() {
+            let tag = cstr("packages");
+            let path = cstr(&packages_host);
+            ffi::check("add_virtiofs", ffi::krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()));
+            eprintln!("[launcher] Mounted {packages_host} as virtio-fs 'packages'");
+        }
+
+        ffi::check("set_port_map", ffi::krun_set_port_map(ctx, port_map_ptrs.as_ptr()));
+        eprintln!("[launcher] Port map: 2000:2000");
+
+        ffi::check(
+            "set_exec",
+            ffi::krun_set_exec(ctx, exec_c.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()),
+        );
+
+        match seccomp::apply_vmm_filter() {
+            Ok(n) => eprintln!("[launcher] VMM seccomp filter applied ({n} syscalls allowed, ioctl restricted to KVM+terminal)"),
+            Err(e) => {
+                eprintln!("[launcher] WARNING: Failed to apply VMM seccomp: {e}");
+            }
+        }
+
+        eprintln!("[launcher] Starting microVM...");
+
+        let ret = ffi::krun_start_enter(ctx);
+        eprintln!("[launcher] krun_start_enter returned {ret} (should not return on success)");
+        process::exit(1);
+    }
+}

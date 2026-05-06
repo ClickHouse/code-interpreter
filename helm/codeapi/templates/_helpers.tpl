@@ -1,0 +1,168 @@
+{{/*
+_helpers.tpl - Reusable template snippets
+
+Helm templates use Go templating. Key concepts:
+- {{ .Values.xxx }} - Access values from values.yaml
+- {{ .Release.Name }} - The name you gave when installing (helm install MY-NAME ...)
+- {{ .Chart.Name }} - The chart name from Chart.yaml
+- {{- ... }} - The dash suppresses whitespace
+- define/include - Create and use reusable snippets
+*/}}
+
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "codeapi.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited to this.
+*/}}
+{{- define "codeapi.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "codeapi.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels - applied to all resources
+*/}}
+{{- define "codeapi.labels" -}}
+helm.sh/chart: {{ include "codeapi.chart" . }}
+{{ include "codeapi.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
+Selector labels - used for pod selection
+*/}}
+{{- define "codeapi.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "codeapi.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+API specific labels
+*/}}
+{{- define "codeapi.api.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: api
+{{- end }}
+
+{{- define "codeapi.api.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: api
+{{- end }}
+
+{{/*
+Worker-Sandbox specific labels
+*/}}
+{{- define "codeapi.workerSandbox.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: worker-sandbox
+{{- end }}
+
+{{- define "codeapi.workerSandbox.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: worker-sandbox
+{{- end }}
+
+{{/*
+File Server specific labels
+*/}}
+{{- define "codeapi.fileServer.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: file-server
+{{- end }}
+
+{{- define "codeapi.fileServer.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: file-server
+{{- end }}
+
+{{/*
+Tool Call Server specific labels
+*/}}
+{{- define "codeapi.toolCallServer.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: tool-call-server
+{{- end }}
+
+{{- define "codeapi.toolCallServer.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: tool-call-server
+{{- end }}
+
+{{/*
+Redis host - either from subchart or external
+*/}}
+{{- define "codeapi.redis.host" -}}
+{{- if .Values.redis.enabled }}
+{{- printf "%s-redis-master" .Release.Name }}
+{{- else }}
+{{- .Values.redis.external.host }}
+{{- end }}
+{{- end }}
+
+{{/*
+Redis port
+*/}}
+{{- define "codeapi.redis.port" -}}
+{{- if .Values.redis.enabled }}
+{{- "6379" }}
+{{- else }}
+{{- .Values.redis.external.port | default "6379" }}
+{{- end }}
+{{- end }}
+
+{{/*
+MinIO endpoint - either from subchart, simple deployment, or external
+*/}}
+{{- define "codeapi.minio.endpoint" -}}
+{{- if or .Values.minio.enabled .Values.minio.useSimple }}
+{{- printf "%s-minio" (include "codeapi.fullname" .) }}
+{{- else }}
+{{- .Values.minio.external.endpoint }}
+{{- end }}
+{{- end }}
+
+{{/*
+MinIO port
+*/}}
+{{- define "codeapi.minio.port" -}}
+{{- if or .Values.minio.enabled .Values.minio.useSimple }}
+{{- "9000" }}
+{{- else }}
+{{- .Values.minio.external.port | default "9000" }}
+{{- end }}
+{{- end }}
+
+{{/*
+MinIO bucket name
+*/}}
+{{- define "codeapi.minio.bucket" -}}
+{{- if or .Values.minio.enabled .Values.minio.useSimple }}
+{{- .Values.minio.defaultBuckets | default "codeapi-files" }}
+{{- else }}
+{{- .Values.minio.external.bucket }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,10 @@
+.**
+!.gitignore
+!.github
+!.eslintrc.json
+!.prettierrc
+!.husky
+node_modules/
+dist/
+combined.log
+error.log

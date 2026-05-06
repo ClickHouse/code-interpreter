@@ -1,0 +1,61 @@
+site_name: Code Interpreter API Documentation
+site_description: Documentation for the LibreChat Code Interpreter API
+
+nav:
+    - Home: index.md
+    - Development:
+        - Local Setup: development/local-setup.md
+        - Builder Scripts: development/builder-scripts.md
+        - Project Structure: development/project-structure.md
+    - Deployment:
+        - Docker Compose: deployment/docker-compose.md
+        - Azure: deployment/azure.md
+        - ACR Push: deployment/acr-push.md
+    - Configuration:
+        - Sandbox: configuration/sandbox.md
+    - API Reference:
+        - API v2: api/v2.md
+    - Enterprise:
+        - Overview: enterprise/overview.md
+
+theme:
+    name: material
+    palette:
+        - scheme: slate
+          primary: blue
+          accent: cyan
+          toggle:
+            icon: material/brightness-4
+            name: Switch to light mode
+        - scheme: default
+          primary: blue
+          accent: cyan
+          toggle:
+            icon: material/brightness-7
+            name: Switch to dark mode
+    features:
+        - navigation.sections
+        - navigation.expand
+        - navigation.top
+        - search.highlight
+        - content.code.copy
+
+markdown_extensions:
+    - admonition
+    - pymdownx.details
+    - pymdownx.superfences:
+        custom_fences:
+          - name: mermaid
+            class: mermaid
+            format: !!python/name:pymdownx.superfences.fence_code_format
+    - pymdownx.tabbed:
+        alternate_style: true
+    - pymdownx.highlight:
+        anchor_linenums: true
+    - pymdownx.inlinehilite
+    - tables
+    - attr_list
+    - md_in_html
+
+plugins:
+    - search

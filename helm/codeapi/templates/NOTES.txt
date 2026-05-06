@@ -1,0 +1,75 @@
+🚀 Code Interpreter API has been deployed!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 DEPLOYMENT SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{- if .Values.api.enabled }}
+API Service:
+  Replicas: {{ .Values.api.replicaCount }}
+  Port: {{ .Values.api.service.port }}
+{{- end }}
+
+{{- if .Values.workerSandbox.enabled }}
+Worker-Sandbox:
+  Replicas: {{ .Values.workerSandbox.replicaCount }}
+  Python Concurrency: {{ .Values.workerSandbox.config.pythonConcurrency }} per pod
+  Total Capacity: {{ mul .Values.workerSandbox.replicaCount .Values.workerSandbox.config.pythonConcurrency }} concurrent Python jobs
+{{- end }}
+
+{{- if .Values.fileServer.enabled }}
+File Server:
+  Replicas: {{ .Values.fileServer.replicaCount }}
+{{- end }}
+
+{{- if .Values.toolCallServer.enabled }}
+Tool Call Server:
+  Replicas: {{ .Values.toolCallServer.replicaCount }}
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔗 ACCESS THE API
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{- if .Values.api.ingress.enabled }}
+External URL:
+{{- range .Values.api.ingress.hosts }}
+  http{{ if $.Values.api.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else }}
+Port forward to access locally:
+  kubectl port-forward svc/{{ include "codeapi.fullname" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+
+Then access at:
+  http://localhost:{{ .Values.api.service.port }}/v1/health
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📈 SCALING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scale API pods (for more HTTP capacity):
+  kubectl scale deployment/{{ include "codeapi.fullname" . }}-api --replicas=5
+
+Scale Worker-Sandbox pods (for more execution capacity):
+  kubectl scale deployment/{{ include "codeapi.fullname" . }}-worker-sandbox --replicas=10
+
+Or upgrade the release:
+  helm upgrade {{ .Release.Name }} ./helm/codeapi --set workerSandbox.replicaCount=10
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 MONITORING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+View pods:
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+View logs:
+  kubectl logs -l app.kubernetes.io/component=api -f
+  kubectl logs -l app.kubernetes.io/component=worker-sandbox -f
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

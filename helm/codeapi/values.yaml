@@ -1,0 +1,338 @@
+# values.yaml - Configuration for the Code Interpreter API Helm chart
+#
+# This file contains default values. Override them with:
+#   helm install codeapi ./helm/codeapi -f my-values.yaml
+# Or inline:
+#   helm install codeapi ./helm/codeapi --set workerSandbox.replicas=5
+
+# =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+global:
+  # Image pull secrets (if using private registry)
+  imagePullSecrets: []
+  # Storage class for persistent volumes
+  storageClass: ""
+
+# Shared token for internal service-to-service requests between the public API,
+# file-server, tool-call-server, worker, and sandbox API. Override for every
+# production install.
+internalServiceAuth:
+  token: "changeme-in-production"
+
+# =============================================================================
+# API SERVICE (HTTP handlers, scales based on traffic)
+# =============================================================================
+api:
+  enabled: true
+  replicaCount: 2  # Start with 2 API pods
+
+  image:
+    repository: codeapi-api
+    tag: latest
+    pullPolicy: IfNotPresent  # Use Always in production
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 3112
+
+  # Ingress (optional, for external access)
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: codeapi.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  # Extra environment variables
+  extraEnv: []
+
+# =============================================================================
+# WORKER-SANDBOX (Job processors + MicroVM Sandbox, scales based on queue depth)
+# Each pod runs a libkrun microVM with its own kernel + NsJail inside.
+# Only requires /dev/kvm — no privileged mode, no Linux capabilities.
+# =============================================================================
+workerSandbox:
+  enabled: true
+  replicaCount: 3
+
+  image:
+    repository: codeapi-worker-sandbox
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  # Enable libkrun microVM isolation. Requires /dev/kvm on the node.
+  # Set to false to fall back to chroot + NsJail (no guest kernel).
+  # Override to false until the node group has nested virtualisation enabled.
+  kvmEnabled: true
+
+  # MicroVM launcher configuration (only used when kvmEnabled: true)
+  launcher:
+    vcpus: 2
+    ramMib: 2048
+    logLevel: 3
+
+  # Resource limits (higher because it runs code + microVM)
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 3Gi
+
+  # Worker configuration
+  config:
+    pythonConcurrency: 5    # Jobs per worker (= sandbox capacity)
+    otherConcurrency: 15
+    jobWindow: 1000
+    jobTimeout: 300000      # 5 minutes
+
+  # Health check port for the worker
+  healthPort: 3113
+
+  # Sandbox configuration (NsJail-based, uses SANDBOX_* env vars)
+  sandbox:
+    port: 2000
+    maxProcessCount: 100
+    runCpuTime: 60000
+    runTimeout: 300000
+    outputMaxSize: 65536
+    disableNetworking: true
+
+  # Language runtime packages (mount from host or PVC)
+  packages:
+    # Use a PVC for packages
+    persistence:
+      enabled: true
+      size: 10Gi
+      accessMode: ReadWriteOnce
+      storageClass: ""
+      # If you have pre-built packages, specify the existing claim
+      existingClaim: ""
+
+    # Init job to populate packages on first install
+    # Runs as a Helm pre-install/pre-upgrade hook
+    # Compiles Python from source and downloads Node/Bun binaries
+    initJob:
+      enabled: true
+      forceRebuild: false
+      image:
+        repository: codeapi-package-init
+        tag: latest
+        pullPolicy: IfNotPresent
+      pythonVersion: "3.14.4"
+      nodeVersion: "24.15.0"
+      bunVersion: "1.3.13"
+      bashPackageVersion: "5.2.0"
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 3600
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 2000m
+          memory: 4Gi
+
+  # Extra environment variables for worker containers
+  extraEnv: []
+
+  # Horizontal Pod Autoscaler
+  # NOTE: Custom metrics require KEDA or Prometheus Adapter to be installed.
+  # Without these, HPA will fail to scale based on queue depth.
+  # See: https://keda.sh/docs/latest/scalers/redis-lists/
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 20
+    # Custom metric for queue depth
+    metrics:
+      - type: External
+        external:
+          metric:
+            name: bullmq_python_queue_waiting
+          target:
+            type: AverageValue
+            averageValue: "10"
+
+# =============================================================================
+# FILE SERVER (S3/MinIO integration, stateless)
+# =============================================================================
+fileServer:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: codeapi-file-server
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  # ServiceAccount for IRSA (IAM Roles for Service Accounts) on EKS
+  # See: documentation/services/codeapi/deployment/irsa.md
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+    # For IRSA on EKS, add:
+    # annotations:
+    #   eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/codeapi-fileserver-role"
+
+  # S3 configuration (when using AWS S3 instead of MinIO)
+  # Set minio.enabled=false when using external S3
+  s3:
+    enabled: false
+    endpoint: "s3.amazonaws.com"
+    region: "us-east-1"
+    bucket: ""
+    useSSL: true
+    # Use IRSA for authentication (no static credentials needed)
+    useIrsa: false
+
+# =============================================================================
+# TOOL CALL SERVER (programmatic tool calling, stateless)
+# =============================================================================
+toolCallServer:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: codeapi-tool-call-server
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  service:
+    type: ClusterIP
+    port: 3033
+
+  config:
+    requestTimeout: 300000
+    sessionExpiry: 600
+
+# =============================================================================
+# REDIS (Job queue and state store)
+# =============================================================================
+redis:
+  enabled: true  # Set to false if using external Redis
+
+  # Bitnami Redis chart configuration
+  architecture: standalone  # Use 'replication' for HA
+  auth:
+    enabled: true
+    password: "changeme-in-production"
+
+  master:
+    persistence:
+      enabled: true
+      size: 1Gi
+
+  # If using external Redis, configure here:
+  # external:
+  #   host: redis.example.com
+  #   port: 6379
+  #   password: secret
+
+# =============================================================================
+# MINIO (S3-compatible storage)
+# =============================================================================
+minio:
+  enabled: true  # Set to false if using external S3/MinIO
+
+  # Bitnami MinIO chart configuration
+  mode: standalone  # Use 'distributed' for HA
+  auth:
+    rootUser: minioadmin
+    rootPassword: "changeme-in-production"
+
+  persistence:
+    enabled: true
+    size: 10Gi
+
+  defaultBuckets: "codeapi-files"
+
+  # If using external MinIO/S3:
+  # external:
+  #   endpoint: s3.amazonaws.com
+  #   accessKey: AKIAXXXXXXXX
+  #   secretKey: xxxxxxxx
+  #   bucket: my-bucket
+  #   useSSL: true
+
+# =============================================================================
+# COMMON SETTINGS
+# =============================================================================
+
+# Node selector for all pods
+nodeSelector: {}
+
+# Tolerations for all pods
+tolerations: []
+
+# Affinity rules for all pods
+affinity: {}
+
+# Pod disruption budgets
+podDisruptionBudget:
+  api:
+    enabled: false
+    minAvailable: 1
+  workerSandbox:
+    enabled: false
+    minAvailable: 2
+
+# =============================================================================
+# PROMETHEUS METRICS
+# =============================================================================
+metrics:
+  enabled: false    # Set to true to create PodMonitors for Prometheus scraping
+  interval: "30s"
+  scrapeTimeout: "10s"
+
+# =============================================================================
+# NETWORK POLICIES
+# =============================================================================
+networkPolicy:
+  enabled: false  # Enable for production to restrict pod-to-pod traffic
+  toolCallServer:
+    allowExternalEgress: false  # Allow tool call server to reach external APIs

@@ -1,0 +1,11 @@
+const PREFIX = 'sk-lc-code01_';
+const ENTERPRISE_PREFIX = 'sk-ent-code01_';
+
+export default {
+  PREFIX,
+  ENTERPRISE_PREFIX,
+  API_KEY_LENGTH: 32,
+  CHECKSUM_LENGTH: 8,
+  CHECKSUM_PREFIX: '_',
+  VALID_PREFIXES: [PREFIX, ENTERPRISE_PREFIX],
+};

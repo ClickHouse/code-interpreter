@@ -1,0 +1,42 @@
+{{/*
+Persistent Volume Claim for language runtime packages
+These are the language runtimes (Python, Node, Bun, etc.) that the NsJail sandbox uses.
+NOTE: PVC name retains "piston" for backward compatibility with existing volumes.
+
+NOTE on access modes:
+- ReadWriteOnce (RWO): Works for single-node clusters or when all worker pods run on same node
+- ReadWriteMany (RWX): Required for multi-node clusters with workers on different nodes
+  Requires storage class that supports RWX (NFS, EFS, Azure Files, GlusterFS, etc.)
+
+If using the initJob to populate packages:
+- The PVC is created as a Helm hook (pre-install) so it exists before the init job runs
+- The init job writes packages to the PVC
+- Worker pods then mount the PVC (read-only at container level)
+*/}}
+{{- if and .Values.workerSandbox.enabled .Values.workerSandbox.packages.persistence.enabled (not .Values.workerSandbox.packages.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "codeapi.fullname" . }}-piston-packages
+  labels:
+    {{- include "codeapi.labels" . | nindent 4 }}
+  {{- if .Values.workerSandbox.packages.initJob.enabled }}
+  annotations:
+    # Create PVC before the init job runs (lower weight = runs first)
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    # Keep the PVC across upgrades (don't delete)
+    "helm.sh/resource-policy": keep
+  {{- end }}
+spec:
+  accessModes:
+    - {{ .Values.workerSandbox.packages.persistence.accessMode | default "ReadWriteOnce" }}
+  {{- if .Values.workerSandbox.packages.persistence.storageClass }}
+  storageClassName: {{ .Values.workerSandbox.packages.persistence.storageClass }}
+  {{- else if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.workerSandbox.packages.persistence.size }}
+{{- end }}

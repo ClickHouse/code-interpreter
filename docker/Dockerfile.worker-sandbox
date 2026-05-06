@@ -1,0 +1,195 @@
+# Combined Worker-Sandbox Dockerfile (MicroVM)
+# Boots the sandbox server inside a libkrun microVM with its own kernel,
+# alongside the worker process managed by supervisor.sh.
+# Only requires /dev/kvm on the host — no privileged mode, no capabilities.
+#
+# Architecture within this container:
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  Worker-Sandbox Container (Fedora 41, libkrun)                          │
+# │                                                                         │
+# │  ┌─────────────────┐        ┌──────────────────────────────────────────┐│
+# │  │  Worker Process │ ──────▶│  libkrun MicroVM (own kernel)            ││
+# │  │  (job processor)│ :2000  │  └─ NsJail Sandbox (code execution)     ││
+# │  │  Port 3113      │        │                                          ││
+# │  │  (health)       │        │                                          ││
+# │  └─────────────────┘        └──────────────────────────────────────────┘│
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Scale this as a unit - PYTHON_CONCURRENCY = sandbox capacity
+
+# ============================================================================
+# Stage 1: Build NsJail from source
+# ============================================================================
+FROM buildpack-deps:bookworm AS nsjail-builder
+
+WORKDIR /nsjail
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bison \
+    flex \
+    libprotobuf-dev \
+    libnl-route-3-dev \
+    protobuf-compiler \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
+    && git checkout dccf911fd2659e7b08ce9507c25b2b38ec2c5800
+
+RUN make -j$(nproc)
+
+COPY api/src/spec-guard.c /tmp/spec-guard.c
+RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c
+
+# ============================================================================
+# Stage 2: Build worker
+# ============================================================================
+FROM oven/bun:1.3.13 AS worker-builder
+WORKDIR /app
+COPY service/package.json service/bun.lock ./
+COPY service/lib ./lib
+RUN cd lib/api-keys && bun install --ignore-scripts && bun run build
+RUN bun install --frozen-lockfile
+COPY service/src ./src
+COPY service/tsconfig.json ./
+RUN bun build ./src/worker-server.ts --minify --outdir .build --target bun
+
+# ============================================================================
+# Stage 3: Build sandbox API
+# ============================================================================
+FROM oven/bun:1.3.13 AS sandbox-builder
+WORKDIR /app
+COPY api/package.json ./
+RUN bun install --frozen-lockfile
+COPY api/src ./src
+COPY api/tsconfig.json ./
+RUN bun build ./src/index.ts --minify --outdir .build --target bun
+
+# ============================================================================
+# Stage 4: Build sandbox rootfs (full OS layer for the microVM guest)
+# ============================================================================
+FROM oven/bun:1.3.13-debian AS sandbox-rootfs
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    coreutils \
+    util-linux \
+    locales \
+    procps \
+    iptables \
+    socat \
+    poppler-utils \
+    fonts-dejavu \
+    fonts-liberation \
+    libnl-route-3-200 \
+    libprotobuf32 \
+    libffi8 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
+    && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
+    && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+
+COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
+COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
+RUN chmod +x /usr/sbin/nsjail
+
+WORKDIR /sandbox_api
+
+COPY api/package.json ./
+RUN bun install --frozen-lockfile --production
+COPY --from=sandbox-builder /app/.build ./.build
+COPY api/config ./config
+COPY api/src/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
+
+RUN mkdir -p /piston/packages /tmp/sandbox
+
+RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
+RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
+         /usr/bin/perl* /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg \
+         /usr/sbin/adduser /usr/sbin/useradd /usr/sbin/usermod \
+         /usr/sbin/groupadd /usr/sbin/groupmod \
+         /usr/bin/su \
+         /usr/bin/chfn /usr/bin/chsh /usr/bin/gpasswd /usr/bin/newgrp \
+         /usr/bin/passwd /usr/bin/sg \
+         /usr/bin/chage /usr/bin/expiry /usr/sbin/unix_chkpwd \
+    2>/dev/null || true
+
+# ============================================================================
+# Stage 5: Build the Rust launcher binary (Fedora for libkrun ABI)
+# ============================================================================
+FROM fedora:41 AS launcher-builder
+
+RUN dnf install -y \
+    rust cargo \
+    libkrun-devel \
+    gcc \
+    && dnf clean all
+
+WORKDIR /launcher
+COPY launcher/Cargo.toml launcher/build.rs ./
+COPY launcher/src/ ./src/
+
+RUN cargo build --release
+
+# ============================================================================
+# Stage 6: Final combined image (Fedora for libkrun runtime)
+# ============================================================================
+FROM fedora:41
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+    libkrun \
+    socat \
+    curl \
+    unzip \
+    util-linux \
+    gawk \
+    findutils \
+    ca-certificates \
+    && dnf clean all
+
+# Install Bun runtime (for the worker process on the host side)
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+
+# --- Launcher (runs on host, boots microVM) ---
+COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
+
+# --- Sandbox rootfs (becomes the microVM guest filesystem) ---
+COPY --from=sandbox-rootfs / /sandbox-rootfs/
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+
+RUN mkdir -p /host-packages
+
+# --- Launcher entrypoint (DNS resolution + socat relay before VM boot) ---
+COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
+COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
+RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh
+
+# --- Worker ---
+WORKDIR /worker
+COPY service/package.json service/bun.lock ./
+COPY service/lib ./lib
+RUN cd lib/api-keys && bun install --ignore-scripts && bun run build
+RUN bun install --frozen-lockfile --production
+COPY --from=worker-builder /app/.build ./.build
+COPY --from=worker-builder /app/src ./src
+COPY --from=worker-builder /app/src/matplotlib.py /app/src/matplotlib-async.py ./
+
+# --- Supervisor ---
+COPY docker/supervisor.sh /supervisor.sh
+RUN chmod +x /supervisor.sh
+
+WORKDIR /
+EXPOSE 2000 3113
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:3113/health || exit 1
+
+CMD ["/supervisor.sh"]

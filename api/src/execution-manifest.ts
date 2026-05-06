@@ -1,0 +1,209 @@
+import crypto from 'crypto';
+
+export const EXECUTION_MANIFEST_HEADER = 'X-CodeAPI-Execution-Manifest';
+export const EXECUTION_MANIFEST_VERSION = 1;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+export type ExecutionManifestErrorReason =
+  | 'missing_header'
+  | 'missing_secret'
+  | 'malformed'
+  | 'invalid_signature'
+  | 'expired'
+  | 'not_yet_valid'
+  | 'scope_mismatch';
+
+export class ExecutionManifestError extends Error {
+  readonly reason: ExecutionManifestErrorReason;
+
+  constructor(reason: ExecutionManifestErrorReason, message: string) {
+    super(message);
+    this.name = 'ExecutionManifestError';
+    this.reason = reason;
+  }
+}
+
+export interface ExecutionManifestInputFile {
+  id: string;
+  session_id: string;
+  name: string;
+}
+
+export interface ExecutionManifestClaims {
+  v: typeof EXECUTION_MANIFEST_VERSION;
+  exec_id: string;
+  tenant_id: string;
+  user_id: string;
+  session_key: string;
+  input_files: ExecutionManifestInputFile[];
+  read_sessions: string[];
+  output_session_id: string;
+  max_upload_bytes: number;
+  max_output_files: number;
+  max_requests: number;
+  iat: number;
+  exp: number;
+  chc_user_id?: string;
+  org_id?: string;
+  service_id?: string;
+  principal_source?: string;
+  auth_context_hash?: string;
+}
+
+function base64UrlEncode(input: Buffer | string): string {
+  return Buffer.from(input).toString('base64url');
+}
+
+function base64UrlDecode(input: string): Buffer {
+  if (!BASE64URL_PATTERN.test(input) || input.length % 4 === 1) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest is not valid base64url');
+  }
+
+  try {
+    return Buffer.from(input, 'base64url');
+  } catch {
+    throw new ExecutionManifestError('malformed', 'Execution manifest is not valid base64url');
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new ExecutionManifestError('malformed', 'Execution manifest contains a non-finite number');
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (typeof value === 'object' && value !== undefined) {
+    const obj = value as Record<string, unknown>;
+    const entries = Object.keys(obj)
+      .filter(key => obj[key] !== undefined)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(obj[key])}`);
+    return `{${entries.join(',')}}`;
+  }
+
+  throw new ExecutionManifestError('malformed', 'Execution manifest contains an unsupported value');
+}
+
+function hmacSha256(data: string, secret: string): Buffer {
+  return crypto.createHmac('sha256', secret).update(data, 'utf8').digest();
+}
+
+function validateClaimsShape(value: unknown): asserts value is ExecutionManifestClaims {
+  const claims = value as Partial<ExecutionManifestClaims> | null;
+  if (claims == null || typeof claims !== 'object') {
+    throw new ExecutionManifestError('malformed', 'Execution manifest claims must be an object');
+  }
+
+  const stringFields: Array<keyof ExecutionManifestClaims> = [
+    'exec_id',
+    'tenant_id',
+    'user_id',
+    'session_key',
+    'output_session_id',
+  ];
+  for (const field of stringFields) {
+    if (typeof claims[field] !== 'string' || claims[field] === '') {
+      throw new ExecutionManifestError('malformed', `Execution manifest ${field} is invalid`);
+    }
+  }
+
+  const numberFields: Array<keyof ExecutionManifestClaims> = [
+    'max_upload_bytes',
+    'max_output_files',
+    'max_requests',
+    'iat',
+    'exp',
+  ];
+  for (const field of numberFields) {
+    if (typeof claims[field] !== 'number' || !Number.isFinite(claims[field])) {
+      throw new ExecutionManifestError('malformed', `Execution manifest ${field} is invalid`);
+    }
+  }
+
+  if (claims.v !== EXECUTION_MANIFEST_VERSION) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest version is unsupported');
+  }
+  if (!Array.isArray(claims.input_files)) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest input_files must be an array');
+  }
+  if (!Array.isArray(claims.read_sessions) || claims.read_sessions.some(session => typeof session !== 'string' || session === '')) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest read_sessions is invalid');
+  }
+  for (const file of claims.input_files) {
+    if (
+      file == null ||
+      typeof file !== 'object' ||
+      typeof file.id !== 'string' ||
+      typeof file.session_id !== 'string' ||
+      typeof file.name !== 'string' ||
+      file.id === '' ||
+      file.session_id === '' ||
+      file.name === ''
+    ) {
+      throw new ExecutionManifestError('malformed', 'Execution manifest input_files contains an invalid file');
+    }
+  }
+}
+
+export function signExecutionManifest(claims: ExecutionManifestClaims, secret: string): string {
+  if (!secret) {
+    throw new ExecutionManifestError('missing_secret', 'Execution manifest secret is not configured');
+  }
+
+  validateClaimsShape(claims);
+  const payload = canonicalJson(claims);
+  const signature = hmacSha256(payload, secret);
+  return `${base64UrlEncode(payload)}.${base64UrlEncode(signature)}`;
+}
+
+export function verifyExecutionManifest(
+  token: string,
+  secret: string,
+  options: { nowSeconds?: number; clockToleranceSeconds?: number } = {},
+): ExecutionManifestClaims {
+  if (!secret) {
+    throw new ExecutionManifestError('missing_secret', 'Execution manifest secret is not configured');
+  }
+  const [payloadPart, signaturePart, extraPart] = token.split('.');
+  if (!payloadPart || !signaturePart || extraPart !== undefined) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest token is malformed');
+  }
+
+  const payload = base64UrlDecode(payloadPart).toString('utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    throw new ExecutionManifestError('malformed', 'Execution manifest payload is not valid JSON');
+  }
+
+  validateClaimsShape(parsed);
+  const canonicalPayload = canonicalJson(parsed);
+  if (payload !== canonicalPayload) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest payload is not canonical');
+  }
+
+  const expected = hmacSha256(canonicalPayload, secret);
+  const actual = base64UrlDecode(signaturePart);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+    throw new ExecutionManifestError('invalid_signature', 'Execution manifest signature is invalid');
+  }
+
+  const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const tolerance = options.clockToleranceSeconds ?? 30;
+  if (parsed.exp <= now - tolerance) {
+    throw new ExecutionManifestError('expired', 'Execution manifest is expired');
+  }
+  if (parsed.iat > now + tolerance) {
+    throw new ExecutionManifestError('not_yet_valid', 'Execution manifest is not valid yet');
+  }
+
+  return parsed;
+}

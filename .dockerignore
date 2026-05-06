@@ -1,0 +1,61 @@
+# Documentation
+docs/
+*.md
+mkdocs.yml
+.readthedocs.yaml
+
+# Tests
+tests/
+__tests__/
+*.test.js
+*.test.ts
+*.spec.js
+*.spec.ts
+
+# Development files
+.vscode/
+.env
+.env.*
+!.env.example
+.envrc
+.git/
+.gitignore
+.gitattributes
+.prettierrc.yaml
+.prettierignore
+
+# Docker files (not needed in build context)
+docker-compose*.yml
+docker-compose*.yaml
+Dockerfile*
+
+# Build artifacts
+node_modules/
+dist/
+build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Helm charts (not needed for Docker build)
+helm/
+
+# Scripts not needed in production
+scripts/dev/
+scripts/test/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

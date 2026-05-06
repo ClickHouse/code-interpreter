@@ -1,0 +1,8 @@
+# Force git to be case-sensitive on case-insensitive filesystems
+* text=auto
+*.js text eol=lf
+*.ts text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf

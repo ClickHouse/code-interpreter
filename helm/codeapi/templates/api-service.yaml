@@ -1,0 +1,21 @@
+{{/*
+API Service
+Exposes the API pods within the cluster.
+*/}}
+{{- if .Values.api.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codeapi.fullname" . }}-api
+  labels:
+    {{- include "codeapi.api.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.api.service.type }}
+  ports:
+    - port: {{ .Values.api.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "codeapi.api.selectorLabels" . | nindent 4 }}
+{{- end }}

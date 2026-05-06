@@ -1,0 +1,117 @@
+#include <tunables/global>
+
+profile sandbox-nsjail flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # ==========================================================================
+  # NsJail requires these capabilities to set up sandboxes
+  # ==========================================================================
+  capability sys_admin,
+  capability sys_chroot,
+  capability sys_ptrace,
+  capability setuid,
+  capability setgid,
+  capability net_admin,
+  capability dac_override,
+  capability dac_read_search,
+  capability chown,
+  capability fowner,
+  capability fsetid,
+  capability kill,
+  capability setfcap,
+  capability mknod,
+
+  # ==========================================================================
+  # Namespace and mount operations required by NsJail
+  # ==========================================================================
+  mount,
+  umount,
+  pivot_root,
+  
+  # Allow remounting with various flags
+  mount options=(ro, remount) -> **,
+  mount options=(rw, remount) -> **,
+  mount options=(bind) -> **,
+  mount options=(rbind) -> **,
+  mount options=(move) -> **,
+  mount fstype=tmpfs,
+  mount fstype=proc,
+  mount fstype=devpts,
+  mount fstype=cgroup2,
+
+  # ==========================================================================
+  # File access rules
+  # ==========================================================================
+  
+  # Full access to sandbox working directories
+  /piston/** rwlk,
+  /tmp/** rwlk,
+  /mnt/** rwlk,
+  
+  # NsJail binary and config
+  /usr/sbin/nsjail rix,
+  /sandbox_api/** r,
+  /sandbox_api/config/** r,
+  
+  # Runtime executables (Python, Node, Bun, etc.)
+  /usr/** rix,
+  /bin/** rix,
+  /lib/** rm,
+  /lib64/** rm,
+  
+  # Device access for sandbox
+  /dev/null rw,
+  /dev/zero rw,
+  /dev/urandom r,
+  /dev/random r,
+  /dev/tty rw,
+  /dev/pts/* rw,
+  
+  # Proc filesystem (read-only for most, some writes for cgroups)
+  /proc/** r,
+  /proc/sys/kernel/random/uuid r,
+  
+  # Cgroups v2 (NsJail uses these for resource limits)
+  /sys/fs/cgroup/** rw,
+  
+  # ==========================================================================
+  # Network rules (sandbox networking setup)
+  # ==========================================================================
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  network unix stream,
+  network unix dgram,
+  network netlink raw,
+  
+  # ==========================================================================
+  # Deny rules - defense in depth if NsJail is bypassed
+  # ==========================================================================
+  
+  # Prevent reading sensitive host files
+  deny /etc/shadow r,
+  deny /etc/gshadow r,
+  deny /root/** rwlk,
+  
+  # Prevent writing to sensitive system paths
+  deny /etc/passwd w,
+  deny /etc/group w,
+  deny /boot/** rwlk,
+  
+  # Prevent loading kernel modules
+  deny /lib/modules/** rwlk,
+  deny /sys/module/** w,
+  
+  # Prevent accessing other containers (Docker socket)
+  deny /var/run/docker.sock rwlk,
+  
+  # Prevent ptrace on host processes (only sandbox children)
+  deny ptrace (read, trace) peer=unconfined,
+  
+  # ==========================================================================
+  # Signal rules
+  # ==========================================================================
+  signal (send) set=(kill, term, int, hup, cont, stop, usr1, usr2),
+  signal (receive),
+}

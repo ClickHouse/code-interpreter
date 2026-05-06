@@ -1,0 +1,67 @@
+{
+  "name": "@librechat/api-keys",
+  "version": "1.7.5",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "watch": "tsc -w",
+    "prepare": "husky",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\""
+  },
+  "keywords": [],
+  "author": "Danny Avila danny@librechat.ai, Marco Beretta berry@librechat.ai",
+  "license": "ISC",
+  "description": "API key management for LibreChat apps",
+  "devDependencies": {
+    "@commitlint/cli": "^19.5.0",
+    "@commitlint/config-conventional": "^19.5.0",
+    "@types/bun": "latest",
+    "@types/jest": "^29.5.13",
+    "@types/node": "^22.5.5",
+    "@typescript-eslint/eslint-plugin": "^8.6.0",
+    "@typescript-eslint/parser": "^8.6.0",
+    "axios": "^1.7.9",
+    "commitlint": "^19.5.0",
+    "dotenv": "^16.4.7",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-import-resolver-typescript": "^3.6.3",
+    "eslint-plugin-import": "^2.30.0",
+    "eslint-plugin-prettier": "^5.2.1",
+    "husky": "^9.1.6",
+    "jest": "^29.7.0",
+    "lint-staged": "^15.2.10",
+    "mongodb-memory-server": "^10.1.2",
+    "msw": "^2.7.0",
+    "prettier": "^3.3.3",
+    "stripe": "^17.3.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.6.2"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix",
+      "prettier --write"
+    ]
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "winston": "^3.14.2",
+    "zod": "^3.23.8"
+  },
+  "dependencies": {
+    "@azure/arm-containerregistry": "^10.1.0",
+    "@azure/core-util": "^1.11.0",
+    "@azure/identity": "^4.6.0",
+    "mongoose": "^8.9.5"
+  }
+}

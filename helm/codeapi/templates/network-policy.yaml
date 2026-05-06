@@ -1,0 +1,227 @@
+{{/*
+Network Policies for CodeAPI
+Restricts network access for sandbox pods to minimize attack surface.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "codeapi.fullname" . }}-worker-sandbox
+  labels:
+    {{- include "codeapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "codeapi.workerSandbox.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow health checks from anywhere in cluster
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.workerSandbox.healthPort }}
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow connection to Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow connection to File Server
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: file-server
+      ports:
+        - protocol: TCP
+          port: {{ .Values.fileServer.service.port }}
+    # Allow connection to Tool Call Server
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: tool-call-server
+      ports:
+        - protocol: TCP
+          port: {{ .Values.toolCallServer.service.port }}
+    # Allow connection to MinIO (for file storage)
+    {{- if .Values.minio.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "codeapi.fullname" . }}-api
+  labels:
+    {{- include "codeapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "codeapi.api.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow ingress traffic
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.port }}
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow connection to Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow connection to File Server
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: file-server
+      ports:
+        - protocol: TCP
+          port: {{ .Values.fileServer.service.port }}
+    # Allow connection to MinIO
+    {{- if .Values.minio.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "codeapi.fullname" . }}-file-server
+  labels:
+    {{- include "codeapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "codeapi.fileServer.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from API and workers
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker-sandbox
+      ports:
+        - protocol: TCP
+          port: {{ .Values.fileServer.service.port }}
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow connection to MinIO
+    {{- if .Values.minio.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "codeapi.fullname" . }}-tool-call-server
+  labels:
+    {{- include "codeapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "codeapi.toolCallServer.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from workers only
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker-sandbox
+      ports:
+        - protocol: TCP
+          port: {{ .Values.toolCallServer.service.port }}
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Tool call server may need external access for tool execution
+    # This can be further restricted based on specific tool requirements
+    {{- if .Values.networkPolicy.toolCallServer.allowExternalEgress }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    {{- end }}
+{{- end }}

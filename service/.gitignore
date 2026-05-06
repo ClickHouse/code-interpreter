@@ -1,0 +1,11 @@
+node_modules
+.git
+python-libs
+python
+python-libs**.*
+.env
+/logs/**/*
+/stress-tests/**.txt
+.build**/*
+**.log
+.npmrc

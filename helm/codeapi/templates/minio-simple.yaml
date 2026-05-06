@@ -1,0 +1,127 @@
+{{/*
+Simple MinIO deployment using official image.
+Only deployed if minio.useSimple=true (bypasses Bitnami chart)
+*/}}
+{{- if .Values.minio.useSimple }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codeapi.fullname" . }}-minio
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: minio
+          # Pin to specific release for reproducibility
+          # Update policy: Check https://github.com/minio/minio/releases for new versions
+          # Test thoroughly before updating - MinIO releases can include breaking changes
+          image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+          imagePullPolicy: IfNotPresent
+          command:
+            - minio
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              value: {{ .Values.minio.auth.rootUser | quote }}
+            - name: MINIO_ROOT_PASSWORD
+              value: {{ .Values.minio.auth.rootPassword | quote }}
+          ports:
+            - name: api
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codeapi.fullname" . }}-minio
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 9000
+      targetPort: api
+    - name: console
+      port: 9001
+      targetPort: console
+  selector:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+# Job to create default bucket after MinIO is ready
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "codeapi.fullname" . }}-minio-setup
+  labels:
+    app.kubernetes.io/name: minio-setup
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    # Run after install/upgrade
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          # MinIO Client for bucket setup
+          # Update policy: Should be compatible with the MinIO server version above
+          # Check https://github.com/minio/mc/releases for new versions
+          image: minio/mc:RELEASE.2024-11-17T19-35-25Z
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for MinIO to be ready..."
+              until mc alias set myminio http://{{ include "codeapi.fullname" . }}-minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} 2>/dev/null; do
+                sleep 2
+              done
+              echo "Creating bucket..."
+              mc mb --ignore-existing myminio/{{ .Values.minio.defaultBuckets | default "codeapi-files" }}
+              echo "Bucket created successfully"
+          env:
+            - name: MINIO_ROOT_USER
+              value: {{ .Values.minio.auth.rootUser | quote }}
+            - name: MINIO_ROOT_PASSWORD
+              value: {{ .Values.minio.auth.rootPassword | quote }}
+{{- end }}

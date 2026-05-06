@@ -1,0 +1,17 @@
+data/
+node_modules
+.env
+.git
+.npmrc
+/logs/**/*
+/file-server-logs/**/*
+/service-logs/**/*
+/tool-call-server-logs/**/*
+
+# Helm artifacts
+helm/*/charts/*.tgz
+helm/*/Chart.lock
+
+# Local piston runtime data (docker volume mount)
+data/
+
