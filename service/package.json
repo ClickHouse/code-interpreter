@@ -17,6 +17,7 @@
     "start:worker:dev": "ts-node src/worker-server.ts",
     "build": "rollup -c",
     "deploy": "serverless deploy",
+    "test": "bun test ./src/*.test.ts ./src/*.spec.ts ./src/**/*.test.ts ./src/**/*.spec.ts",
     "test:ptc": "bun run scripts/test-ptc-sentinel.ts && bun run scripts/test-replay-state.ts",
     "test:ptc:smoke": "bun run scripts/test-ptc-sentinel.ts && bun run scripts/test-replay-state.ts && bun run scripts/test-ptc-replay-smoke.ts && bun run scripts/test-ptc-replay-bash-smoke.ts"
   },
