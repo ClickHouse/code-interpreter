@@ -86,6 +86,14 @@ export const env = {
   NEWSLETTER_SECRET: process.env.NEWSLETTER_SECRET!,
   // Optional logging
   LOGGING_ENABLED: (process.env.LOGGING_ENABLED) === 'true',
+  /** Strict tenant isolation. When true, sessionKey resolution fails closed
+   *  (500) on requests whose auth context lacks `tenantId`, instead of
+   *  silently falling back to the `'legacy'` tenant prefix. Default OFF in
+   *  code so single-tenant deploys without an auth tenancy concept keep
+   *  working; multi-tenant deploys MUST set this to `true` before any tenant
+   *  is multi-homed, otherwise a missing tenantId would silently bucket
+   *  cross-tenant requests under the same `'legacy'` prefix. */
+  TENANT_ISOLATION_STRICT: process.env.CODEAPI_TENANT_ISOLATION_STRICT === 'true',
   // Signed execution manifests. If the secret is unset, manifest generation is disabled.
   EXECUTION_MANIFEST_SECRET: process.env.CODEAPI_EXECUTION_MANIFEST_SECRET ?? '',
   EXECUTION_MANIFEST_TTL_SECONDS: Math.min(

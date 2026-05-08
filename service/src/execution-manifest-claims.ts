@@ -6,12 +6,24 @@ import {
   type ExecutionManifestInputFile,
 } from './execution-manifest';
 
-function isPayloadFileRef(file: t.PayloadBody['files'][number]): file is ExecutionManifestInputFile {
+interface PayloadFileRef {
+  /** Storage file id (the per-file uuid the file_server registered the
+   *  upload under). Lives in `RequestFile.id` after the resource-id
+   *  split — the resource identity (skill/agent) is carried in
+   *  `resource_id` instead, but isn't part of the manifest's input
+   *  file scope (which only verifies the storage tuple hasn't shifted
+   *  between sign-time and validation-time). */
+  id: string;
+  storage_session_id: string;
+  name: string;
+}
+
+function isPayloadFileRef(file: t.PayloadBody['files'][number]): file is PayloadFileRef {
   return (
     'id' in file &&
-    'session_id' in file &&
+    'storage_session_id' in file &&
     typeof file.id === 'string' &&
-    typeof file.session_id === 'string' &&
+    typeof file.storage_session_id === 'string' &&
     typeof file.name === 'string'
   );
 }
@@ -19,7 +31,7 @@ function isPayloadFileRef(file: t.PayloadBody['files'][number]): file is Executi
 export function collectManifestInputFiles(payload: t.PayloadBody): ExecutionManifestInputFile[] {
   return payload.files
     .filter(isPayloadFileRef)
-    .map(file => ({ id: file.id, session_id: file.session_id, name: file.name }))
+    .map(file => ({ id: file.id, session_id: file.storage_session_id, name: file.name }))
     .sort((a, b) => (
       a.session_id.localeCompare(b.session_id) ||
       a.id.localeCompare(b.id) ||

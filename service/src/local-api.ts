@@ -60,6 +60,13 @@ const localAuth = async (
   };
   req.apiKey = mockApiKey;
   req.planId = 'local-plan';
+  /* Mirror the populate that `apiKeyAuth` does for prod auth. Without
+   * this, sessionKey resolvers that read `codeApiAuthContext.userId`
+   * 500 with "authContext.userId is missing" under local mode. */
+  req.codeApiAuthContext = {
+    ...(req.codeApiAuthContext ?? {}),
+    userId: mockApiKey.userId.toString(),
+  };
   next();
 };
 

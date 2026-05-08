@@ -4,24 +4,37 @@ import type { Request } from 'express';
 import type { ExecutionManifestClaims } from '../execution-manifest';
 import { Jobs } from '@/enum/service';
 
+/**
+ * Per-file vs. top-level session distinction
+ * --------------------------------------------
+ * `storage_session_id` is the long-lived identifier for the bucket of
+ * sandbox object storage where a file's bytes live. Scoped to the file's
+ * owner (skill, agent, user) and survives across sandbox runs. Used in
+ * file-server URLs and as the per-file pointer carried alongside `file_id`
+ * on every reference.
+ *
+ * `session_id` is the transient identifier for one sandbox
+ * `/exec` invocation. Created fresh per call (or reused for continuation),
+ * torn down at completion. Used to address an in-flight execution.
+ *
+ * Both used to be called `session_id` and conflating the two caused real
+ * bugs (the most recent: a worker overwrote storage ids with the exec id
+ * on response, breaking next-turn file mounts). All three repos
+ * (codeapi / `@librechat/agents` / LibreChat) deploy this rename in
+ * lockstep, so no legacy `session_id` alias is kept — old client builds
+ * are not expected after cutover.
+ */
 export type FileRef = {
   id: string;
   name: string;
-  session_id?: string;  // Included for self-contained file references
+  /** Per-file storage session id (where the bytes live in object storage). */
+  storage_session_id?: string;
   path?: string;
   /** Lineage tracking - present if this file was modified from a previous session's file */
   modified_from?: {
     id: string;
-    session_id: string;
+    storage_session_id: string;
   };
-  /**
-   * Echoed back on `inherited: true` files (unchanged input passthroughs)
-   * so the caller's session-state cache can preserve the per-file entity
-   * scope across the round-trip. Without this, callers either lose the
-   * field on every same-name merge (silent 403 on next execute) or have
-   * to defensively carry it forward themselves.
-   */
-  entity_id?: string;
   /**
    * `true` when the sandbox echoed this entry as an unchanged passthrough
    * of an input the caller already owns. Surfaced so callers can render
@@ -30,17 +43,60 @@ export type FileRef = {
   inherited?: true;
 };
 
+/**
+ * Closed set of resource kinds for sandbox file caching. Defined as an
+ * `as const` tuple so the runtime list and the TypeScript union can't
+ * drift on future additions — adding a new kind to the tuple updates
+ * both at once, and the exhaustive `never` check in `resolveSessionKey`
+ * surfaces missing switch arms at compile time.
+ *
+ * - `skill`: shared per skill identity. Cross-user-within-tenant
+ *   sharing. SessionKey omits the user dimension. `version` is required
+ *   so a skill edit naturally invalidates the prior cache entry under
+ *   the new sessionKey.
+ * - `agent`: shared per agent identity. Same sharing semantic as
+ *   skills.
+ * - `user`: user-private. SessionKey is keyed by the requesting user
+ *   from auth context. Used for chat attachments and code-output
+ *   artifacts.
+ */
+export const CODE_ENV_KINDS = ['skill', 'agent', 'user'] as const;
+export type CodeEnvKind = (typeof CODE_ENV_KINDS)[number];
+
 export type RequestFile = {
+  /**
+   * **Storage file id** — the per-file uuid the file_server returns
+   * at upload time and that uniquely identifies the bytes at
+   * `<storage_session_id>/<id>` in the object bucket. Used by the
+   * worker to fetch file contents and by the auth layer's upload-key
+   * existence check.
+   */
   id: string;
-  session_id: string;
+  /**
+   * **Resource id** — the identity of the entity that owns this
+   * file's storage session. Skill `_id` for `kind: 'skill'`, agent
+   * id for `'agent'`, informational-only for `'user'` (sessionKey
+   * derives from auth context). Distinct from `id` (the storage
+   * uuid) — this one drives `resolveSessionKey`. Conflating the two
+   * at the wire level (a single `id` field) caused authorization to
+   * fail on every shared-kind `/exec` because the sessionKey
+   * re-derivation used the storage nanoid as the resource id and
+   * produced a key that didn't match the cached one. See codeapi
+   * #1455 review.
+   */
+  resource_id: string;
+  /** Per-file storage session id (where the bytes live in object storage). */
+  storage_session_id: string;
   name: string;
-  /** Optional per-file entity scope. When present, this file's authorization
-   *  resolves its sessionKey under this entity instead of the request-level
-   *  `entity_id`, allowing one execute call to reference files uploaded under
-   *  different entities (e.g. a skill bundle + a user attachment). Falls back
-   *  to the request-level entity when absent. Charset matches
-   *  `validateEntityIdString`. */
-  entity_id?: string;
+  /** Resource kind. Drives `resolveSessionKey`'s switch — for shared
+   *  kinds (`'skill'`, `'agent'`) the sessionKey omits the user
+   *  dimension; for `'user'` it includes the user from auth context. */
+  kind: CodeEnvKind;
+  /** Resource version. Required when `kind: 'skill'`; rejected
+   *  otherwise. The skill's monotonic version counter scopes the cache
+   *  per revision so any edit naturally invalidates the prior cache
+   *  entry under the new sessionKey. */
+  version?: number;
 };
 
 export type FileRefs = FileRef[];
@@ -60,6 +116,7 @@ export type ExecuteResponse = {
   };
   language: string;
   version: string;
+  /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRefs;
 };
@@ -68,9 +125,7 @@ export interface RequestBody {
   code: string;
   lang: string;
   args?: string[];
-  // session_id: string;
   user_id?: string;
-  entity_id?: string;
   files?: RequestFile[];
 }
 
@@ -78,7 +133,8 @@ export type CreatePayload = { req: AuthenticatedRequest, session_id: string; isP
 export interface FileObject {
   name: string;
   id: string;
-  session_id: string;
+  /** Per-file storage session id. */
+  storage_session_id: string;
   content?: string;
   encoding?: 'base64'|'hex'|'utf8';
   size?: number;
@@ -100,7 +156,14 @@ export interface PayloadBody {
   run_memory_limit?: number;
   run_timeout?: number;
   run_cpu_time?: number;
-  files: Array<PayloadFile | { id: string; session_id: string; name: string; entity_id?: string }>;
+  /* Intra-monorepo wire (service-api → sandbox). Hard rename — no
+   * legacy compat needed because both ends ship together. The sandbox
+   * downloads files by `(storage_session_id, id)`; `kind`/`version`
+   * are sessionKey-derivation inputs at the service entry, never
+   * consumed by the sandbox, so they're intentionally not on this
+   * shape. */
+  files: Array<PayloadFile | { id: string; storage_session_id: string; name: string }>;
+  /** Top-level execution session id (passed to sandbox to seed Job.uuid). */
   session_id?: string;
   args?: string[];
   /**
@@ -114,6 +177,7 @@ export interface PayloadBody {
 }
 
 export type ExecuteResult = {
+  /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   stdout: string;
   stderr: string;
@@ -150,7 +214,10 @@ export type ExecuteJob = Job<JobData, JobResult, Jobs.execute>;
 
 export interface CodeApiAuthContext {
   userId: string;
-  tenantId: string;
+  /** Multi-tenant prefix used by `resolveSessionKey`. Optional because
+   *  single-tenant deploys may not populate it; `TENANT_ISOLATION_STRICT`
+   *  rejects requests missing this field, otherwise `'legacy'` is used. */
+  tenantId?: string;
   orgId?: string;
   serviceId?: string;
   chcUserId?: string;
@@ -179,6 +246,7 @@ export interface ProgrammaticTool {
 export interface ProgrammaticRequestBody {
   code: string;
   tools?: ProgrammaticTool[];
+  /** Top-level execution session id (continuation reuses this). */
   session_id?: string;
   timeout?: number;
   continuation_token?: string;
@@ -188,7 +256,6 @@ export interface ProgrammaticRequestBody {
     is_error?: boolean;
     error_message?: string;
   }>;
-  entity_id?: string;
   user_id?: string;
   files?: RequestFile[];
   /** Optional. Defaults to 'python'. Currently supported: 'python', 'bash'. */
@@ -215,6 +282,7 @@ export interface ProgrammaticResponse {
   stdout?: string;
   stderr?: string;
   files?: FileRefs;
+  /** Top-level execution session id (one sandbox PTC invocation). */
   session_id?: string;
   tool_calls_made?: number;
   execution_time?: number;

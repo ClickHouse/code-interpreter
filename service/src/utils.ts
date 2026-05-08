@@ -44,6 +44,32 @@ export function isValidId(id: string = ''): boolean {
   return /^[A-Za-z0-9_-]{21}$/.test(id);
 }
 
+/**
+ * Resource identifiers (skill `_id`, agent id, user id) come from
+ * heterogeneous upstream identity systems and don't fit the 21-char
+ * nanoid shape `isValidId` enforces for sandbox-generated ids:
+ *
+ *   - Skills: MongoDB `_id` — 24-char hex (`/^[a-f0-9]{24}$/`).
+ *   - Agents: LibreChat agent id — 17-char `agent_<11-char-nanoid>` slug.
+ *   - Users: MongoDB `_id` (24-char hex) or other length depending on
+ *     the host's identity model.
+ *
+ * Kept liberal — alphanumerics + a small set of safe punctuation,
+ * length-bounded — because over-tight format checks here become
+ * cross-org integration friction. The sessionKey itself is the
+ * tamper-resistance boundary; this validator just rejects obvious
+ * garbage (whitespace, control chars, unbounded length).
+ */
+export function isValidResourceId(id: string = ''): boolean {
+  if (!id) {
+    return false;
+  }
+  if (id.length < 1 || id.length > 128) {
+    return false;
+  }
+  return /^[A-Za-z0-9_.:-]+$/.test(id);
+}
+
 export function getAxiosErrorDetails(error: unknown): ErrorDetails | unknown {
   if (axios.isAxiosError(error)) {
     const axiosError = error as AxiosError;

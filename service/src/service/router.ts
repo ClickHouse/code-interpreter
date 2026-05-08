@@ -6,10 +6,10 @@ import type { Response } from 'express';
 import type { Readable } from 'stream';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
-import { sessionAuth, validateEntityId, validateEntityIdString } from '../middleware/auth';
+import { sessionAuth } from '../middleware/auth';
 import { executionLimiter, uploadLimiter, downloadLimiter, fetchLimiter } from '../middleware/limits';
 import { internalServiceHeaders } from '../internal-service-auth';
-import { resolveSessionKey } from '../session-key';
+import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
 import { sleep, getAxiosErrorDetails } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
@@ -74,9 +74,41 @@ function sendFileRefAuthorizationError(
   return false;
 }
 
+/**
+ * Mirrors `sendFileRefAuthorizationError`'s return-true-when-handled
+ * shape and logs the rejection before responding. Without the log,
+ * sessionKey misconfigurations (e.g. middleware not populating
+ * `codeApiAuthContext`, malformed kind/version on uploads) would
+ * surface as 500/400s in the response body with zero server-side
+ * trail — silent in production logs and easy to miss until a user
+ * reports it. Includes auth/request context so the failure mode is
+ * traceable without correlating HTTP captures.
+ */
+function sendSessionKeyResolutionError(
+  error: unknown,
+  res: Response,
+  req: t.AuthenticatedRequest,
+  context: string,
+): boolean {
+  if (error instanceof SessionKeyResolutionError) {
+    logger.error(`[${INSTANCE_ID}] sessionKey resolution failed (${context})`, {
+      status: error.status,
+      message: error.message,
+      method: req.method,
+      path: req.path,
+      requestUserId: req.apiKey?.userId?.toString(),
+      authContextUserId: req.codeApiAuthContext?.userId,
+      tenantId: req.codeApiAuthContext?.tenantId,
+    });
+    res.status(error.status).json({ error: error.message });
+    return true;
+  }
+  return false;
+}
+
 const router = Router();
 
-router.post('/exec', validateEntityId, executionLimiter, async (req: t.AuthenticatedRequest, res) => {
+router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
   const apiKeyString = req.header('X-API-Key') ?? '';
   const apiKeyId = (req.apiKey?._id ?? '').toString();
   const userId = (req.apiKey?.userId ?? '').toString();
@@ -93,20 +125,17 @@ router.post('/exec', validateEntityId, executionLimiter, async (req: t.Authentic
   }
 
   const body = req.body as t.RequestBody;
-  const { user_id, entity_id, lang: rawLang, code, files } = body;
+  const { user_id, lang: rawLang, code, files } = body;
   const language = resolveLanguage(rawLang);
   if (language == null) {
     return res.status(400).json({ error: `Unsupported language: ${rawLang}` });
   }
 
-  const sessionKey = resolveSessionKey(req, userId, entity_id);
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
       req,
       files,
-      userId,
-      entityId: entity_id,
       store: connection,
     });
     body.files = authorizedFiles.length > 0 ? authorizedFiles : undefined;
@@ -116,12 +145,31 @@ router.post('/exec', validateEntityId, executionLimiter, async (req: t.Authentic
     return res.status(500).json({ error: 'Internal server error' });
   }
 
+  /* Output bucket sessionKey is hardcoded user-private regardless of
+   * input file kinds — outputs always belong to the requesting user.
+   * Skill executions do NOT produce a skill-scoped output bucket; that's
+   * a deliberate behavioral change from the legacy entity_id-driven
+   * derivation. See codeapi #1455 / Phase C design. */
+  let sessionKey: string;
+  try {
+    sessionKey = resolveOutputBucketSessionKey(req);
+  } catch (error) {
+    if (sendSessionKeyResolutionError(error, res, req, 'resolveOutputBucketSessionKey')) return;
+    throw error;
+  }
+
+  /* The execute call generates a fresh session id used as both the
+   * Job.uuid (top-level execution scope) and the storage prefix for any
+   * output files this run produces (worker writes to `<uuid>/<file_id>`).
+   * The two roles share the value by design — naming it
+   * `session_id` since the primary semantic is "the running
+   * sandbox invocation." */
   const session_id = nanoid();
   const execution_id = nanoid();
   await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
   try {
-    logger.info('Request received', { userId, apiKeyId, user: user_id, session_id, language, entity_id, files: authorizedFiles, sessionKey });
+    logger.info('Request received', { userId, apiKeyId, user: user_id, session_id, language, files: authorizedFiles, sessionKey });
 
     const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
     const payload = createPayload({
@@ -234,7 +282,14 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
     if (userId == null) return;
 
     const session_id = nanoid();
-    let entity_id: string | undefined;
+    /* `kind`/`id`/`version?` form fields drive the upload-bucket
+     * sessionKey via `resolveSessionKey`, replacing the legacy
+     * `entity_id` form field. Same validation rules as /exec
+     * `RequestFile`: kind is required, version is required for
+     * `'skill'` and forbidden otherwise. */
+    let uploadKind: string | undefined;
+    let uploadId: string | undefined;
+    let uploadVersionRaw: string | undefined;
     let readOnly = false;
     let hasResponded = false;
 
@@ -252,8 +307,12 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
     const uploadPromises: Promise<t.UploadResult>[] = [];
 
     bb.on('field', (fieldname: string, val: string) => {
-      if (fieldname === 'entity_id') {
-        entity_id = val;
+      if (fieldname === 'kind') {
+        uploadKind = val;
+      } else if (fieldname === 'id') {
+        uploadId = val;
+      } else if (fieldname === 'version') {
+        uploadVersionRaw = val;
       } else if (fieldname === 'read_only') {
         /* `read_only=true` declares these uploads as infrastructure inputs
          * (e.g. skill files) — the sandbox API and downstream callers
@@ -288,14 +347,30 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
           reject(new Error('Upload timeout'));
         }, UPLOAD_TIMEOUT_MS);
 
-        if (entity_id != null && !validateEntityIdString(entity_id)) {
+        let sessionKeyInput: SessionKeyInput;
+        try {
+          sessionKeyInput = parseUploadSessionKeyInput({
+            kind: uploadKind,
+            id: uploadId,
+            version: uploadVersionRaw,
+            authContextUserId: req.codeApiAuthContext?.userId ?? userId,
+          });
+        } catch (err) {
           clearTimeout(uploadTimeout);
           file.resume();
-          reject(new Error('Invalid entity ID'));
+          reject(err instanceof Error ? err : new Error(String(err)));
           return;
         }
 
-        const sessionKey = resolveSessionKey(req, userId, entity_id);
+        let sessionKey: string;
+        try {
+          sessionKey = resolveSessionKey(req, sessionKeyInput);
+        } catch (err) {
+          clearTimeout(uploadTimeout);
+          file.resume();
+          reject(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
         connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
         logger.info(`[${INSTANCE_ID}] Upload: Session ID: ${session_id} | User ID: ${userId} | Session key: ${sessionKey}`);
 
@@ -351,11 +426,12 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
       hasResponded = true;
       try {
         const results = await Promise.all(uploadPromises);
-        res.status(200).json({
+        const response: t.UploadResponse = {
           message: 'success',
-          session_id,
+          storage_session_id: session_id,
           files: results,
-        });
+        };
+        res.status(200).json(response);
       } catch (error) {
         logger.error(`[${INSTANCE_ID}] Error uploading files for session ${session_id}:`, error);
         if (!res.headersSent) {
@@ -398,11 +474,24 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     if (userId == null) return;
 
     const session_id = nanoid();
-    let entity_id: string | undefined;
+    /* `kind`/`id`/`version?` form fields drive the batch's sessionKey
+     * — the same shape as `/upload`. See `/upload` for the full
+     * rationale. */
+    let uploadKind: string | undefined;
+    let uploadId: string | undefined;
+    let uploadVersionRaw: string | undefined;
     let readOnly = false;
     let sessionKeySet = false;
     let hasResponded = false;
     let filesLimitReached = false;
+    /* `SessionKeyResolutionError.status` spans 400 | 500 — 400 is a
+     * client-input fault (per-file rejection is OK), 500 signals a
+     * server misconfiguration (e.g. strict-mode tenantId gap) where
+     * masking the failure as a per-file error string would hide an
+     * operational breakage behind a 200/400 response. Latch the first
+     * 500 we see and convert it into a single 500 batch response on
+     * `bb.on('finish')`. */
+    let serverError: SessionKeyResolutionError | undefined;
 
     const planFileSize = planLimits[req.planId ?? '']?.max_file_size ?? planLimits.default.max_file_size;
     /* See note on the single-upload busboy above for why preservePath is set. */
@@ -415,8 +504,12 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     const uploadPromises: Promise<t.BatchUploadFileResult>[] = [];
 
     bb.on('field', (fieldname: string, val: string) => {
-      if (fieldname === 'entity_id') {
-        entity_id = val;
+      if (fieldname === 'kind') {
+        uploadKind = val;
+      } else if (fieldname === 'id') {
+        uploadId = val;
+      } else if (fieldname === 'version') {
+        uploadVersionRaw = val;
       } else if (fieldname === 'read_only') {
         /* See `/upload` for semantics. The flag applies to every file in
          * this batch — sized for skill priming where all files share the
@@ -449,14 +542,39 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
           resolve({ status: 'error', filename, error: 'Upload timeout' });
         }, UPLOAD_TIMEOUT_MS);
 
-        if (entity_id != null && !validateEntityIdString(entity_id)) {
+        let sessionKeyInput: SessionKeyInput;
+        try {
+          sessionKeyInput = parseUploadSessionKeyInput({
+            kind: uploadKind,
+            id: uploadId,
+            version: uploadVersionRaw,
+            authContextUserId: req.codeApiAuthContext?.userId ?? userId,
+          });
+        } catch (err) {
           clearTimeout(uploadTimeout);
           file.resume();
-          resolve({ status: 'error', filename, error: 'Invalid entity ID' });
+          const message = err instanceof Error ? err.message : 'Invalid upload identity';
+          resolve({ status: 'error', filename, error: message });
           return;
         }
 
-        const sessionKey = resolveSessionKey(req, userId, entity_id);
+        let sessionKey: string;
+        try {
+          sessionKey = resolveSessionKey(req, sessionKeyInput);
+        } catch (err) {
+          clearTimeout(uploadTimeout);
+          file.resume();
+          /* Latch 500-class errors so `bb.on('finish')` can surface
+           * them as a single batch-level 500. Per-file degradation is
+           * the right call for 400-class faults but masks server
+           * misconfiguration. */
+          if (err instanceof SessionKeyResolutionError && err.status === 500 && !serverError) {
+            serverError = err;
+          }
+          const message = err instanceof Error ? err.message : 'Failed to resolve sessionKey';
+          resolve({ status: 'error', filename, error: message });
+          return;
+        }
         if (!sessionKeySet) {
           connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
           sessionKeySet = true;
@@ -523,14 +641,29 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
       try {
         const results = await Promise.all(uploadPromises);
 
+        /* If sessionKey resolution faulted with a 500 status (server
+         * misconfiguration — see `serverError` declaration above),
+         * surface the fault as a single batch-level 500 instead of
+         * per-file errors. This avoids quietly returning 200 with
+         * `partial_success` when a tenantId gap or similar makes
+         * EVERY upload structurally impossible. */
+        if (serverError) {
+          logger.error(
+            `[${INSTANCE_ID}] Batch upload faulted on sessionKey resolution: ${serverError.message}`,
+            { session_id, files: results.length },
+          );
+          res.status(500).json({ error: serverError.message });
+          return;
+        }
+
         if (results.length === 0) {
           res.status(400).json({ error: 'No files provided' });
           return;
         }
 
-        if (entity_id != null && validateEntityIdString(entity_id)) {
-          connection.set(`session:${session_id}`, resolveSessionKey(req, userId, entity_id), 'EX', env.SESSION_CACHE_TTL);
-        }
+        /* SessionKey was set inline in the per-file handler under
+         * `sessionKeySet`. No batch-level fallback needed: if zero files
+         * succeeded, no session was created. */
 
         let succeeded = 0;
         let failed = 0;
@@ -547,7 +680,7 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
         const statusCode = message === 'error' ? 400 : 200;
         const response: t.BatchUploadResponse = {
           message,
-          session_id,
+          storage_session_id: session_id,
           files: results,
           succeeded,
           failed,
@@ -582,7 +715,7 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
   }
 });
 
-router.get('/files/:session_id', fetchLimiter, validateEntityId, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
+router.get('/files/:session_id', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id } = req.params;
   const { detail = 'simple' } = req.query;
 
@@ -615,7 +748,7 @@ router.get('/files/:session_id', fetchLimiter, validateEntityId, sessionAuth, as
  * authenticated by `sessionAuth` so the requester must own the
  * `(session_id, entity_id)` pair the file was stored under.
  */
-router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, validateEntityId, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
+router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
 
   try {
@@ -638,7 +771,7 @@ router.get('/sessions/:session_id/objects/:fileId', fetchLimiter, validateEntity
   }
 });
 
-router.delete('/files/:session_id/:fileId', fetchLimiter, validateEntityId, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
+router.delete('/files/:session_id/:fileId', fetchLimiter, sessionAuth, async (req: t.AuthenticatedRequest, res: Response) => {
   const { session_id, fileId } = req.params;
 
   try {

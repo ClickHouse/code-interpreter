@@ -25,6 +25,12 @@ export class ExecutionManifestError extends Error {
 
 export interface ExecutionManifestInputFile {
   id: string;
+  /** Per-file storage session id. Kept as `session_id` (rather than
+   *  renamed alongside the wire body field) so the manifest version
+   *  doesn't need bumping — in-flight tokens remain valid through a
+   *  rolling deploy. The wire body field is `storage_session_id`; the
+   *  service maps to `session_id` at manifest construction and the
+   *  worker maps back at validation. */
   session_id: string;
   name: string;
 }

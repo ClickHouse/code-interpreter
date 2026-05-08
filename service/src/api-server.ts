@@ -49,6 +49,15 @@ const localAuth = async (
   };
   req.apiKey = mockApiKey;
   req.planId = 'local-plan';
+  /* Mirror the populate that `apiKeyAuth` does for prod auth — both
+   * code paths must set `codeApiAuthContext` so sessionKey resolvers
+   * have a userId. Without this, /exec under LOCAL_MODE 500s with
+   * "authContext.userId is missing" while prod works fine, masking
+   * the regression for anyone running locally. */
+  req.codeApiAuthContext = {
+    ...(req.codeApiAuthContext ?? {}),
+    userId: mockApiKey.userId.toString(),
+  };
   next();
 };
 

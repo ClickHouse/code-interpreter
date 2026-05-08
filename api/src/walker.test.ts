@@ -23,8 +23,8 @@ interface WalkerInternals {
   submissionDir: string;
   entryPointName: string | undefined;
   generatedFiles: Array<{ id: string; name: string; path: string }>;
-  sessionFiles: Array<{ id: string; name: string; session_id: string; modified_from?: { id: string; session_id: string }; inherited?: true; entity_id?: string }>;
-  inheritedRefs: Array<{ id: string; name: string; session_id: string; inherited?: true; entity_id?: string }>;
+  sessionFiles: Array<{ id: string; name: string; storage_session_id: string; modified_from?: { id: string; storage_session_id: string }; inherited?: true; entity_id?: string }>;
+  inheritedRefs: Array<{ id: string; name: string; storage_session_id: string; inherited?: true; entity_id?: string }>;
   inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string; readOnly?: boolean }>;
   files: TFile[];
   walkDir: (dir: string, depth: number, inputByName: Map<string, TFile>) => Promise<'collected' | 'empty' | 'skipped'>;
@@ -56,6 +56,9 @@ function makeRuntime(language = 'python', maxFileSize = 10_000_000): Runtime {
 function makeJob(opts: {
   files?: TFile[];
   language?: string;
+  /* The Job-constructor seed for `this.uuid` — top-level execution
+   * session id (one sandbox `/exec` invocation), not the per-file
+   * `storage_session_id` carried on each file ref. */
   session_id?: string;
   maxFileSize?: number;
 } = {}): Job {
@@ -131,7 +134,7 @@ describe('walkDir / inherited .dirkeep preservation', () => {
 
     const inheritedFile: TFile = {
       id: 'prior-id',
-      session_id: 'prior-session',
+      storage_session_id: 'prior-session',
       name: keepRel,
     };
     const job = makeJob();
@@ -151,7 +154,7 @@ describe('walkDir / inherited .dirkeep preservation', () => {
     expect(internals.inheritedRefs[0]).toEqual({
       id: 'prior-id',
       name: keepRel,
-      session_id: 'prior-session',
+      storage_session_id: 'prior-session',
       inherited: true,
     });
   });
@@ -164,7 +167,7 @@ describe('walkDir / inherited .dirkeep preservation', () => {
 
     const inheritedFile: TFile = {
       id: 'prior-id',
-      session_id: 'prior-session',
+      storage_session_id: 'prior-session',
       name: keepRel,
     };
     const job = makeJob({ session_id: 'current-session' });
@@ -182,10 +185,10 @@ describe('walkDir / inherited .dirkeep preservation', () => {
     expect(internals.inheritedRefs).toHaveLength(0);
     expect(internals.generatedFiles).toHaveLength(1);
     expect(internals.sessionFiles).toHaveLength(1);
-    expect(internals.sessionFiles[0].session_id).toBe('current-session');
+    expect(internals.sessionFiles[0].storage_session_id).toBe('current-session');
     expect(internals.sessionFiles[0].modified_from).toEqual({
       id: 'prior-id',
-      session_id: 'prior-session',
+      storage_session_id: 'prior-session',
     });
   });
 });
@@ -233,7 +236,7 @@ describe('walkDir / inline .dirkeep files', () => {
 
     /* Inline inputs have no persistent id, so skipping re-emission would
      * make the empty directory disappear on the next request. The client
-     * must receive a fresh {id, session_id} ref for each run. */
+     * must receive a fresh {id, storage_session_id} ref for each run. */
     const emitted = internals.generatedFiles.find(f => f.name === keepRel);
     expect(emitted).toBeDefined();
     const sessionRef = internals.sessionFiles.find(f => f.name === keepRel);
@@ -271,7 +274,7 @@ describe('walkDir / regular file handling', () => {
 
     const downloaded: TFile = {
       id: 'download-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name,
     };
     const job = makeJob();
@@ -288,7 +291,7 @@ describe('walkDir / regular file handling', () => {
 
     expect(internals.inheritedRefs).toHaveLength(1);
     expect(internals.inheritedRefs[0].id).toBe('download-id');
-    expect(internals.inheritedRefs[0].session_id).toBe('prev-session');
+    expect(internals.inheritedRefs[0].storage_session_id).toBe('prev-session');
     expect(internals.inheritedRefs[0].inherited).toBe(true);
     expect(internals.generatedFiles).toHaveLength(0);
   });
@@ -309,7 +312,7 @@ describe('walkDir / regular file handling', () => {
 
     const downloaded: TFile = {
       id: 'doc-id',
-      session_id: 'storage-session-A',
+      storage_session_id: 'storage-session-A',
       name,
       entity_id: 'skill-pptx-123',
     };
@@ -335,7 +338,7 @@ describe('walkDir / regular file handling', () => {
     expect(internals.inheritedRefs[0]).toEqual({
       id: 'doc-id',
       name,
-      session_id: 'storage-session-A',
+      storage_session_id: 'storage-session-A',
       inherited: true,
       entity_id: 'skill-pptx-123',
     });
@@ -350,7 +353,7 @@ describe('walkDir / regular file handling', () => {
 
     const downloaded: TFile = {
       id: 'download-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name,
     };
     const job = makeJob();
@@ -380,7 +383,7 @@ describe('walkDir / regular file handling', () => {
 
     const downloaded: TFile = {
       id: 'stale-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name,
     };
     const job = makeJob();
@@ -394,7 +397,7 @@ describe('walkDir / regular file handling', () => {
     expect(internals.generatedFiles[0].id).not.toBe('stale-id');
     const sessionRef = internals.sessionFiles.find(f => f.name === name);
     expect(sessionRef?.id).toBe(internals.generatedFiles[0].id);
-    expect(sessionRef?.session_id).toBe('test-session');
+    expect(sessionRef?.storage_session_id).toBe('test-session');
   });
 
   it('skips unchanged inline entry-point source (no round-trip)', async () => {
@@ -432,7 +435,7 @@ describe('walkDir / regular file handling', () => {
 
     expect(internals.generatedFiles).toHaveLength(1);
     expect(internals.generatedFiles[0].name).toBe(name);
-    expect(internals.sessionFiles[0].session_id).toBe('cur');
+    expect(internals.sessionFiles[0].storage_session_id).toBe('cur');
     expect(internals.sessionFiles[0].modified_from).toBeUndefined();
   });
 
@@ -441,7 +444,7 @@ describe('walkDir / regular file handling', () => {
     const full = path.join(tmpDir, name);
     await fsp.writeFile(full, 'new-content');
 
-    const downloaded: TFile = { id: 'orig-id', session_id: 'orig-session', name };
+    const downloaded: TFile = { id: 'orig-id', storage_session_id: 'orig-session', name };
     const job = makeJob({ session_id: 'cur' });
     const internals = asInternals(job);
     internals.submissionDir = tmpDir;
@@ -457,7 +460,7 @@ describe('walkDir / regular file handling', () => {
     expect(internals.generatedFiles).toHaveLength(1);
     expect(internals.sessionFiles[0].modified_from).toEqual({
       id: 'orig-id',
-      session_id: 'orig-session',
+      storage_session_id: 'orig-session',
     });
     /* Modified-input refresh emits a brand-new ref the caller owns; it must NOT
      * carry the `inherited` flag (callers should download it like any output). */
@@ -531,7 +534,7 @@ describe('walkDir / read-only inputs', () => {
     await fsp.mkdir(path.dirname(full), { recursive: true });
     await fsp.writeFile(full, 'sandbox-mutated-bytes');
 
-    const downloaded: TFile = { id: 'skill-id', session_id: 'skill-session', name };
+    const downloaded: TFile = { id: 'skill-id', storage_session_id: 'skill-session', name };
     const job = makeJob({ session_id: 'cur' });
     const internals = asInternals(job);
     internals.submissionDir = tmpDir;
@@ -550,7 +553,7 @@ describe('walkDir / read-only inputs', () => {
     expect(internals.inheritedRefs[0]).toEqual({
       id: 'skill-id',
       name,
-      session_id: 'skill-session',
+      storage_session_id: 'skill-session',
       inherited: true,
     });
   });
@@ -562,7 +565,7 @@ describe('walkDir / read-only inputs', () => {
     const bytes = 'apache-2.0';
     await fsp.writeFile(full, bytes);
 
-    const downloaded: TFile = { id: 'lic-id', session_id: 'skill-session', name };
+    const downloaded: TFile = { id: 'lic-id', storage_session_id: 'skill-session', name };
     const job = makeJob({ session_id: 'cur' });
     const internals = asInternals(job);
     internals.submissionDir = tmpDir;
@@ -590,7 +593,7 @@ describe('walkDir / read-only inputs', () => {
     const full = path.join(tmpDir, name);
     await fsp.writeFile(full, 'user-edited-bytes');
 
-    const downloaded: TFile = { id: 'data-id', session_id: 'prev', name };
+    const downloaded: TFile = { id: 'data-id', storage_session_id: 'prev', name };
     const job = makeJob({ session_id: 'cur' });
     const internals = asInternals(job);
     internals.submissionDir = tmpDir;
@@ -608,7 +611,7 @@ describe('walkDir / read-only inputs', () => {
     expect(internals.inheritedRefs).toHaveLength(0);
     expect(internals.sessionFiles[0].modified_from).toEqual({
       id: 'data-id',
-      session_id: 'prev',
+      storage_session_id: 'prev',
     });
   });
 });
@@ -636,7 +639,7 @@ describe('walkDir / output caps', () => {
       const name = `inh${i}.py`;
       const full = path.join(tmpDir, name);
       await fsp.writeFile(full, `content-${i}`);
-      inputs.push({ id: `id-${i}`, session_id: 'prev', name });
+      inputs.push({ id: `id-${i}`, storage_session_id: 'prev', name });
     }
 
     const job = makeJob();
@@ -647,7 +650,7 @@ describe('walkDir / output caps', () => {
         hash: sha256(`content-${f.name.slice(3, -3)}`),
         path: path.join(tmpDir, f.name),
         originalId: f.id,
-        originalSessionId: f.session_id,
+        originalSessionId: f.storage_session_id,
       });
     }
 
@@ -697,7 +700,7 @@ describe('handleSessionFiles / priority-fill composition', () => {
       const name = path.join('inh', `prev${i}.py`);
       const full = path.join(tmpDir, name);
       await fsp.writeFile(full, `prev-${i}`);
-      inherited.push({ id: `prev-id-${i}`, session_id: 'prev-session', name });
+      inherited.push({ id: `prev-id-${i}`, storage_session_id: 'prev-session', name });
     }
 
     const job = makeJob({ files: inherited, session_id: 'cur' });
@@ -709,7 +712,7 @@ describe('handleSessionFiles / priority-fill composition', () => {
         hash: sha256(`prev-${f.name.match(/prev(\d+)/)![1]}`),
         path: path.join(tmpDir, f.name),
         originalId: f.id,
-        originalSessionId: f.session_id,
+        originalSessionId: f.storage_session_id,
       });
     }
 
@@ -743,7 +746,7 @@ describe('handleSessionFiles / priority-fill composition', () => {
     const inheritedFull = path.join(tmpDir, inheritedName);
     await fsp.writeFile(inheritedFull, 'prev');
     const inherited: TFile[] = [
-      { id: 'prev-id', session_id: 'prev-session', name: inheritedName },
+      { id: 'prev-id', storage_session_id: 'prev-session', name: inheritedName },
     ];
 
     const job = makeJob({ files: inherited, session_id: 'cur' });
@@ -863,7 +866,7 @@ describe('isOutputCapFull / early termination when generated files hit cap', () 
     const internals = asInternals(job);
 
     for (let i = 0; i < cap; i++) {
-      internals.inheritedRefs.push({ id: `i${i}`, name: `f${i}.py`, session_id: 'prev' });
+      internals.inheritedRefs.push({ id: `i${i}`, name: `f${i}.py`, storage_session_id: 'prev' });
     }
     /* Stopping walk here would silently drop later-visited generated files;
      * per-push guards already bound inheritedRefs memory. */
@@ -874,7 +877,7 @@ describe('isOutputCapFull / early termination when generated files hit cap', () 
     const job = makeJob();
     const internals = asInternals(job);
     internals.generatedFiles.push({ id: 'g', name: 'g.py', path: '/tmp/g.py' });
-    internals.inheritedRefs.push({ id: 'i', name: 'i.py', session_id: 'prev' });
+    internals.inheritedRefs.push({ id: 'i', name: 'i.py', storage_session_id: 'prev' });
     expect(asProbe(job).isOutputCapFull()).toBe(false);
   });
 });
@@ -915,7 +918,7 @@ describe('walkDir / hidden-directory filter', () => {
     const inputFull = path.join(tmpDir, inputRel);
     await fsp.writeFile(inputFull, 'hello');
 
-    const inputFile: TFile = { id: 'i1', session_id: 'prev', name: inputRel };
+    const inputFile: TFile = { id: 'i1', storage_session_id: 'prev', name: inputRel };
     const job = makeJob();
     const internals = asInternals(job);
     internals.submissionDir = tmpDir;

@@ -1,13 +1,43 @@
 // src/middleware/auth.ts
 import { validateAndGetUser, validateUser, validateApiKey, ErrorMessages, UserErrors, KeyErrors } from '@librechat/api-keys';
 import type { ServiceUser, IApiKey } from '@librechat/api-keys';
-import type { Request, Response, NextFunction } from 'express';
+import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest } from '../types';
 import { connection } from '../queue';
 import { isValidId } from '../utils';
 import { env } from '../config';
-import { resolveSessionKey } from '../session-key';
+import { resolveSessionKey, parseUploadSessionKeyInput, SessionKeyResolutionError } from '../session-key';
 import logger from '../logger';
+
+/**
+ * Mirrors the helper in `service/router.ts`. Returns true when the
+ * error was a SessionKeyResolutionError and the response was sent
+ * (with a logged trail); false otherwise so the caller can rethrow.
+ * Centralizing the log gives a server-side breadcrumb for sessionKey
+ * misconfigurations that would otherwise only surface in response
+ * bodies.
+ */
+const logSessionKeyResolutionError = (
+  err: unknown,
+  res: Response,
+  req: AuthenticatedRequest,
+  context: string,
+): boolean => {
+  if (err instanceof SessionKeyResolutionError) {
+    logger.error(`sessionKey resolution failed (${context})`, {
+      status: err.status,
+      message: err.message,
+      method: req.method,
+      path: req.path,
+      requestUserId: req.apiKey?.userId?.toString(),
+      authContextUserId: req.codeApiAuthContext?.userId,
+      tenantId: req.codeApiAuthContext?.tenantId,
+    });
+    res.status(err.status).json({ error: err.message });
+    return true;
+  }
+  return false;
+};
 
 const checkUser = async (req: AuthenticatedRequest, userId: string): Promise<void> => {
   const cachedUser = await connection.get(`user:${userId}`) ?? '';
@@ -109,6 +139,18 @@ export const apiKeyAuth = async (
     }
 
     req.apiKey = apiKey;
+    /* Populate the canonical `codeApiAuthContext` from the validated
+     * API key. `resolveSessionKey` and `resolveOutputBucketSessionKey`
+     * read this directly with no fallback to `req.apiKey.userId`, so
+     * leaving it unset throws "authContext.userId is missing" on
+     * every `/exec`. Single-tenant deploys leave `tenantId` undefined
+     * — `TENANT_ISOLATION_STRICT=false` (default) folds that to
+     * `'legacy'`; multi-tenant deploys flip STRICT on once a real
+     * tenantId is available from the auth artifact. */
+    req.codeApiAuthContext = {
+      ...(req.codeApiAuthContext ?? {}),
+      userId,
+    };
     next();
   } catch (error) {
     const message = ((error as Error | undefined)?.message ?? '') as UserErrors | KeyErrors;
@@ -118,6 +160,18 @@ export const apiKeyAuth = async (
   }
 };
 
+/**
+ * Verify the requester is authorized to read the given storage session.
+ *
+ * Looks up the cached sessionKey for `session_id` (set at upload time
+ * by `/upload` or `/upload/batch`) and compares it to the sessionKey
+ * the requester would derive from their auth context plus the
+ * `kind`/`id`/`version?` URL query params. Equality is the entire
+ * authorization check — for shared kinds (`'skill'`, `'agent'`) any
+ * user in the same tenant who supplies the matching kind/id/version
+ * resolves the same key and is authorized; for `'user'` only the
+ * uploading user does.
+ */
 export const sessionAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void | Response> => {
   const { session_id, fileId } = req.params as { session_id?: string; fileId?: string };
 
@@ -129,16 +183,40 @@ export const sessionAuth = async (req: AuthenticatedRequest, res: Response, next
     return res.status(400).json({ error: 'Bad request' });
   }
 
-  const userId =  (req.apiKey?.userId ?? '').toString();
+  const userId = (req.apiKey?.userId ?? '').toString();
   if (!userId) {
     return res.status(401).json({ error: 'User not found' });
   }
 
-  const { entity_id } = req.query;
-  if (entity_id != null && typeof entity_id !== 'string') {
-    return res.status(400).json({ error: 'Bad request' });
+  const { kind, id, version } = req.query;
+  if (kind !== undefined && typeof kind !== 'string') return res.status(400).json({ error: 'Bad request' });
+  if (id !== undefined && typeof id !== 'string') return res.status(400).json({ error: 'Bad request' });
+  if (version !== undefined && typeof version !== 'string') return res.status(400).json({ error: 'Bad request' });
+
+  let sessionKeyInput;
+  try {
+    sessionKeyInput = parseUploadSessionKeyInput({
+      kind: kind as string | undefined,
+      id: id as string | undefined,
+      version: version as string | undefined,
+      authContextUserId: req.codeApiAuthContext?.userId ?? userId,
+    });
+  } catch (err) {
+    if (logSessionKeyResolutionError(err, res, req, 'sessionAuth: parseUploadSessionKeyInput')) {
+      return;
+    }
+    throw err;
   }
-  const sessionKey = resolveSessionKey(req, userId, entity_id);
+
+  let sessionKey: string;
+  try {
+    sessionKey = resolveSessionKey(req, sessionKeyInput);
+  } catch (err) {
+    if (logSessionKeyResolutionError(err, res, req, 'sessionAuth: resolveSessionKey')) {
+      return;
+    }
+    throw err;
+  }
   const cachedSessionKey = await connection.get(`session:${session_id}`);
   if (cachedSessionKey !== sessionKey) {
     logger.error(`Unauthorized download: Cached session key: ${cachedSessionKey} | Expected session key: ${sessionKey} | Session ID: ${session_id} | File ID: ${fileId}`);
@@ -147,51 +225,4 @@ export const sessionAuth = async (req: AuthenticatedRequest, res: Response, next
 
   req.sessionKey = sessionKey;
   next();
-};
-
-const validPattern = /^[A-Za-z0-9_-]+$/;
-export const validateEntityId = (req: Request, res: Response, next: NextFunction): void | Response => {
-  // Check both query and body
-  const entityId = req.query.entity_id ?? req.body.entity_id;
-
-  // Skip validation if entity_id is undefined or null
-  if (entityId == null) {
-    return next();
-  }
-
-  // Check if entity_id is a string
-  if (typeof entityId !== 'string') {
-    return res.status(400).json({
-      error: 'Invalid entity_id format',
-      details: 'entity_id must be a string'
-    });
-  }
-
-  // Check length
-  if (entityId.length > 40) {
-    return res.status(400).json({
-      error: 'Invalid entity_id length',
-      details: 'entity_id must not exceed 40 characters'
-    });
-  }
-
-  // Check pattern: only alphanumeric characters, underscores, and hyphens
-  const validPattern = /^[A-Za-z0-9_-]+$/;
-  if (!validPattern.test(entityId)) {
-    return res.status(400).json({
-      error: 'Invalid entity_id format',
-      details: 'entity_id must contain only alphanumeric characters, underscores, and hyphens'
-    });
-  }
-
-  next();
-};
-
-// Helper function for busboy validation
-export const validateEntityIdString = (entityId: string): boolean => {
-  if (entityId.length > 40) {
-    return false;
-  }
-
-  return validPattern.test(entityId);
 };

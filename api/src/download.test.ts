@@ -123,10 +123,10 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
      * where the user expects to `cat` it on the next turn. */
     const file: TFile = {
       id: 'nested-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name: 'flat-fallback.txt',
     };
-    routes.set(`/sessions/${encodeURIComponent(file.session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
+    routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
       contentDisposition: "attachment; filename*=UTF-8''proj%2Fnotes.txt",
       body: 'hello from a nested artifact\n',
@@ -150,10 +150,10 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
      * parser must still find a name and write the file. */
     const file: TFile = {
       id: 'legacy-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name: 'ignored.txt',
     };
-    routes.set(`/sessions/${encodeURIComponent(file.session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
+    routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
       contentDisposition: 'attachment; filename="legacy.txt"',
       body: 'legacy bytes',
@@ -172,10 +172,10 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
   it('decodes UTF-8 percent-encoded names with non-ASCII characters', async () => {
     const file: TFile = {
       id: 'utf8-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name: 'ignored.txt',
     };
-    routes.set(`/sessions/${encodeURIComponent(file.session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
+    routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
       contentDisposition: "attachment; filename*=UTF-8''%E4%BD%A0%E5%A5%BD.txt",
       body: 'hi',
@@ -194,7 +194,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
   it('returns null when the server keeps 404-ing past the retry cap (no phantom write)', async () => {
     const file: TFile = {
       id: 'missing-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name: 'should-not-exist.txt',
     };
     /* No route registered → listener returns 404 for every retry. */
@@ -217,10 +217,10 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
      * `validateFilePath` aborts before any write happens. */
     const file: TFile = {
       id: 'evil-id',
-      session_id: 'prev-session',
+      storage_session_id: 'prev-session',
       name: 'innocent.txt',
     };
-    routes.set(`/sessions/${encodeURIComponent(file.session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
+    routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
       status: 200,
       contentDisposition: "attachment; filename*=UTF-8''..%2F..%2Fescape.txt",
       body: 'should never be written',

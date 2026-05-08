@@ -385,19 +385,19 @@ describe('mapWithConcurrency', () => {
 });
 
 describe('isNormalizedObjectForSession', () => {
-  it('accepts a well-formed object whose session_id matches', () => {
+  it('accepts a well-formed object whose storage_session_id matches', () => {
     const guard = isNormalizedObjectForSession('sess-abc');
-    expect(guard({ id: 'x', name: 'n', session_id: 'sess-abc' })).toBe(true);
+    expect(guard({ id: 'x', name: 'n', storage_session_id: 'sess-abc' })).toBe(true);
   });
 
-  it('rejects an object whose session_id is a shorter prefix (MinIO leak)', () => {
+  it('rejects an object whose storage_session_id is a shorter prefix (MinIO leak)', () => {
     const guard = isNormalizedObjectForSession('sess-abc');
-    expect(guard({ id: 'x', name: 'n', session_id: 'sess' })).toBe(false);
+    expect(guard({ id: 'x', name: 'n', storage_session_id: 'sess' })).toBe(false);
   });
 
-  it('rejects an object whose session_id is a longer prefix-match', () => {
+  it('rejects an object whose storage_session_id is a longer prefix-match', () => {
     const guard = isNormalizedObjectForSession('abc');
-    expect(guard({ id: 'x', name: 'n', session_id: 'abcdef' })).toBe(false);
+    expect(guard({ id: 'x', name: 'n', storage_session_id: 'abcdef' })).toBe(false);
   });
 
   it('rejects non-objects', () => {
@@ -408,18 +408,18 @@ describe('isNormalizedObjectForSession', () => {
     expect(guard('str')).toBe(false);
   });
 
-  it('rejects objects missing any of id/name/session_id', () => {
+  it('rejects objects missing any of id/name/storage_session_id', () => {
     const guard = isNormalizedObjectForSession('s');
-    expect(guard({ name: 'n', session_id: 's' })).toBe(false);
-    expect(guard({ id: 'x', session_id: 's' })).toBe(false);
+    expect(guard({ name: 'n', storage_session_id: 's' })).toBe(false);
+    expect(guard({ id: 'x', storage_session_id: 's' })).toBe(false);
     expect(guard({ id: 'x', name: 'n' })).toBe(false);
   });
 
   it('rejects objects whose fields are non-string', () => {
     const guard = isNormalizedObjectForSession('s');
-    expect(guard({ id: 1, name: 'n', session_id: 's' })).toBe(false);
-    expect(guard({ id: 'x', name: 2, session_id: 's' })).toBe(false);
-    expect(guard({ id: 'x', name: 'n', session_id: 3 })).toBe(false);
+    expect(guard({ id: 1, name: 'n', storage_session_id: 's' })).toBe(false);
+    expect(guard({ id: 'x', name: 2, storage_session_id: 's' })).toBe(false);
+    expect(guard({ id: 'x', name: 'n', storage_session_id: 3 })).toBe(false);
   });
 });
 

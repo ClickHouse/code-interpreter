@@ -74,7 +74,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       );
     }
 
-    const response = await axios.post<Log>(
+    const response = await axios.post<Log & { files?: t.FileRefs }>(
       `${SANDBOX_ENDPOINT}/${Jobs.execute}`,
       payload,
       {
@@ -107,7 +107,12 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
     const result: t.ExecuteResult = {
       session_id: response.data.session_id,
-      files,
+      /* `files` is optional on the sandbox response (e.g. dry-run
+       * execute with no outputs); the public `ExecuteResult.files` is
+       * required and downstream callers always iterate it. Default to
+       * `[]` so the strictened response type from Phase B doesn't
+       * surface a regression that wasn't there before. */
+      files: files ?? [],
       stdout,
       stderr,
     };

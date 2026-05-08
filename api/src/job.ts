@@ -180,20 +180,20 @@ export function resolveOriginalName(response: Response, file: TFile): string {
 
 /**
  * Type-guard factory for the file server's normalized-detail response. Only
- * accepts objects whose `session_id` matches `sid` exactly, closing the
- * MinIO prefix-list leak where listing `abc` also returns keys under
+ * accepts objects whose `storage_session_id` matches `sid` exactly, closing
+ * the MinIO prefix-list leak where listing `abc` also returns keys under
  * `abcdef/`. Exported for unit testing.
  */
 export function isNormalizedObjectForSession(
   sid: string,
-): (o: unknown) => o is { id: string; name: string; session_id: string } {
-  return (o): o is { id: string; name: string; session_id: string } => {
+): (o: unknown) => o is { id: string; name: string; storage_session_id: string } {
+  return (o): o is { id: string; name: string; storage_session_id: string } => {
     if (!o || typeof o !== 'object') return false;
     const rec = o as Record<string, unknown>;
     if (typeof rec.id !== 'string') return false;
     if (typeof rec.name !== 'string') return false;
-    if (typeof rec.session_id !== 'string') return false;
-    return rec.session_id === sid;
+    if (typeof rec.storage_session_id !== 'string') return false;
+    return rec.storage_session_id === sid;
   };
 }
 
@@ -540,7 +540,10 @@ const SUPPORTED_EXTENSIONS = new Set([
 
 export interface TFile {
   id?: string;
-  session_id?: string;
+  /** Per-file storage session id (where the file's bytes live in object
+   *  storage). Distinct from the top-level execution session of a `/exec`
+   *  call — those are different concepts and were historically conflated. */
+  storage_session_id?: string;
   name: string;
   content?: string;
   encoding?: 'base64' | 'hex' | 'utf8';
@@ -556,8 +559,9 @@ export interface TFile {
 interface FileRef {
   id: string;
   name: string;
-  session_id: string;
-  modified_from?: { id: string; session_id: string };
+  /** Per-file storage session id (where the bytes live). */
+  storage_session_id: string;
+  modified_from?: { id: string; storage_session_id: string };
   /**
    * `true` when this ref is an unchanged passthrough of an input the caller
    * already owns (downloaded inputs, inherited `.dirkeep` markers). Surfaced
@@ -600,6 +604,7 @@ interface ExecuteResult {
   run?: NsJailResult;
   language: string;
   version: string;
+  /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRef[];
 }
@@ -628,6 +633,9 @@ export class Job {
   private chmoddedDirs = new Set<string>();
 
   constructor(opts: {
+    /** Top-level execution session id. Becomes `Job.uuid` and is the id
+     *  used to address an in-flight execution. Distinct from per-file
+     *  `storage_session_id`. */
     session_id?: string | null;
     runtime: Runtime;
     files: TFile[];
@@ -643,7 +651,11 @@ export class Job {
     this.runtime = opts.runtime;
     this.files = opts.files.map((file, i) => ({
       id: file.id,
-      session_id: file.session_id ?? this.uuid,
+      /* When the input doesn't carry a per-file storage id (e.g. inline
+       * source supplied as `content`), fall back to the execution id —
+       * historically these collapsed onto the same `session_id` field
+       * which is exactly the conflation this rename eliminates. */
+      storage_session_id: file.storage_session_id ?? this.uuid,
       name: file.name || `file${i}.code`,
       content: file.content,
       encoding: (['base64', 'hex', 'utf8'] as const).includes(file.encoding as 'base64' | 'hex' | 'utf8')
@@ -724,7 +736,7 @@ export class Job {
 
     this.log.info({ submissionDir: this.submissionDir }, 'Priming job');
 
-    if (config.file_server_url && this.files.some(f => f.id && f.session_id)) {
+    if (config.file_server_url && this.files.some(f => f.id && f.storage_session_id)) {
       await this.autoLoadDirkeep();
     }
 
@@ -741,7 +753,7 @@ export class Job {
 
   private async autoLoadDirkeep(): Promise<void> {
     const sessionIds = new Set(
-      this.files.filter(f => f.id && f.session_id).map(f => f.session_id!),
+      this.files.filter(f => f.id && f.storage_session_id).map(f => f.storage_session_id!),
     );
     const existingNames = new Set(this.files.map(f => f.name));
     const explicitFilePaths = this.files
@@ -773,13 +785,13 @@ export class Job {
    * `.dirkeep` markers belonging to exactly that session. Guards against:
    *   - non-OK responses (empty list, no throw)
    *   - non-array JSON bodies
-   *   - missing/malformed id/name/session_id fields
+   *   - missing/malformed id/name/storage_session_id fields
    *   - MinIO prefix-list leakage (`abc` prefix also matches `abcdef/...`)
-   *     by requiring `session_id === sid`.
+   *     by requiring `storage_session_id === sid`.
    */
   private async fetchSessionMarkers(
     sid: string,
-  ): Promise<Array<{ id: string; name: string; session_id: string }>> {
+  ): Promise<Array<{ id: string; name: string; storage_session_id: string }>> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), AUTO_LOAD_DIRKEEP_TIMEOUT_MS);
     try {
@@ -809,7 +821,7 @@ export class Job {
    * duplicate name, invalid/traversing path, conflict with explicit file.
    */
   private tryRegisterInheritedMarker(
-    obj: { id: string; name: string; session_id: string },
+    obj: { id: string; name: string; storage_session_id: string },
     existingNames: Set<string>,
     explicitFilePaths: string[],
   ): boolean {
@@ -817,25 +829,25 @@ export class Job {
     if (existingNames.has(obj.name)) return false;
     if (!isValidFilePath(obj.name, this.submissionDir)) {
       this.log.warn(
-        { sessionId: obj.session_id, name: obj.name },
+        { sessionId: obj.storage_session_id, name: obj.name },
         'autoLoadDirkeep: rejected marker with invalid or traversing path',
       );
       return false;
     }
     if (markerConflictsWithExplicitFile(obj.name, explicitFilePaths)) {
       this.log.debug(
-        { sessionId: obj.session_id, name: obj.name },
+        { sessionId: obj.storage_session_id, name: obj.name },
         'autoLoadDirkeep: skipping marker that conflicts with explicit request file',
       );
       return false;
     }
-    this.files.push({ id: obj.id, session_id: obj.session_id, name: obj.name });
+    this.files.push({ id: obj.id, storage_session_id: obj.storage_session_id, name: obj.name });
     existingNames.add(obj.name);
     return true;
   }
 
   async downloadAndWriteFile(file: TFile, maxRetries = 5, retryDelay = 500): Promise<string | null> {
-    if (!file.id || !file.session_id) return null;
+    if (!file.id || !file.storage_session_id) return null;
 
     validateFilePath(file.name, this.submissionDir);
 
@@ -869,7 +881,7 @@ export class Job {
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
         this.inputFileHashes.set(originalName, {
           originalId: file.id,
-          originalSessionId: file.session_id!,
+          originalSessionId: file.storage_session_id!,
           hash,
           path: finalPath,
           readOnly: readOnly || undefined,
@@ -921,11 +933,11 @@ export class Job {
 
   /**
    * URL for fetching a single object from the file server. Encodes path
-   * segments — client-supplied session_id / file.id could otherwise inject
-   * `../` or raw `/` and hit unintended endpoints (SSRF-adjacent).
+   * segments — client-supplied storage_session_id / file.id could otherwise
+   * inject `../` or raw `/` and hit unintended endpoints (SSRF-adjacent).
    */
   private buildDownloadUrl(file: TFile): string {
-    return `${config.file_server_url}/sessions/${encodeURIComponent(file.session_id!)}/objects/${encodeURIComponent(file.id!)}`;
+    return `${config.file_server_url}/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`;
   }
 
   /**
@@ -1133,7 +1145,7 @@ export class Job {
     if (inheritedKeep && !inheritedKeep.id) {
       return this.handleInlineUserDirkeep(keepPath, keepFullPath);
     }
-    if (inheritedKeep?.id && inheritedKeep.session_id) {
+    if (inheritedKeep?.id && inheritedKeep.storage_session_id) {
       return this.handleInheritedDirkeep(keepPath, keepFullPath, inheritedKeep);
     }
     return this.createDirkeepMarker(keepPath, keepFullPath);
@@ -1157,7 +1169,7 @@ export class Job {
       return { collected: false, truncated: true };
     }
     const id = nanoid();
-    this.sessionFiles.push({ id, name: keepPath, session_id: this.uuid });
+    this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.uuid });
     this.generatedFiles.push({ id, name: keepPath, path: keepFullPath });
     return { collected: true, truncated: false };
   }
@@ -1206,11 +1218,11 @@ export class Job {
       return { collected: false, truncated: true };
     }
     const refreshedId = nanoid();
-    const refreshedRef: FileRef = { id: refreshedId, name: keepPath, session_id: this.uuid };
+    const refreshedRef: FileRef = { id: refreshedId, name: keepPath, storage_session_id: this.uuid };
     if (keepInfo?.originalId && keepInfo.originalSessionId) {
       refreshedRef.modified_from = {
         id: keepInfo.originalId,
-        session_id: keepInfo.originalSessionId,
+        storage_session_id: keepInfo.originalSessionId,
       };
     }
     this.sessionFiles.push(refreshedRef);
@@ -1249,7 +1261,7 @@ export class Job {
     this.inheritedRefs.push({
       id: inheritedKeep.id!,
       name: keepPath,
-      session_id: inheritedKeep.session_id!,
+      storage_session_id: inheritedKeep.storage_session_id!,
       inherited: true,
       ...(inheritedKeep.entity_id !== undefined
         ? { entity_id: inheritedKeep.entity_id }
@@ -1279,7 +1291,7 @@ export class Job {
       return { collected: false, truncated: false };
     }
     const id = nanoid();
-    this.sessionFiles.push({ id, name: keepPath, session_id: this.uuid });
+    this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.uuid });
     this.generatedFiles.push({ id, name: keepPath, path: keepFullPath });
     return { collected: true, truncated: false };
   }
@@ -1317,14 +1329,14 @@ export class Job {
     if (!inputFileInfo) return null;
     if (!existingFile) return null;
 
-    if (existingFile.id && existingFile.session_id) {
+    if (existingFile.id && existingFile.storage_session_id) {
       if (this.inheritedRefs.length >= config.max_output_files) {
         return { collected: false, truncated: true };
       }
       this.inheritedRefs.push({
         id: existingFile.id,
         name: relativePath,
-        session_id: existingFile.session_id,
+        storage_session_id: existingFile.storage_session_id,
         inherited: true,
         ...(existingFile.entity_id !== undefined
           ? { entity_id: existingFile.entity_id }
@@ -1411,11 +1423,11 @@ export class Job {
     }
 
     const newId = nanoid();
-    const fileData: FileRef = { id: newId, name: relativePath, session_id: this.uuid };
+    const fileData: FileRef = { id: newId, name: relativePath, storage_session_id: this.uuid };
     if (wasModified && inputFileInfo?.originalId && inputFileInfo.originalSessionId) {
       fileData.modified_from = {
         id: inputFileInfo.originalId,
-        session_id: inputFileInfo.originalSessionId,
+        storage_session_id: inputFileInfo.originalSessionId,
       };
     }
     this.sessionFiles.push(fileData);

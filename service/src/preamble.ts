@@ -663,6 +663,7 @@ function wrapUserCodeInAsync(userCode: string): string {
 
 export interface CreateProgrammaticPayloadOptions {
   req: t.AuthenticatedRequest;
+  /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   execution_id: string;
   /** Blocking-mode only. Ignored in replay mode. */
@@ -759,7 +760,7 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
         content: finalCode
       }
     ],
-    session_id
+    session_id,
   };
 
   if (mode === 'replay') {
@@ -774,7 +775,7 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
       if (obj.name && isReservedPtcFilename(obj.name)) continue;
       payload.files.push({
         id: obj.id,
-        session_id: obj.session_id,
+        storage_session_id: obj.storage_session_id,
         name: obj.name,
       });
     }
@@ -830,7 +831,7 @@ function buildBashPayload(args: {
       if (obj.name && isReservedPtcFilename(obj.name)) continue;
       payload.files.push({
         id: obj.id,
-        session_id: obj.session_id,
+        storage_session_id: obj.storage_session_id,
         name: obj.name,
       });
     }

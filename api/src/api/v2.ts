@@ -11,6 +11,9 @@ import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 const router = express.Router();
 
 interface ExecuteRequestBody {
+  /** Top-level execution session id (one sandbox `/exec` invocation).
+   *  Intra-monorepo wire — service-api and sandbox ship together, so
+   *  the rename is hard with no backward-compat alias. */
   session_id?: string;
   language: string;
   version: string;

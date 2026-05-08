@@ -14,7 +14,7 @@ interface ExecuteRequestBody {
 
 interface PayloadFileRef {
   id: string;
-  session_id?: string | null;
+  storage_session_id?: string | null;
   name?: string;
 }
 
@@ -40,13 +40,18 @@ export function collectExecuteRequestInputFiles(body: ExecuteRequestBody): Execu
   return files
     .map((file, index) => {
       if (!isPayloadFileRef(file)) return null;
-      const sessionId = typeof file.session_id === 'string' ? file.session_id : body.session_id;
-      if (!sessionId) {
+      /* Inline-content refs (no per-file `storage_session_id`) get persisted
+       * under the exec session as their storage prefix — the two roles share
+       * the value by design, so falling back to `body.session_id` here is
+       * correct, not a category error. Same rationale lives in
+       * `service/src/service/router.ts` where the prefix is chosen. */
+      const storageId = typeof file.storage_session_id === 'string' ? file.storage_session_id : body.session_id;
+      if (!storageId) {
         throw new ExecutionManifestError('scope_mismatch', 'Execution manifest input file scope does not match request');
       }
       return {
         id: file.id,
-        session_id: sessionId,
+        session_id: storageId,
         name: typeof file.name === 'string' && file.name ? file.name : `file${index}.code`,
       };
     })

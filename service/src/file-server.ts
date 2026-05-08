@@ -369,7 +369,7 @@ app.post('/sessions/:session_id/objects', async (req: express.Request, res: expr
 
       return res.status(200).json({
         message: 'success',
-        session_id,
+        storage_session_id: session_id,
         files: successfulUploads
       });
     } catch (err) {
@@ -641,7 +641,7 @@ const detailLevels: Record<t.DetailLevel | string, (obj: BucketItem) => Promise<
     const result: Record<string, unknown> = {
       id: parsed?.file_id ?? path.basename(obj.name ?? '').replace(/\.[^.]+$/, ''),
       name: originalFilename,
-      session_id: parsed?.session_id ?? '',
+      storage_session_id: parsed?.session_id ?? '',
       size: obj.size,
       contentType: stat.metaData['content-type'] ?? 'application/octet-stream',
       lastModified: obj.lastModified,

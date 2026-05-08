@@ -96,8 +96,8 @@ describe('execution manifest claim construction', () => {
       session_id: 'sess_output',
       files: [
         { name: 'main.py', content: 'print(1)' },
-        { id: 'file_b', session_id: 'sess_b', name: 'b.csv' },
-        { id: 'file_a', session_id: 'sess_a', name: 'a.csv' },
+        { id: 'file_b', storage_session_id: 'sess_b', name: 'b.csv' },
+        { id: 'file_a', storage_session_id: 'sess_a', name: 'a.csv' },
       ],
     };
     const req = {

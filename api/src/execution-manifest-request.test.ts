@@ -38,7 +38,7 @@ const body = {
   session_id: 'sess_output',
   files: [
     { name: 'main.py', content: 'print(1)' },
-    { id: 'file_123', session_id: 'sess_input', name: 'inputs/data.csv' },
+    { id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' },
   ],
 };
 
@@ -142,8 +142,8 @@ describe('execute request manifest validation', () => {
     const duplicateBody = {
       session_id: 'sess_output',
       files: [
-        { id: 'file_123', session_id: 'sess_input', name: 'inputs/data.csv' },
-        { id: 'file_123', session_id: 'sess_input', name: 'inputs/data.csv' },
+        { id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' },
+        { id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' },
       ],
     };
     const token = signExecutionManifest(claims({

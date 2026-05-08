@@ -54,16 +54,13 @@ export function createPayload({
 
   if (files && files.length > 0) {
     files.forEach(obj => {
-      /* `entity_id` flows through to the worker's TFile so it can be
-       * echoed back on `inherited: true` files. Caller (LibreChat) needs
-       * the round-trip to survive — without it, the next execute in the
-       * same session injects unscoped files and 403s under per-file
-       * authorization. */
+      /* The sandbox downloads files by `(storage_session_id, id)`;
+       * `kind`/`version` are sessionKey-derivation inputs at the
+       * service entry only, not consumed downstream. */
       payload.files.push({
         id: obj.id,
-        session_id: obj.session_id,
+        storage_session_id: obj.storage_session_id,
         name: obj.name,
-        ...(obj.entity_id !== undefined ? { entity_id: obj.entity_id } : {}),
       });
     });
   }

@@ -5,7 +5,6 @@ import type { Response } from 'express';
 import type { Queue, QueueEvents } from 'bullmq';
 import type * as t from '../types';
 import { checkServiceStartUp, checkServiceShutDown } from '../lifecycle';
-import { validateEntityId } from '../middleware/auth';
 import { executionLimiter } from '../middleware/limits';
 import { pyQueue, pyQueueEvents, otherQueue, otherQueueEvents, connection } from '../queue';
 import { createProgrammaticPayload, extractPendingFromStdout } from '../preamble';
@@ -13,7 +12,7 @@ import { findBashToolNameCollision } from '../preamble-bash';
 import type { LCTool } from '../preamble';
 import { isReservedPtcFilename } from '../ptc-constants';
 import { internalServiceHeaders } from '../internal-service-auth';
-import { resolveSessionKey } from '../session-key';
+import { resolveOutputBucketSessionKey, SessionKeyResolutionError } from '../session-key';
 import {
   jobsSubmitted,
   ptcReplayContinuations,
@@ -66,16 +65,41 @@ function sendFileRefAuthorizationError(
   req?: t.AuthenticatedRequest,
 ): boolean {
   if (error instanceof FileRefAuthorizationError) {
-    const queryEntityId = typeof req?.query.entity_id === 'string' ? req.query.entity_id : undefined;
     logger.warn('File reference authorization rejected', {
       status: error.status,
       reason: error.reason,
       message: error.message,
       requestUserId: req?.apiKey?.userId.toString(),
       requestApiKeyId: req?.apiKey?._id.toString(),
-      requestEntityId: queryEntityId,
       tenantId: req?.codeApiAuthContext?.tenantId,
       ...error.context,
+    });
+    res.status(error.status).json({ error: error.message });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Mirrors the helper in `router.ts`. Returns true when the error was
+ * a SessionKeyResolutionError and the response was sent (with a logged
+ * trail); false otherwise so the caller can rethrow.
+ */
+function sendSessionKeyResolutionError(
+  error: unknown,
+  res: Response,
+  req: t.AuthenticatedRequest,
+  context: string,
+): boolean {
+  if (error instanceof SessionKeyResolutionError) {
+    logger.error(`sessionKey resolution failed (${context})`, {
+      status: error.status,
+      message: error.message,
+      method: req.method,
+      path: req.path,
+      requestUserId: req.apiKey?.userId?.toString(),
+      authContextUserId: req.codeApiAuthContext?.userId,
+      tenantId: req.codeApiAuthContext?.tenantId,
     });
     res.status(error.status).json({ error: error.message });
     return true;
@@ -403,7 +427,6 @@ async function handleReplayInitial(
   const {
     code,
     tools,
-    entity_id,
     user_id,
     files,
     timeout = 300000,
@@ -462,14 +485,11 @@ async function handleReplayInitial(
     }
   }
 
-  const sessionKey = resolveSessionKey(req, userId, entity_id);
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
       req,
       files,
-      userId,
-      entityId: entity_id,
       store: connection,
     });
     (req.body as t.ProgrammaticRequestBody).files = authorizedFiles.length > 0 ? authorizedFiles : undefined;
@@ -478,6 +498,18 @@ async function handleReplayInitial(
     logger.error('Error authorizing replay file refs:', error);
     res.status(500).json({ error: 'Internal server error' });
     return;
+  }
+
+  /* Output bucket: hardcoded user-private. See router.ts /exec for the
+   * full rationale; same gate, same shape. */
+  let sessionKey: string;
+  try {
+    sessionKey = resolveOutputBucketSessionKey(req);
+  } catch (error) {
+    if (sendSessionKeyResolutionError(error, res, req, 'programmatic /exec: resolveOutputBucketSessionKey')) {
+      return;
+    }
+    throw error;
   }
 
   const session_id = nanoid();
@@ -547,7 +579,6 @@ async function handleReplayInitial(
     user: user_id,
     session_id,
     execution_id,
-    entity_id,
     language,
     toolCount: tools.length,
     codeLength: code.length,
@@ -907,7 +938,7 @@ async function runAndRespond(
 // Request entrypoint
 // ---------------------------------------------------------------------------
 
-router.post('/exec/programmatic', validateEntityId, executionLimiter, async (req: t.AuthenticatedRequest, res) => {
+router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
   const apiKeyString = req.header('X-API-Key') ?? '';
   const apiKeyId = (req.apiKey?._id ?? '').toString();
   const userId = (req.apiKey?.userId ?? '').toString();
@@ -1011,7 +1042,6 @@ async function handleBlocking(
   const {
     code,
     tools,
-    entity_id,
     user_id,
     files,
     timeout = 300000,
@@ -1128,14 +1158,11 @@ async function handleBlocking(
     }
   }
 
-  const sessionKey = resolveSessionKey(req, userId, entity_id);
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
       req,
       files,
-      userId,
-      entityId: entity_id,
       store: connection,
     });
     (req.body as t.ProgrammaticRequestBody).files = authorizedFiles.length > 0 ? authorizedFiles : undefined;
@@ -1143,6 +1170,18 @@ async function handleBlocking(
     if (sendFileRefAuthorizationError(error, res, req)) return;
     logger.error('Error authorizing programmatic file refs:', error);
     return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  /* Output bucket: hardcoded user-private. See router.ts /exec for the
+   * full rationale. */
+  let sessionKey: string;
+  try {
+    sessionKey = resolveOutputBucketSessionKey(req);
+  } catch (error) {
+    if (sendSessionKeyResolutionError(error, res, req, 'programmatic /exec-blocking: resolveOutputBucketSessionKey')) {
+      return;
+    }
+    throw error;
   }
 
   const session_id = nanoid();
@@ -1168,7 +1207,6 @@ async function handleBlocking(
       user: user_id,
       session_id,
       execution_id,
-      entity_id,
       toolCount: tools.length,
       codeLength: code.length,
       files: authorizedFiles,
