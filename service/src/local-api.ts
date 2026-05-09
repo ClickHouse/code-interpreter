@@ -14,6 +14,8 @@ import type { AuthenticatedRequest } from './types';
 import type { IApiKey } from '@librechat/api-keys';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
+import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-error-logger';
+import { applyPrincipal } from './auth/principal';
 import { pyQueue, otherQueue, webhookQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
 import { setStartupComplete } from './lifecycle';
 // Workers are imported to ensure they're started with the process
@@ -63,10 +65,12 @@ const localAuth = async (
   /* Mirror the populate that `apiKeyAuth` does for prod auth. Without
    * this, sessionKey resolvers that read `codeApiAuthContext.userId`
    * 500 with "authContext.userId is missing" under local mode. */
-  req.codeApiAuthContext = {
-    ...(req.codeApiAuthContext ?? {}),
+  applyPrincipal(req, {
     userId: mockApiKey.userId.toString(),
-  };
+    tenantId: 'legacy',
+    principalSource: 'legacy_api_key',
+    credentialId: mockApiKey._id.toString(),
+  });
   next();
 };
 
@@ -74,6 +78,8 @@ v1.use(localAuth);
 v1.use(serviceRouter);
 v1.use(programmaticRouter);
 app.use('/v1', v1);
+app.use(requestNotFoundLogger);
+app.use(requestErrorLogger);
 
 // Simplified startup for local development
 async function localStartup(): Promise<void> {

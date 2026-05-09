@@ -15,10 +15,12 @@ import express, { json, Router } from 'express';
 import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest } from './types';
 import type { IApiKey } from '@librechat/api-keys';
-import { initializeAzureClient } from '@librechat/api-keys';
 import { startApiServer, gracefulShutdown } from './lifecycle';
 import enterpriseRouter from './enterprise/router';
 import { apiKeyAuth } from './middleware/auth';
+import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-error-logger';
+import { applyPrincipal } from './auth/principal';
+import { getAuthProviderMode } from './auth/provider';
 import newsletterRouter from './emails/router';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
@@ -54,10 +56,12 @@ const localAuth = async (
    * have a userId. Without this, /exec under LOCAL_MODE 500s with
    * "authContext.userId is missing" while prod works fine, masking
    * the regression for anyone running locally. */
-  req.codeApiAuthContext = {
-    ...(req.codeApiAuthContext ?? {}),
+  applyPrincipal(req, {
     userId: mockApiKey.userId.toString(),
-  };
+    tenantId: 'legacy',
+    principalSource: 'legacy_api_key',
+    credentialId: mockApiKey._id.toString(),
+  });
   next();
 };
 
@@ -101,11 +105,19 @@ v1.use(serviceRouter);
 v1.use(programmaticRouter);
 
 app.use('/v1', v1);
+app.use(requestNotFoundLogger);
+app.use(requestErrorLogger);
 
 // Start API-only server (no workers)
 startApiServer(app, async () => {
   if (!isLocalMode) {
+    const mode = getAuthProviderMode();
+    if (mode !== 'legacy-api-key' && mode !== 'both') {
+      logger.info('Skipping Azure client initialization for non-legacy auth provider');
+      return;
+    }
     logger.info('Initializing Azure client...');
+    const { initializeAzureClient } = await import('@librechat/api-keys');
     await initializeAzureClient();
     logger.info('Azure client initialized');
   }

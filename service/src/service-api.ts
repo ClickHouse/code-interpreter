@@ -1,8 +1,9 @@
 import express, { json, Router } from 'express';
-import { initializeAzureClient } from '@librechat/api-keys';
 import { startServer, gracefulShutdown } from './lifecycle';
 import enterpriseRouter from './enterprise/router';
 import { apiKeyAuth } from './middleware/auth';
+import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-error-logger';
+import { getAuthProviderMode } from './auth/provider';
 import newsletterRouter from './emails/router';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
@@ -41,9 +42,17 @@ v1.use(serviceRouter);
 v1.use(programmaticRouter);
 
 app.use('/v1', v1);
+app.use(requestNotFoundLogger);
+app.use(requestErrorLogger);
 
 startServer(app, async () => {
+  const mode = getAuthProviderMode();
+  if (mode !== 'legacy-api-key' && mode !== 'both') {
+    logger.info('Skipping Azure client initialization for non-legacy auth provider');
+    return;
+  }
   logger.info('Initializing Azure client...');
+  const { initializeAzureClient } = await import('@librechat/api-keys');
   await initializeAzureClient();
   logger.info('Azure client initialized');
 });

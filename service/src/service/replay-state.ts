@@ -916,12 +916,14 @@ export function checkContinuationPreconditions(params: {
   state: ExecutionState;
   results: ValidatedContinuationResult[];
   userId: string;
-  apiKeyId: string;
+  apiKeyId?: string;
+  tenantId?: string;
+  authContextHash?: string;
   delta: ToolHistoryDelta;
 }):
   | { ok: true }
   | { ok: false; status: number; error: string; cleanupOnReject?: boolean } {
-  const { state, results, userId, apiKeyId, delta } = params;
+  const { state, results, userId, apiKeyId, tenantId, authContextHash, delta } = params;
   if (state.mode !== 'replay') {
     return {
       ok: false,
@@ -931,7 +933,9 @@ export function checkContinuationPreconditions(params: {
   }
   if (
     state.userId !== userId ||
-    (state.apiKeyId != null && state.apiKeyId !== apiKeyId)
+    (state.apiKeyId != null && state.apiKeyId !== apiKeyId) ||
+    (state.tenantId != null && state.tenantId !== tenantId) ||
+    (state.authContextHash != null && state.authContextHash !== authContextHash)
   ) {
     return { ok: false, status: 403, error: 'Forbidden' };
   }

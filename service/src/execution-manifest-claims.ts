@@ -77,7 +77,7 @@ export function buildExecutionManifestClaims(args: {
     ...((args.chcUserId ?? ctx?.chcUserId) ? { chc_user_id: args.chcUserId ?? ctx?.chcUserId } : {}),
     ...((args.orgId ?? ctx?.orgId) ? { org_id: args.orgId ?? ctx?.orgId } : {}),
     ...((args.serviceId ?? ctx?.serviceId) ? { service_id: args.serviceId ?? ctx?.serviceId } : {}),
-    principal_source: args.principalSource ?? ctx?.principalSource ?? (ctx ? 'librechat' : 'api_key'),
+    principal_source: args.principalSource ?? ctx?.principalSource ?? 'legacy_api_key',
     ...((args.authContextHash ?? ctx?.authContextHash) ? { auth_context_hash: args.authContextHash ?? ctx?.authContextHash } : {}),
   };
 }

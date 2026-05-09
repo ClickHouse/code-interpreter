@@ -14,7 +14,15 @@ const sendCommand: SendCommandFn = async (command: string, ...args: (string | nu
 };
 
 export const keyGenerator = (req: Request): string => {
-  return ((req as AuthenticatedRequest).apiKey?.userId ?? req.ip ?? '').toString();
+  const authReq = req as AuthenticatedRequest;
+  const principal = authReq.codeApiPrincipal;
+  if (principal?.userId) {
+    return `${principal.tenantId}:${principal.userId}`;
+  }
+  if (authReq.codeApiAuthContext?.userId) {
+    return `${authReq.codeApiAuthContext.tenantId ?? 'legacy'}:${authReq.codeApiAuthContext.userId}`;
+  }
+  return (authReq.apiKey?.userId ?? req.ip ?? '').toString();
 };
 
 export const createRateLimiter = (

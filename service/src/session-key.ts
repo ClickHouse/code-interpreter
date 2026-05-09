@@ -10,6 +10,7 @@ function strictTenantIsolation(): boolean {
 }
 
 const KNOWN_KINDS_RUNTIME = new Set<string>(CODE_ENV_KINDS);
+const DEFAULT_SINGLE_TENANT_ID = 'legacy';
 
 /**
  * Inputs sufficient to derive a sessionKey. `RequestFile` (per-file
@@ -53,12 +54,12 @@ export class SessionKeyResolutionError extends Error {
  * any legacy `entity_id` behavior.
  *
  * Tenant prefix is derived server-side from `req.codeApiAuthContext.tenantId`.
- * When `TENANT_ISOLATION_STRICT=true` and tenantId is missing, throws a
+ * When `CODEAPI_TENANT_ISOLATION_STRICT=true` and tenantId is missing, throws a
  * 500 — the auth layer is responsible for populating it on every
  * authenticated request, and a missing value would otherwise silently
  * collapse cross-tenant requests under the same `'legacy'` prefix. In
- * non-strict mode the fallback is intentional so single-tenant deploys
- * without an auth tenancy concept keep working.
+ * non-strict mode the configured single-tenant fallback is intentional so
+ * deploys without an auth tenancy concept keep working.
  */
 export function resolveSessionKey(
   req: AuthenticatedRequest,
@@ -103,7 +104,7 @@ export function resolveSessionKey(
 /**
  * Output bucket sessionKey for `/exec` runs. Hardcoded user-private
  * regardless of input file kinds — outputs always belong to the
- * requesting user. Same `TENANT_ISOLATION_STRICT` gate as
+ * requesting user. Same `CODEAPI_TENANT_ISOLATION_STRICT` gate as
  * `resolveSessionKey`. Skill executions do NOT produce a skill-scoped
  * output bucket; that's a deliberate behavioral change from the legacy
  * entity_id-driven derivation. See codeapi #1455 / Phase C design.
@@ -172,10 +173,18 @@ function resolveTenantPrefix(req: AuthenticatedRequest): string {
     if (strictTenantIsolation()) {
       throw new SessionKeyResolutionError(
         500,
-        'tenantId missing from auth context (TENANT_ISOLATION_STRICT=true)',
+        'tenantId missing from auth context (CODEAPI_TENANT_ISOLATION_STRICT=true)',
       );
     }
-    return 'legacy';
+    return resolveSingleTenantId();
   }
   return tenant;
+}
+
+function resolveSingleTenantId(): string {
+  const configured = process.env.CODEAPI_JWT_SINGLE_TENANT_ID;
+  if (configured != null && configured.trim() !== '') {
+    return configured.trim();
+  }
+  return DEFAULT_SINGLE_TENANT_ID;
 }

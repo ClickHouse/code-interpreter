@@ -15,6 +15,8 @@ import { sleep, getAxiosErrorDetails } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { maybeBuildExecutionManifestClaims } from '../execution-manifest-claims';
+import { summarizeRequestedFiles } from '../execution-log';
+import { getCredentialId, getLegacyApiKeyString, getPrincipalOrReject } from '../auth/principal';
 import { jobsSubmitted } from '../metrics';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
@@ -31,11 +33,8 @@ const UPLOAD_TIMEOUT_MS = 30_000;
 const MAX_BATCH_FILES = 200;
 
 function validateUploadRequest(req: t.AuthenticatedRequest, res: Response): string | null {
-  const userId = (req.apiKey?.userId ?? '').toString();
-  if (!userId) {
-    res.status(401).json({ error: 'User not found' });
-    return null;
-  }
+  const principal = getPrincipalOrReject(req, res);
+  if (!principal) return null;
   if (req.headers['content-type']?.includes('multipart/form-data') !== true) {
     res.status(400).json({ error: 'Invalid content type. Must be multipart/form-data.' });
     return null;
@@ -48,7 +47,7 @@ function validateUploadRequest(req: t.AuthenticatedRequest, res: Response): stri
     res.status(503).json({ error: 'Service is starting up' });
     return null;
   }
-  return userId;
+  return principal.userId;
 }
 
 function sendFileRefAuthorizationError(
@@ -62,8 +61,8 @@ function sendFileRefAuthorizationError(
       status: error.status,
       reason: error.reason,
       message: error.message,
-      requestUserId: req?.apiKey?.userId?.toString(),
-      requestApiKeyId: req?.apiKey?._id?.toString(),
+      requestUserId: req?.codeApiAuthContext?.userId,
+      requestApiKeyId: req ? getCredentialId(req) : undefined,
       requestEntityId: queryEntityId,
       tenantId: req?.codeApiAuthContext?.tenantId,
       ...error.context,
@@ -96,7 +95,7 @@ function sendSessionKeyResolutionError(
       message: error.message,
       method: req.method,
       path: req.path,
-      requestUserId: req.apiKey?.userId?.toString(),
+      requestUserId: req.codeApiAuthContext?.userId,
       authContextUserId: req.codeApiAuthContext?.userId,
       tenantId: req.codeApiAuthContext?.tenantId,
     });
@@ -109,12 +108,11 @@ function sendSessionKeyResolutionError(
 const router = Router();
 
 router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
-  const apiKeyString = req.header('X-API-Key') ?? '';
-  const apiKeyId = (req.apiKey?._id ?? '').toString();
-  const userId = (req.apiKey?.userId ?? '').toString();
-  if (!userId) {
-    return res.status(401).json({ error: 'User not found' });
-  }
+  const principal = getPrincipalOrReject(req, res);
+  if (!principal) return;
+  const apiKeyString = getLegacyApiKeyString(req);
+  const apiKeyId = getCredentialId(req);
+  const userId = principal.userId;
 
   if (checkServiceShutDown()) {
     return res.status(503).json({ error: 'Service is shutting down' });
@@ -169,7 +167,15 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
   try {
-    logger.info('Request received', { userId, apiKeyId, user: user_id, session_id, language, files: authorizedFiles, sessionKey });
+    logger.info('Request received', {
+      userId,
+      apiKeyId,
+      user: user_id,
+      session_id,
+      language,
+      files: summarizeRequestedFiles(authorizedFiles),
+      sessionKey,
+    });
 
     const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
     const payload = createPayload({
@@ -196,6 +202,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       apiKeyId,
       isPyPlot,
       apiKeyString,
+      principalSource: principal.principalSource,
       executionId: execution_id,
       tenantId: executionManifestClaims?.tenant_id,
       canonicalUserId: executionManifestClaims?.user_id,

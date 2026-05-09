@@ -2,6 +2,7 @@ import type { Job } from 'bullmq';
 import type { IApiKey } from '@librechat/api-keys';
 import type { Request } from 'express';
 import type { ExecutionManifestClaims } from '../execution-manifest';
+import type { CodeApiPrincipal } from '../auth/principal';
 import { Jobs } from '@/enum/service';
 
 /**
@@ -201,6 +202,7 @@ export type JobData = {
   userId: string;
   apiKeyId: string;
   apiKeyString: string;
+  principalSource?: string;
   payload: PayloadBody;
   SANDBOX_ENDPOINT: string;
   isPyPlot?: boolean;
@@ -230,6 +232,7 @@ export interface AuthenticatedRequest extends Request {
   sessionKey?: string;
   planId?: string;
   codeApiAuthContext?: CodeApiAuthContext;
+  codeApiPrincipal?: CodeApiPrincipal;
 }
 
 export interface ProgrammaticTool {

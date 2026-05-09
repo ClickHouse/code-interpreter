@@ -1,6 +1,5 @@
 import axios from 'axios';
 import { Worker } from 'bullmq';
-import { incrementUserApiUsage, incrementApiKeyUsage, createLog } from '@librechat/api-keys';
 import type { CreateLogInput } from '@librechat/api-keys';
 import type * as t from './types';
 import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails } from './utils';
@@ -9,14 +8,24 @@ import { Jobs, Queues } from './enum';
 import { connection } from './queue';
 import { env } from './config';
 import { EXECUTION_MANIFEST_HEADER, signExecutionManifest } from './execution-manifest';
+import { summarizeSandboxResponse, summarizeText } from './execution-log';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
 const WORKER_ID = `${INSTANCE_ID}-${process.pid}`;
 
 type Log = Omit<CreateLogInput, 'userId' | 'input'>;
+type ApiKeysModule = typeof import('@librechat/api-keys');
+
+let apiKeysModulePromise: Promise<ApiKeysModule> | null = null;
+
+function getApiKeysModule(): Promise<ApiKeysModule> {
+  apiKeysModulePromise ??= import('@librechat/api-keys');
+  return apiKeysModulePromise;
+}
 
 async function incrementAndCacheUser(userId: string, apiKeyString: string): Promise<void> {
+  const { incrementUserApiUsage } = await getApiKeysModule();
   const user = await incrementUserApiUsage(userId, apiKeyString);
   await connection.set(
     `user:${userId}`,
@@ -27,6 +36,7 @@ async function incrementAndCacheUser(userId: string, apiKeyString: string): Prom
 }
 
 async function incrementAndCacheApiKey(apiKeyId: string, apiKeyString: string): Promise<void> {
+  const { incrementApiKeyUsage } = await getApiKeysModule();
   const apiKey = await incrementApiKeyUsage(apiKeyId, apiKeyString);
   await connection.set(
     `apiKey:${apiKeyString}`,
@@ -44,7 +54,21 @@ async function completeJob(job: t.ExecuteJob): Promise<void> {
     return;
   }
 
-  const { userId, apiKeyString, apiKeyId } = job.data;
+  const { userId, apiKeyString, apiKeyId, principalSource } = job.data;
+  if (principalSource !== undefined && principalSource !== 'legacy_api_key') {
+    logger.debug('Skipping legacy API-key usage increment for non-API-key principal', {
+      principalSource,
+      userId,
+    });
+    return;
+  }
+  if (!apiKeyString || !apiKeyId) {
+    logger.debug('Skipping legacy API-key usage increment without API-key credentials', {
+      principalSource,
+      userId,
+    });
+    return;
+  }
   const promises: Array<Promise<void>> = [];
   promises.push(incrementAndCacheUser(userId, apiKeyString).catch(err => {logger.error('Error incrementing user usage', err);}));
   promises.push(incrementAndCacheApiKey(apiKeyId, apiKeyString).catch(err => {logger.error('Error incrementing API key usage', err);}));
@@ -87,16 +111,25 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       throw new Error('Error from sandbox');
     }
 
-    logger.info('Sandbox response', { data: response.data });
+    logger.info('Sandbox response', summarizeSandboxResponse(response.data));
 
     const { files } = response.data;
     try {
-      if (env.LOGGING_ENABLED === true) {
+      if (
+        env.LOGGING_ENABLED === true &&
+        (job.data.principalSource === undefined || job.data.principalSource === 'legacy_api_key')
+      ) {
+        const { createLog } = await getApiKeysModule();
         createLog({
           userId: job.data.userId,
           ...response.data,
           input: code,
-        }).catch(err => logger.error('Error creating log', err));
+        }).catch((err: unknown) => logger.error('Error creating log', err));
+      } else if (env.LOGGING_ENABLED === true) {
+        logger.debug('Skipping legacy API-key log creation for non-API-key principal', {
+          principalSource: job.data.principalSource,
+          userId: job.data.userId,
+        });
       }
     } catch (err) {
       logger.error('Error creating log', err);
@@ -130,7 +163,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         session_id: response.data.session_id,
         code: result.code,
         signal: result.signal,
-        message: result.message,
+        message: summarizeText(result.message),
         status: result.status,
         wall_time: result.wall_time,
       });

@@ -1,14 +1,38 @@
 import type { Queue } from 'bullmq';
 import type { Express } from 'express';
-import { validateRemoteToken } from '@librechat/api-keys';
 import { pyQueue, otherQueue, webhookQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
 import { connectDb } from './connect';
+import { validateStartupAuthConfig } from './auth/startup';
 import { env } from './config';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
 let isShuttingDown = false;
 let isStartingUp = true;
+type ApiKeysModule = typeof import('@librechat/api-keys');
+
+let apiKeysModulePromise: Promise<ApiKeysModule> | null = null;
+
+function getApiKeysModule(): Promise<ApiKeysModule> {
+  apiKeysModulePromise ??= import('@librechat/api-keys');
+  return apiKeysModulePromise;
+}
+
+async function validateRemoteAccessToken(token: string): Promise<string> {
+  const { validateRemoteToken } = await getApiKeysModule();
+  return validateRemoteToken(token);
+}
+
+async function setAccessUser(userId: string): Promise<void> {
+  await connection.set('access-user', userId);
+}
+
+async function validateLifecycleAuthConfig(): Promise<void> {
+  await validateStartupAuthConfig({
+    setAccessUser,
+    validateRemoteToken: validateRemoteAccessToken,
+  });
+}
 
 // Flag to track if this process runs workers
 let hasWorkers = false;
@@ -61,21 +85,7 @@ function setupQueueListeners(queue: Queue, name: string): void {
 export async function startupApiOnly(): Promise<void> {
   logger.info('Starting API service (no workers)...');
   await connectDb();
-
-  if (env.LOCAL_MODE) {
-    logger.info('⚠️  LOCAL MODE - Authentication bypassed');
-    await connection.set('access-user', 'local-test-user');
-  } else if (process.env.MONGODB_URI != null) {
-    logger.info('Connected to database');
-  } else if (process.env.SANDBOX_ACCESS_TOKEN != null) {
-    logger.info('Validating sandbox access token...');
-    const accessUserId = await validateRemoteToken(process.env.SANDBOX_ACCESS_TOKEN);
-    await connection.set('access-user', accessUserId);
-    logger.info('Sandbox access token validated');
-  } else {
-    logger.error('Unauthenticated access. Did you provide `SANDBOX_ACCESS_TOKEN`?');
-    throw new Error('Unauthenticated access');
-  }
+  await validateLifecycleAuthConfig();
 
   // Set up queue listeners for monitoring (optional, for observability)
   setupQueueListeners(pyQueue, 'Python');
@@ -135,18 +145,7 @@ export async function startupWorkerOnly(): Promise<void> {
 async function gracefulStartup(): Promise<void> {
   logger.info('Starting up service (combined API + Workers)...');
   await connectDb();
-
-  if (process.env.MONGODB_URI != null) {
-    logger.info('Connected to database');
-  } else if (process.env.SANDBOX_ACCESS_TOKEN != null) {
-    logger.info('Validating sandbox access token...');
-    const accessUserId = await validateRemoteToken(process.env.SANDBOX_ACCESS_TOKEN);
-    await connection.set('access-user', accessUserId);
-    logger.info('Sandbox access token validated');
-  } else {
-    logger.error('Unauthenticated access. Did you provide `SANDBOX_ACCESS_TOKEN`?');
-    throw new Error('Unauthenticated access');
-  }
+  await validateLifecycleAuthConfig();
 
   try {
     logger.info('Setting up queues...');

@@ -77,7 +77,15 @@ function makeState(overrides: Partial<ExecutionState> = {}): ExecutionState {
   return {
     execution_id: overrides.execution_id ?? `exec_${Math.random().toString(36).slice(2, 10)}`,
     session_id: overrides.session_id ?? `sess_${Math.random().toString(36).slice(2, 10)}`,
+    sessionKey: overrides.sessionKey,
     userId: overrides.userId ?? 'user_test',
+    tenantId: overrides.tenantId,
+    canonicalUserId: overrides.canonicalUserId,
+    orgId: overrides.orgId,
+    serviceId: overrides.serviceId,
+    chcUserId: overrides.chcUserId,
+    principalSource: overrides.principalSource,
+    authContextHash: overrides.authContextHash,
     apiKeyId: overrides.apiKeyId ?? 'key_test',
     startTime: overrides.startTime ?? now,
     lastActivity: overrides.lastActivity ?? now,
@@ -793,6 +801,68 @@ function makeDelta(
   assert(
     !out.ok && out.status === 403,
     'checkContinuationPreconditions: apiKeyId mismatch -> 403 (when state has apiKeyId set)',
+  );
+})();
+
+(() => {
+  const state = makeState({ emittedCallIds: ['call_001'], tenantId: 'tenant_a' });
+  const out = checkContinuationPreconditions({
+    state,
+    results: [{ call_id: 'call_001', result: 'x' }],
+    userId: state.userId,
+    apiKeyId: state.apiKeyId,
+    tenantId: 'tenant_b',
+    delta: makeDelta(['call_001'], 10),
+  });
+  assert(
+    !out.ok && out.status === 403,
+    'checkContinuationPreconditions: tenant mismatch -> 403',
+  );
+})();
+
+(() => {
+  const state = makeState({ emittedCallIds: ['call_001'], tenantId: 'tenant_a' });
+  const out = checkContinuationPreconditions({
+    state,
+    results: [{ call_id: 'call_001', result: 'x' }],
+    userId: state.userId,
+    apiKeyId: state.apiKeyId,
+    delta: makeDelta(['call_001'], 10),
+  });
+  assert(
+    !out.ok && out.status === 403,
+    'checkContinuationPreconditions: missing tenant on tenant-bound execution -> 403',
+  );
+})();
+
+(() => {
+  const state = makeState({ emittedCallIds: ['call_001'], authContextHash: 'hash_orig' });
+  const out = checkContinuationPreconditions({
+    state,
+    results: [{ call_id: 'call_001', result: 'x' }],
+    userId: state.userId,
+    apiKeyId: state.apiKeyId,
+    authContextHash: 'hash_other',
+    delta: makeDelta(['call_001'], 10),
+  });
+  assert(
+    !out.ok && out.status === 403,
+    'checkContinuationPreconditions: authContextHash mismatch -> 403',
+  );
+})();
+
+(() => {
+  const state = makeState({ emittedCallIds: ['call_001'], authContextHash: 'hash_orig' });
+  const out = checkContinuationPreconditions({
+    state,
+    results: [{ call_id: 'call_001', result: 'x' }],
+    userId: state.userId,
+    apiKeyId: state.apiKeyId,
+    delta: makeDelta(['call_001'], 10),
+  });
+  assert(
+    !out.ok && out.status === 403,
+    'checkContinuationPreconditions: missing authContextHash on hash-bound execution -> 403',
   );
 })();
 

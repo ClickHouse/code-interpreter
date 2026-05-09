@@ -13,6 +13,7 @@ import type { LCTool } from '../preamble';
 import { isReservedPtcFilename } from '../ptc-constants';
 import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveOutputBucketSessionKey, SessionKeyResolutionError } from '../session-key';
+import { getCredentialId, getLegacyApiKeyString, getPrincipalOrReject } from '../auth/principal';
 import {
   jobsSubmitted,
   ptcReplayContinuations,
@@ -23,7 +24,9 @@ import {
 import { Jobs } from '../enum';
 import { env } from '../config';
 import { maybeBuildExecutionManifestClaims } from '../execution-manifest-claims';
+import { summarizeRequestedFiles } from '../execution-log';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
+import { buildReplayExecutionState } from './programmatic-state';
 import logger from '../logger';
 import {
   type ExecutionState,
@@ -69,8 +72,8 @@ function sendFileRefAuthorizationError(
       status: error.status,
       reason: error.reason,
       message: error.message,
-      requestUserId: req?.apiKey?.userId.toString(),
-      requestApiKeyId: req?.apiKey?._id.toString(),
+      requestUserId: req?.codeApiAuthContext?.userId,
+      requestApiKeyId: req ? getCredentialId(req) : undefined,
       tenantId: req?.codeApiAuthContext?.tenantId,
       ...error.context,
     });
@@ -97,7 +100,7 @@ function sendSessionKeyResolutionError(
       message: error.message,
       method: req.method,
       path: req.path,
-      requestUserId: req.apiKey?.userId?.toString(),
+      requestUserId: req.codeApiAuthContext?.userId,
       authContextUserId: req.codeApiAuthContext?.userId,
       tenantId: req.codeApiAuthContext?.tenantId,
     });
@@ -389,6 +392,7 @@ async function runReplayIteration(
     apiKeyId,
     isPyPlot: state.isPyPlot ?? false,
     apiKeyString,
+    principalSource: state.principalSource,
     executionId: state.execution_id,
     tenantId: executionManifestClaims?.tenant_id,
     canonicalUserId: executionManifestClaims?.user_id,
@@ -521,31 +525,20 @@ async function handleReplayInitial(
 
   await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
-  const now = Date.now();
-  const state: ExecutionState = {
-    execution_id,
-    session_id,
+  const state = buildReplayExecutionState({
+    executionId: execution_id,
+    sessionId: session_id,
     sessionKey,
     userId,
-    tenantId: authContext?.tenantId ?? 'legacy',
-    canonicalUserId: authContext?.userId ?? userId,
-    orgId: authContext?.orgId,
-    serviceId: authContext?.serviceId,
-    chcUserId: authContext?.chcUserId,
-    principalSource: authContext?.principalSource ?? (authContext ? 'librechat' : 'api_key'),
-    authContextHash: authContext?.authContextHash,
     apiKeyId,
-    startTime: now,
-    lastActivity: now,
-    mode: 'replay',
-    userCode: code,
+    authContext,
+    code,
     tools: tools as LCTool[],
     files: authorizedFiles.length > 0 ? authorizedFiles : undefined,
     isPyPlot,
     timeout,
-    callCount: 0,
     language,
-  };
+  });
   /** Replay mode persists the full request (`userCode` + `tools` + `files`)
    * inside `ExecutionState` so continuations can re-enqueue without the
    * client re-sending. A pathologically large but otherwise valid request
@@ -582,7 +575,7 @@ async function handleReplayInitial(
     language,
     toolCount: tools.length,
     codeLength: code.length,
-    files: authorizedFiles,
+    files: summarizeRequestedFiles(authorizedFiles),
     sessionKey,
     timeout,
   });
@@ -668,15 +661,25 @@ async function handleReplayContinuation(
     /** Mode/auth/issued-call-id/cap checks are pure functions of state
      * + input; the helper centralizes the branch logic so it's
      * exhaustively unit-testable in `test-replay-state.ts`. */
-    const pre = checkContinuationPreconditions({ state, results: validatedResults, userId, apiKeyId, delta });
+    const pre = checkContinuationPreconditions({
+      state,
+      results: validatedResults,
+      userId,
+      apiKeyId,
+      tenantId: req.codeApiAuthContext?.tenantId,
+      authContextHash: req.codeApiAuthContext?.authContextHash,
+      delta,
+    });
     if (!pre.ok) {
       if (pre.status === 403) {
         logger.warn('Unauthorized replay continuation request rejected', {
           execution_id: state.execution_id,
           requestUserId: userId,
           requestApiKeyId: apiKeyId,
+          requestTenantId: req.codeApiAuthContext?.tenantId,
           executionUserId: state.userId,
           executionApiKeyId: state.apiKeyId,
+          executionTenantId: state.tenantId,
         });
       }
       if (pre.cleanupOnReject === true) {
@@ -939,12 +942,11 @@ async function runAndRespond(
 // ---------------------------------------------------------------------------
 
 router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
-  const apiKeyString = req.header('X-API-Key') ?? '';
-  const apiKeyId = (req.apiKey?._id ?? '').toString();
-  const userId = (req.apiKey?.userId ?? '').toString();
-  if (!userId) {
-    return res.status(401).json({ error: 'User not found' });
-  }
+  const principal = getPrincipalOrReject(req, res);
+  if (!principal) return;
+  const apiKeyString = getLegacyApiKeyString(req);
+  const apiKeyId = getCredentialId(req);
+  const userId = principal.userId;
 
   if (checkServiceShutDown()) {
     return res.status(503).json({ error: 'Service is shutting down' });
@@ -1064,14 +1066,24 @@ async function handleBlocking(
 
     if (
       execution.userId !== userId ||
-      (execution.apiKeyId != null && execution.apiKeyId !== apiKeyId)
+      (execution.apiKeyId != null && execution.apiKeyId !== apiKeyId) ||
+      (
+        execution.tenantId != null &&
+        execution.tenantId !== req.codeApiAuthContext?.tenantId
+      ) ||
+      (
+        execution.authContextHash != null &&
+        execution.authContextHash !== req.codeApiAuthContext?.authContextHash
+      )
     ) {
       logger.warn('Unauthorized blocking continuation request rejected', {
         execution_id,
         requestUserId: userId,
         requestApiKeyId: apiKeyId,
+        requestTenantId: req.codeApiAuthContext?.tenantId,
         executionUserId: execution.userId,
         executionApiKeyId: execution.apiKeyId,
+        executionTenantId: execution.tenantId,
       });
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -1192,7 +1204,15 @@ async function handleBlocking(
   const executionState: ExecutionState = {
     execution_id,
     session_id,
+    sessionKey,
     userId,
+    tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',
+    canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
+    orgId: req.codeApiAuthContext?.orgId,
+    serviceId: req.codeApiAuthContext?.serviceId,
+    chcUserId: req.codeApiAuthContext?.chcUserId,
+    principalSource: req.codeApiAuthContext?.principalSource,
+    authContextHash: req.codeApiAuthContext?.authContextHash,
     apiKeyId,
     startTime: Date.now(),
     lastActivity: Date.now(),
@@ -1209,7 +1229,7 @@ async function handleBlocking(
       execution_id,
       toolCount: tools.length,
       codeLength: code.length,
-      files: authorizedFiles,
+      files: summarizeRequestedFiles(authorizedFiles),
       sessionKey,
       timeout,
     });
@@ -1274,6 +1294,7 @@ async function handleBlocking(
       apiKeyId,
       isPyPlot: false,
       apiKeyString,
+      principalSource: req.codeApiAuthContext?.principalSource,
       executionId: execution_id,
       tenantId: executionManifestClaims?.tenant_id,
       canonicalUserId: executionManifestClaims?.user_id,

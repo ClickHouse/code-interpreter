@@ -15,21 +15,28 @@ function request(authContext?: t.CodeApiAuthContext): t.AuthenticatedRequest {
   return { codeApiAuthContext: authContext } as t.AuthenticatedRequest;
 }
 
-/* `TENANT_ISOLATION_STRICT` is read live from `process.env` per call,
- * so toggling the env var between tests is sufficient — no module
+/* Tenant isolation env is read live from `process.env` per call,
+ * so toggling env vars between tests is sufficient — no module
  * cache surgery needed. */
-describe('TENANT_ISOLATION_STRICT', () => {
-  const originalEnv = process.env.CODEAPI_TENANT_ISOLATION_STRICT;
+describe('CODEAPI_TENANT_ISOLATION_STRICT', () => {
+  const originalStrictEnv = process.env.CODEAPI_TENANT_ISOLATION_STRICT;
+  const originalSingleTenantEnv = process.env.CODEAPI_JWT_SINGLE_TENANT_ID;
 
   beforeEach(() => {
     delete process.env.CODEAPI_TENANT_ISOLATION_STRICT;
+    delete process.env.CODEAPI_JWT_SINGLE_TENANT_ID;
   });
 
   afterEach(() => {
-    if (originalEnv === undefined) {
+    if (originalStrictEnv === undefined) {
       delete process.env.CODEAPI_TENANT_ISOLATION_STRICT;
     } else {
-      process.env.CODEAPI_TENANT_ISOLATION_STRICT = originalEnv;
+      process.env.CODEAPI_TENANT_ISOLATION_STRICT = originalStrictEnv;
+    }
+    if (originalSingleTenantEnv === undefined) {
+      delete process.env.CODEAPI_JWT_SINGLE_TENANT_ID;
+    } else {
+      process.env.CODEAPI_JWT_SINGLE_TENANT_ID = originalSingleTenantEnv;
     }
   });
 
@@ -37,6 +44,19 @@ describe('TENANT_ISOLATION_STRICT', () => {
     const req = request({ userId: USER_ID });
     const key = resolveSessionKey(req, { kind: 'skill', id: SKILL_ID, version: 1 });
     expect(key).toBe(`legacy:skill:${SKILL_ID}:v:1`);
+  });
+
+  test('non-strict (default): output bucket also falls back to "legacy"', () => {
+    const req = request({ userId: USER_ID });
+    const key = resolveOutputBucketSessionKey(req);
+    expect(key).toBe(`legacy:user:${USER_ID}`);
+  });
+
+  test('non-strict (default): missing tenantId uses configured single-tenant namespace', () => {
+    process.env.CODEAPI_JWT_SINGLE_TENANT_ID = 'local-single-tenant';
+    const req = request({ userId: USER_ID });
+    const key = resolveSessionKey(req, { kind: 'skill', id: SKILL_ID, version: 1 });
+    expect(key).toBe(`local-single-tenant:skill:${SKILL_ID}:v:1`);
   });
 
   test('strict mode: missing tenantId throws 500', () => {
