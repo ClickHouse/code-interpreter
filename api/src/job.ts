@@ -539,6 +539,21 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.bat', '.cmd', '.deb', '.log', '.rpm', '.vbs',
 ]);
 
+function isSupportedOutputFilename(name: string): boolean {
+  const basename = path.basename(name);
+  const ext = path.extname(basename).toLowerCase();
+  const dottedBasename = `.${basename}`;
+  return (
+    (ext !== '' && SUPPORTED_EXTENSIONS.has(ext)) ||
+    SUPPORTED_EXTENSIONS.has(basename) ||
+    SUPPORTED_EXTENSIONS.has(basename.toLowerCase()) ||
+    (ext === '' && (
+      SUPPORTED_EXTENSIONS.has(dottedBasename) ||
+      SUPPORTED_EXTENSIONS.has(dottedBasename.toLowerCase())
+    ))
+  );
+}
+
 export interface TFile {
   id?: string;
   /** Per-file storage session id (where the file's bytes live in object
@@ -624,6 +639,7 @@ export class Job {
   memory_limits: { run: number; compile: number };
   extra_env_vars?: Record<string, string>;
   egressGrantToken?: string;
+  outputSessionId: string;
 
   private log: Logger;
   private submissionDir = '';
@@ -647,9 +663,11 @@ export class Job {
     cpu_times: { run: number; compile: number };
     memory_limits: { run: number; compile: number };
     extra_env_vars?: Record<string, string>;
+    output_session_id?: string;
     egress_grant?: string;
   }) {
     this.uuid = opts.session_id ?? nanoid();
+    this.outputSessionId = opts.output_session_id ?? this.uuid;
     this.log = rootLogger.child({ job: this.uuid });
     this.runtime = opts.runtime;
     this.files = opts.files.map((file, i) => ({
@@ -658,7 +676,7 @@ export class Job {
        * source supplied as `content`), fall back to the execution id —
        * historically these collapsed onto the same `session_id` field
        * which is exactly the conflation this rename eliminates. */
-      storage_session_id: file.storage_session_id ?? this.uuid,
+      storage_session_id: file.storage_session_id ?? this.outputSessionId,
       name: file.name || `file${i}.code`,
       content: file.content,
       encoding: (['base64', 'hex', 'utf8'] as const).includes(file.encoding as 'base64' | 'hex' | 'utf8')
@@ -1088,7 +1106,7 @@ export class Job {
       run,
       language: this.runtime.language,
       version: this.runtime.version.raw,
-      session_id: this.uuid,
+      session_id: this.outputSessionId,
       files: this.sessionFiles,
     };
   }
@@ -1190,7 +1208,7 @@ export class Job {
       return { collected: false, truncated: true };
     }
     const id = nanoid();
-    this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.uuid });
+    this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.outputSessionId });
     this.generatedFiles.push({ id, name: keepPath, path: keepFullPath });
     return { collected: true, truncated: false };
   }
@@ -1239,7 +1257,7 @@ export class Job {
       return { collected: false, truncated: true };
     }
     const refreshedId = nanoid();
-    const refreshedRef: FileRef = { id: refreshedId, name: keepPath, storage_session_id: this.uuid };
+    const refreshedRef: FileRef = { id: refreshedId, name: keepPath, storage_session_id: this.outputSessionId };
     if (keepInfo?.originalId && keepInfo.originalSessionId) {
       refreshedRef.modified_from = {
         id: keepInfo.originalId,
@@ -1312,7 +1330,7 @@ export class Job {
       return { collected: false, truncated: false };
     }
     const id = nanoid();
-    this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.uuid });
+    this.sessionFiles.push({ id, name: keepPath, storage_session_id: this.outputSessionId });
     this.generatedFiles.push({ id, name: keepPath, path: keepFullPath });
     return { collected: true, truncated: false };
   }
@@ -1397,8 +1415,7 @@ export class Job {
      * markers in non-empty directories are preserved; the empty-directory
      * branch handles the auto-generated case. */
     if (entry.name !== DIRKEEP) {
-      const ext = path.extname(entry.name).toLowerCase();
-      if (!SUPPORTED_EXTENSIONS.has(ext)) {
+      if (!isSupportedOutputFilename(entry.name)) {
         return { collected: false, truncated: false, stopLoop: false };
       }
     }
@@ -1444,7 +1461,7 @@ export class Job {
     }
 
     const newId = nanoid();
-    const fileData: FileRef = { id: newId, name: relativePath, storage_session_id: this.uuid };
+    const fileData: FileRef = { id: newId, name: relativePath, storage_session_id: this.outputSessionId };
     if (wasModified && inputFileInfo?.originalId && inputFileInfo.originalSessionId) {
       fileData.modified_from = {
         id: inputFileInfo.originalId,
@@ -1668,7 +1685,7 @@ export class Job {
       return null;
     }
 
-    const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.uuid)}/objects/${encodeURIComponent(file.id)}`;
+    const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.outputSessionId)}/objects/${encodeURIComponent(file.id)}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
     const stream = fs.createReadStream(file.path);

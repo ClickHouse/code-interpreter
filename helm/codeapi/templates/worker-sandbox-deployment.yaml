@@ -89,8 +89,12 @@ spec:
               containerPort: {{ .Values.workerSandbox.healthPort }}
               protocol: TCP
           env:
+            - name: CODEAPI_HARDENED_SANDBOX_MODE
+              value: {{ .Values.hardenedSandboxMode | quote }}
             - name: SANDBOX_ENDPOINT
               value: "http://{{ include "codeapi.fullname" . }}-sandbox-runner:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
+            - name: EGRESS_GATEWAY_URL
+              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -100,11 +104,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: redis-password
-            - name: CODEAPI_EGRESS_GRANT_SECRET
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
-                  key: codeapi-egress-grant-secret
+                  key: codeapi-internal-service-token
             - name: CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
@@ -199,6 +203,8 @@ spec:
               containerPort: {{ .Values.workerSandbox.sandbox.port }}
               protocol: TCP
           env:
+            - name: CODEAPI_HARDENED_SANDBOX_MODE
+              value: {{ .Values.hardenedSandboxMode | quote }}
             - name: KVM_ENABLED
               value: {{ .Values.workerSandbox.kvmEnabled | quote }}
             - name: LAUNCHER_VCPUS
@@ -219,6 +225,8 @@ spec:
               value: {{ .Values.workerSandbox.sandbox.runTimeout | quote }}
             - name: SANDBOX_OUTPUT_MAX_SIZE
               value: {{ .Values.workerSandbox.sandbox.outputMaxSize | quote }}
+            - name: SANDBOX_MAX_CONCURRENT_JOBS
+              value: {{ (.Values.workerSandbox.sandbox.maxConcurrentJobs | default (mul (.Values.workerSandbox.launcher.vcpus | default 2) 4)) | quote }}
             - name: SANDBOX_EXECUTE_BODY_LIMIT
               value: {{ .Values.workerSandbox.sandbox.executeBodyLimit | quote }}
             - name: SANDBOX_DISABLE_NETWORKING

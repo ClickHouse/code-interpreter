@@ -204,6 +204,22 @@ test_network_blocked() {
     fi
 }
 
+test_sched_setaffinity_blocked() {
+    log_info "Testing sched_setaffinity is blocked with EPERM..."
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import ctypes, errno\nlibc = ctypes.CDLL(None, use_errno=True)\nmask = (ctypes.c_ulong * 16)()\nmask[0] = 1\nrc = libc.sched_setaffinity(0, ctypes.sizeof(mask), ctypes.byref(mask))\nerr = ctypes.get_errno()\nprint(f\"rc={rc} errno={err}\")\nif rc != -1 or err != errno.EPERM:\n    raise SystemExit(1)"}]}')
+
+    stdout=$(echo "$result" | jq -r '.run.stdout // empty')
+    code=$(echo "$result" | jq -r '.run.code // empty')
+    if [[ "$stdout" == *"rc=-1 errno=1"* ]] && [[ "$code" == "0" ]]; then
+        log_success "sched_setaffinity blocked with EPERM"
+        return 0
+    else
+        log_error "sched_setaffinity was not blocked with EPERM"
+        echo "$result" | jq .
+        return 1
+    fi
+}
+
 test_bun() {
     log_info "Testing Bun/JavaScript execution..."
     # Get available bun version dynamically
@@ -255,6 +271,7 @@ test_numpy || FAILED=$((FAILED + 1))
 test_chdb || FAILED=$((FAILED + 1))
 test_file_write || FAILED=$((FAILED + 1))
 test_network_blocked || FAILED=$((FAILED + 1))
+test_sched_setaffinity_blocked || FAILED=$((FAILED + 1))
 test_bun || FAILED=$((FAILED + 1))
 test_escape_attempt || FAILED=$((FAILED + 1))
 

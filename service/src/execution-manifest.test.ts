@@ -9,6 +9,7 @@ import {
   signExecutionManifest,
   signExecutionManifestWithPrivateKey,
   verifyExecutionManifest,
+  verifyExecutionManifestWithKey,
   verifyExecutionManifestWithPublicKey,
 } from './execution-manifest';
 
@@ -56,6 +57,20 @@ describe('execution manifest signing', () => {
     const token = signExecutionManifestWithPrivateKey(claims(), PRIVATE_KEY);
     expect(verifyExecutionManifestWithPublicKey(token, PUBLIC_KEY, { nowSeconds: 150 })).toEqual(claims());
     expectManifestError(() => verifyExecutionManifest(token, SECRET, { nowSeconds: 150 }), 'invalid_signature');
+  });
+
+  test('falls back to legacy HMAC verification only when public-key signature verification fails', () => {
+    const token = signExecutionManifest(claims(), SECRET);
+
+    expect(verifyExecutionManifestWithKey(token, {
+      publicKey: PUBLIC_KEY,
+      secret: SECRET,
+    }, { nowSeconds: 150 })).toEqual(claims());
+
+    expectManifestError(() => verifyExecutionManifestWithKey(token, {
+      publicKey: PUBLIC_KEY,
+      secret: SECRET,
+    }, { nowSeconds: 1000 }), 'expired');
   });
 
   test('uses canonical JSON independent of insertion order', () => {

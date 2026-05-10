@@ -9,6 +9,7 @@ services:
             - 3112:3112
         environment:
             - LOCAL_MODE=${LOCAL_MODE:-true}
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
             - CODEAPI_ALLOW_AUTH_PROVIDER_NONE=${CODEAPI_ALLOW_AUTH_PROVIDER_NONE:-}
             - CODEAPI_JWT_ISSUER=${CODEAPI_JWT_ISSUER:-}
@@ -39,7 +40,6 @@ services:
             - FILE_SERVER_URL=http://file_server:3000
             - TOOL_CALL_SERVER_URL=http://tool_call_server:3033
             - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
-            - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
             - REDIS_HOST=redis
             - REDIS_PORT=6379
             - REDIS_PASSWORD=localdev
@@ -55,6 +55,7 @@ services:
         container_name: service-worker
         environment:
             - LOCAL_MODE=${LOCAL_MODE:-true}
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
             - CODEAPI_JWT_SINGLE_TENANT_ID=${CODEAPI_JWT_SINGLE_TENANT_ID:-}
             - CODEAPI_TENANT_ISOLATION_STRICT=${CODEAPI_TENANT_ISOLATION_STRICT:-}
@@ -64,10 +65,13 @@ services:
             - EXECUTION_MANIFEST_MAX_OUTPUT_FILES=${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-}
             - EXECUTION_MANIFEST_MAX_REQUESTS=${EXECUTION_MANIFEST_MAX_REQUESTS:-}
             - SANDBOX_ENDPOINT=http://sandbox-runner:2000/api/v2
-            - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
+            - EGRESS_GATEWAY_URL=http://egress_gateway:3190
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
             - REDIS_HOST=redis
             - REDIS_PORT=6379
             - REDIS_PASSWORD=localdev
+            - PYTHON_CONCURRENCY=${PYTHON_CONCURRENCY:-1}
+            - OTHER_CONCURRENCY=${OTHER_CONCURRENCY:-8}
             - WORKER_HEALTH_PORT=3113
         depends_on:
             redis:
@@ -85,15 +89,21 @@ services:
             - 3190:3190
         environment:
             - SERVICE_NAME=egress-gateway
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
+            - CODEAPI_EGRESS_LEDGER_REQUIRED=${CODEAPI_EGRESS_LEDGER_REQUIRED:-true}
             - EGRESS_GATEWAY_PORT=3190
             - EGRESS_GATEWAY_FILE_SERVER_URL=http://file_server:3000
             - EGRESS_GATEWAY_TOOL_CALL_SERVER_URL=http://tool_call_server:3033
             - EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES=1048576
             - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
             - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - REDIS_HOST=redis
+            - REDIS_PORT=6379
+            - REDIS_PASSWORD=localdev
         depends_on:
             - file_server
             - tool_call_server
+            - redis
 
     tool_call_server:
         build:
@@ -127,10 +137,12 @@ services:
             - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
         environment:
             - KVM_ENABLED=${KVM_ENABLED:-true}
+            - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - EGRESS_GATEWAY_URL=http://egress_gateway:3190
             - SANDBOX_EXECUTE_BODY_LIMIT=${SANDBOX_EXECUTE_BODY_LIMIT:-50mb}
             - SANDBOX_LOG_LEVEL=DEBUG
             - SANDBOX_OUTPUT_MAX_SIZE=65536
+            - SANDBOX_MAX_CONCURRENT_JOBS=${SANDBOX_MAX_CONCURRENT_JOBS:-8}
             - SANDBOX_RUN_TIMEOUT=300000
             - SANDBOX_RUN_CPU_TIME=300000
             - SANDBOX_COMPILE_TIMEOUT=30000

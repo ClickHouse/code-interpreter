@@ -124,8 +124,8 @@ else
     echo "  Sandbox: http://localhost:2000 (direct NsJail, no microVM)"
 fi
 echo "  Worker health: http://localhost:${WORKER_HEALTH_PORT:-3113}/health"
-echo "  PYTHON_CONCURRENCY: ${PYTHON_CONCURRENCY:-5}"
-echo "  OTHER_CONCURRENCY: ${OTHER_CONCURRENCY:-15}"
+echo "  PYTHON_CONCURRENCY: ${PYTHON_CONCURRENCY:-1}"
+echo "  OTHER_CONCURRENCY: ${OTHER_CONCURRENCY:-8}"
 echo "============================================"
 
 wait -n

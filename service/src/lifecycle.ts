@@ -4,6 +4,7 @@ import { pyQueue, otherQueue, webhookQueue, pyQueueEvents, otherQueueEvents, con
 import { connectDb } from './connect';
 import { validateStartupAuthConfig } from './auth/startup';
 import { env } from './config';
+import { validateApiHardenedConfig, validateWorkerHardenedConfig } from './secure-startup';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
@@ -84,6 +85,7 @@ function setupQueueListeners(queue: Queue, name: string): void {
  */
 export async function startupApiOnly(): Promise<void> {
   logger.info('Starting API service (no workers)...');
+  validateApiHardenedConfig();
   await connectDb();
   await validateLifecycleAuthConfig();
 
@@ -102,6 +104,7 @@ export async function startupApiOnly(): Promise<void> {
  */
 export async function startupWorkerOnly(): Promise<void> {
   logger.info('Starting Worker service...');
+  validateWorkerHardenedConfig();
 
   // Connect to database (may be no-op if MONGODB_URI not set)
   // This ensures consistency with other startup functions and supports
@@ -144,6 +147,8 @@ export async function startupWorkerOnly(): Promise<void> {
  */
 async function gracefulStartup(): Promise<void> {
   logger.info('Starting up service (combined API + Workers)...');
+  validateApiHardenedConfig();
+  validateWorkerHardenedConfig();
   await connectDb();
   await validateLifecycleAuthConfig();
 

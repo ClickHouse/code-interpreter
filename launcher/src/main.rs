@@ -309,6 +309,7 @@ fn null_term(v: &[CString]) -> Vec<*const libc::c_char> {
 
 fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
     const ALLOW_EXACT: &[&str] = &[
+        "CODEAPI_HARDENED_SANDBOX_MODE",
         "EGRESS_GATEWAY_URL",
         "HOME",
         "NSJAIL_CONFIG",
@@ -495,6 +496,7 @@ mod tests {
     fn guest_env_allowlist_keeps_only_runner_runtime_vars() {
         for key in [
             "EGRESS_GATEWAY_URL",
+            "CODEAPI_HARDENED_SANDBOX_MODE",
             "SANDBOX_DISABLE_NETWORKING",
             "SANDBOX_ALLOWED_LOCAL_NETWORK_PORT",
             "SANDBOX_FORWARD_TARGET",

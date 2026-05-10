@@ -29,6 +29,7 @@ const requireExecutionManifest = (
 ) === 'true';
 
 export const config = {
+  hardened_sandbox_mode: process.env.CODEAPI_HARDENED_SANDBOX_MODE === 'true',
   log_level: process.env.SANDBOX_LOG_LEVEL ?? 'DEBUG',
   bind_address: `0.0.0.0:${process.env.PORT ?? 2000}`,
   data_directory: process.env.SANDBOX_DATA_DIRECTORY ?? '/piston',
@@ -45,7 +46,7 @@ export const config = {
   run_cpu_time: Number(process.env.SANDBOX_RUN_CPU_TIME ?? 30000),
   compile_memory_limit: Number(process.env.SANDBOX_COMPILE_MEMORY_LIMIT ?? -1),
   run_memory_limit: Number(process.env.SANDBOX_RUN_MEMORY_LIMIT ?? -1),
-  max_concurrent_jobs: Number(process.env.SANDBOX_MAX_CONCURRENT_JOBS ?? 64),
+  max_concurrent_jobs: safeInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS, 8),
   rlimit_as: Number(process.env.SANDBOX_RLIMIT_AS ?? 16384),
   rlimit_fsize: Number(process.env.SANDBOX_RLIMIT_FSIZE ?? 100),
   nsjail_path: process.env.NSJAIL_PATH ?? '/usr/sbin/nsjail',
@@ -57,9 +58,7 @@ export const config = {
   max_path_length: safeInt(process.env.SANDBOX_MAX_PATH_LENGTH, 256),
   max_output_files: safeInt(process.env.SANDBOX_MAX_OUTPUT_FILES, 50),
   require_execution_manifest: requireExecutionManifest,
-  execution_manifest_public_key: process.env.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY
-    ?? process.env.CODEAPI_EXECUTION_MANIFEST_PUBLIC_KEY
-    ?? '',
+  execution_manifest_public_key: process.env.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY ?? '',
   // Legacy HMAC verifier fallback for rolling upgrades only. Cloud split-runner
   // deployments should mount SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY instead so a
   // compromised runner cannot mint valid manifests.

@@ -8,7 +8,7 @@ import { Jobs, Queues } from './enum';
 import { connection } from './queue';
 import { env } from './config';
 import { summarizeSandboxResponse, summarizeText } from './execution-log';
-import { prepareSandboxEgress, restoreSandboxExecuteResult } from './egress-grant';
+import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgressGrant } from './egress-gateway-client';
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
 import logger from './logger';
@@ -55,6 +55,10 @@ async function incrementAndCacheApiKey(apiKeyId: string, apiKeyString: string): 
 
 const { LOCAL_MODE: isLocalMode } = env;
 
+function isAbortError(error: unknown): boolean {
+  return axios.isAxiosError(error) && (error.name === 'AbortError' || error.code === 'ERR_CANCELED');
+}
+
 async function completeJob(job: t.ExecuteJob): Promise<void> {
   if (isLocalMode) {
     logger.debug('Skipping usage increment in local mode');
@@ -90,6 +94,9 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), env.JOB_TIMEOUT);
+  let egressGrantId: string | undefined;
+  let egressGrantTokenForRestore: string | undefined;
+  let revokeReason = 'completed';
 
   try {
     let sandboxPayload = payload;
@@ -97,17 +104,16 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     let egressGrantToken = job.data.egressGrantToken;
 
     if (job.data.egressGrantClaims) {
-      if (!env.EGRESS_GRANT_SECRET) {
-        throw new Error('CODEAPI_EGRESS_GRANT_SECRET is required to dispatch egress-scoped sandbox jobs');
-      }
       const nowSeconds = Math.floor(Date.now() / 1000);
-      const prepared = prepareSandboxEgress({
+      const prepared = await createGatewayEgressGrant({
         payload,
         claims: refreshEgressGrantClaims(job.data.egressGrantClaims, nowSeconds),
-        secret: env.EGRESS_GRANT_SECRET,
+        signal: controller.signal,
       });
+      egressGrantId = prepared.grant_id;
       sandboxPayload = prepared.payload;
       egressGrantToken = prepared.egressGrantToken;
+      egressGrantTokenForRestore = prepared.egressGrantToken;
       executionManifestClaims = (env.EXECUTION_MANIFEST_PRIVATE_KEY || env.EXECUTION_MANIFEST_SECRET)
         ? prepared.executionManifestClaims
         : undefined;
@@ -121,6 +127,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       executionManifestSecret: env.EXECUTION_MANIFEST_SECRET,
       executionManifestTtlSeconds: env.EXECUTION_MANIFEST_TTL_SECONDS,
     });
+    egressGrantTokenForRestore = egressGrantToken;
 
     const response = await axios.post<SandboxLogResponse>(
       `${SANDBOX_ENDPOINT}/${Jobs.execute}`,
@@ -135,8 +142,13 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       throw new Error('Error from sandbox');
     }
 
-    const responseData = egressGrantToken
-      ? restoreSandboxExecuteResult(response.data, egressGrantToken, env.EGRESS_GRANT_SECRET)
+    const responseData = egressGrantTokenForRestore
+      ? await restoreGatewaySandboxResult({
+        grantId: egressGrantId,
+        egressGrantToken: egressGrantTokenForRestore,
+        result: response.data,
+        signal: controller.signal,
+      })
       : response.data;
 
     logger.info('Sandbox response', summarizeSandboxResponse(responseData));
@@ -199,10 +211,11 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
     return result;
   } catch (error) {
+    revokeReason = isAbortError(error) ? 'timeout' : 'failed';
     const errorDetails = getAxiosErrorDetails(error);
     logger.error('Error processing job', errorDetails);
 
-    if (axios.isAxiosError(error) && error.name === 'AbortError') {
+    if (isAbortError(error)) {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
     } else if (axios.isAxiosError(error)) {
       /** Preserve error message from sandbox */
@@ -211,6 +224,16 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     }
     throw error;
   } finally {
+    if (egressGrantId || egressGrantTokenForRestore) {
+      await revokeGatewayEgressGrant({
+        grantId: egressGrantId,
+        egressGrantToken: egressGrantId ? undefined : egressGrantTokenForRestore,
+        reason: revokeReason,
+        timeoutMs: env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
+      }).catch(error => {
+        logger.error('Failed to revoke egress grant', { grantId: egressGrantId, error: getAxiosErrorDetails(error) });
+      });
+    }
     clearTimeout(timer);
     endTimer();
     activeJobs.dec({ language });

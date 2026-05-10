@@ -93,6 +93,18 @@ describe('execute request manifest validation', () => {
     })).toEqual(claims());
   });
 
+  test('falls back to legacy HMAC when both verifier modes are configured during rollout', () => {
+    const token = signExecutionManifest(claims(), SECRET);
+
+    expect(verifyExecuteRequestManifest({
+      headerValue: token,
+      publicKey: PUBLIC_KEY,
+      secret: SECRET,
+      body,
+      nowSeconds: 150,
+    })).toEqual(claims());
+  });
+
   test('includes id refs that rely on runtime defaults in the signed scope check', () => {
     const bodyWithDefaultedRefs = {
       session_id: 'sess_output',

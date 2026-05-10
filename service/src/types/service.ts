@@ -166,6 +166,8 @@ export interface PayloadBody {
   files: Array<PayloadFile | { id: string; storage_session_id: string; name: string }>;
   /** Top-level execution session id (passed to sandbox to seed Job.uuid). */
   session_id?: string;
+  /** Output storage session id/handle used for generated file uploads. */
+  output_session_id?: string;
   /**
    * Opaque encrypted grant consumed only by sandbox-runner for gateway file
    * egress. This intentionally rides in the JSON body instead of an HTTP

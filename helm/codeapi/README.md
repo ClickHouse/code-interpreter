@@ -193,7 +193,7 @@ kubectl logs deployment/codeapi-worker-sandbox --container worker --tail=5
 |  | Sandbox 1    |  | Sandbox 2    |  | Sandbox 3    |     queue depth |
 |  | +----------+ |  | +----------+ |  | +----------+ |                |
 |  | | Worker   | |  | | Worker   | |  | | Worker   | |                |
-|  | | (conc:5) | |  | | (conc:5) | |  | | (conc:5) | |                |
+|  | | (conc:1) | |  | | (conc:1) | |  | | (conc:1) | |                |
 |  | +----+-----+ |  | +----+-----+ |  | +----+-----+ |                |
 |  |      |        |  |      |        |  |      |        |                |
 |  | +----v-----+ |  | +----v-----+ |  | +----v-----+ |                |
@@ -208,7 +208,7 @@ kubectl logs deployment/codeapi-worker-sandbox --container worker --tail=5
 |  |  ReadOnlyMany - shared across all worker-sandbox pods          |   |
 |  +---------------------------------------------------------------+   |
 |                                                                      |
-|  Total capacity: 3 pods x 5 concurrency = 15 concurrent Python jobs  |
+|  Total capacity: 3 pods x 8 other-queue concurrency = 24 jobs        |
 +----------------------------------------------------------------------+
 ```
 

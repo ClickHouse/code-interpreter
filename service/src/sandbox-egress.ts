@@ -1,6 +1,6 @@
 import { buildExecutionManifestClaims, maybeBuildExecutionManifestClaims } from './execution-manifest-claims';
 import { env } from './config';
-import { sealPtcCallbackToken } from './egress-grant';
+import { createGatewayPtcCallbackToken } from './egress-gateway-client';
 import type { ExecutionManifestClaims } from './execution-manifest';
 import type * as t from './types';
 
@@ -14,19 +14,20 @@ export type SandboxJobSecurity = {
 type BuildArgs = Parameters<typeof buildExecutionManifestClaims>[0];
 
 const MISSING_EGRESS_GATEWAY_ERROR =
-  'EGRESS_GATEWAY_URL is required when CODEAPI_EGRESS_GRANT_SECRET enables sandbox egress grants';
+  'EGRESS_GATEWAY_URL is required when hardened sandbox mode or egress grant secret is configured';
 
 export function prepareSandboxJobSecurity(args: BuildArgs): SandboxJobSecurity {
-  if (!env.EGRESS_GRANT_SECRET) {
+  const egressGatewayUrl = env.EGRESS_GATEWAY_URL.trim();
+  const egressGrantMode = env.HARDENED_SANDBOX_MODE || env.EGRESS_GRANT_SECRET.trim() !== '';
+
+  if (!egressGrantMode) {
     return {
       payload: args.payload,
       executionManifestClaims: maybeBuildExecutionManifestClaims(args),
     };
   }
-  /** Masking replaces raw file/session ids with opaque gateway handles. If
-   * the gateway URL is missing, the sandbox would send those handles to
-   * direct file-server routes that cannot validate them, so fail closed. */
-  if (env.EGRESS_GATEWAY_URL.trim() === '') {
+
+  if (egressGatewayUrl === '') {
     throw new Error(MISSING_EGRESS_GATEWAY_ERROR);
   }
 
@@ -79,23 +80,18 @@ export function normalizeProgrammaticTimeoutMs(
   return Math.min(Math.ceil(rawTimeout), maxTimeout);
 }
 
-export function sealPtcCallbackTokenForGateway(args: {
+export async function sealPtcCallbackTokenForGateway(args: {
   executionId: string;
   sessionId: string;
   callbackToken: string;
   timeoutSeconds: number;
-}): string {
-  if (!env.EGRESS_GRANT_SECRET) {
-    throw new Error('CODEAPI_EGRESS_GRANT_SECRET is required for sandbox-originated PTC callbacks');
-  }
-  const issuedAt = Math.floor(Date.now() / 1000);
-  const ttlSeconds = Math.min(args.timeoutSeconds, env.EGRESS_GRANT_TTL_SECONDS);
-  return sealPtcCallbackToken({
+  allowedToolNames: string[];
+}): Promise<string> {
+  return createGatewayPtcCallbackToken({
     executionId: args.executionId,
     sessionId: args.sessionId,
     callbackToken: args.callbackToken,
-    issuedAt,
-    expiresAt: issuedAt + ttlSeconds,
-    secret: env.EGRESS_GRANT_SECRET,
+    timeoutSeconds: args.timeoutSeconds,
+    allowedToolNames: args.allowedToolNames,
   });
 }

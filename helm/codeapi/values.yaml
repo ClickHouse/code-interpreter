@@ -20,11 +20,15 @@ global:
 internalServiceAuth:
   token: "changeme-in-production"
 
-# Encrypted grants/handles used by service-api/service-worker and the egress
-# gateway. Sandbox-runner never receives this secret.
+hardenedSandboxMode: true
+
+# Encrypted grants/handles owned by the egress gateway. Sandbox-runner,
+# service-api, and service-worker never receive this secret.
 egressGrant:
   secret: "changeme-egress-grant-secret-32-bytes-minimum"
   ttlSeconds: 900
+  ledgerRequired: true
+  ledgerTtlGraceSeconds: 300
 
 # Worker signs sandbox execute requests with this private key; sandbox-runner
 # receives only the public verifier so a runner compromise cannot mint new
@@ -141,8 +145,11 @@ workerSandbox:
 
   # Worker configuration
   config:
-    pythonConcurrency: 5    # Jobs per worker (= sandbox capacity)
-    otherConcurrency: 15
+    # Throughput-mode defaults for launcher.vcpus=2. Bash/Node/Bun and
+    # bash-launched Python run through the "other" queue; direct Python is kept
+    # as a small compatibility lane.
+    pythonConcurrency: 1
+    otherConcurrency: 8
     jobWindow: 1000
     jobTimeout: 300000      # 5 minutes
 
@@ -158,6 +165,7 @@ workerSandbox:
     outputMaxSize: 65536
     executeBodyLimit: 50mb
     disableNetworking: true
+    maxConcurrentJobs: 8
 
   # Language runtime packages (mount from host or PVC)
   packages:

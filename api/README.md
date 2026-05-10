@@ -50,7 +50,7 @@ All prefixed with `SANDBOX_` unless noted:
 | `SANDBOX_RUN_CPU_TIME` | `30000` | Run CPU time limit (ms) |
 | `SANDBOX_COMPILE_MEMORY_LIMIT` | `-1` | Compile memory cgroup limit (bytes, -1 = no limit) |
 | `SANDBOX_RUN_MEMORY_LIMIT` | `-1` | Run memory cgroup limit (bytes, -1 = no limit) |
-| `SANDBOX_MAX_CONCURRENT_JOBS` | `64` | Max parallel executions |
+| `SANDBOX_MAX_CONCURRENT_JOBS` | `8` | Max parallel executions per sandbox runner |
 | `SANDBOX_RLIMIT_AS` | `4096` | Address space rlimit (MB) |
 | `SANDBOX_RLIMIT_FSIZE` | `100` | File size rlimit (MB) |
 | `SANDBOX_LIMIT_OVERRIDES` | `{}` | JSON object for per-runtime limit overrides |

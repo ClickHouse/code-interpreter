@@ -69,7 +69,7 @@ const SECCOMP_POLICY = [
   '    ioctl(fd, request) { (request & 0xFF00) == KVM_IOCTL_MAGIC }',
   '  },',
   '  ERRNO(1) {',
-  '    io_uring_setup, io_uring_enter, io_uring_register,',
+  '    io_uring_setup, io_uring_enter, io_uring_register, sched_setaffinity,',
   '    socket(domain) { domain == AF_INET || domain == AF_INET6 }',
   '  }',
   '}',

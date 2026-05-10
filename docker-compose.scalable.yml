@@ -183,8 +183,8 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=localdev
-      - PYTHON_CONCURRENCY=5
-      - OTHER_CONCURRENCY=15
+      - PYTHON_CONCURRENCY=1
+      - OTHER_CONCURRENCY=8
       - JOB_WINDOW=1000
       - JOB_TIMEOUT=300000
       - WORKER_HEALTH_PORT=3113
@@ -195,6 +195,7 @@ services:
       # Sandbox config (passed through to microVM guest)
       - SANDBOX_LOG_LEVEL=INFO
       - SANDBOX_MAX_PROCESS_COUNT=100
+      - SANDBOX_MAX_CONCURRENT_JOBS=8
       - SANDBOX_RUN_CPU_TIME=60000
       - SANDBOX_RUN_TIMEOUT=300000
       - SANDBOX_OUTPUT_MAX_SIZE=65536

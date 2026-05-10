@@ -47,7 +47,6 @@ import {
   cleanupStaleExecutions,
   commitToolHistoryAndState,
   computeToolHistoryDelta,
-  deleteExecutionState,
   getBlockingResult,
   getExecutionState,
   loadToolHistory,
@@ -1296,15 +1295,16 @@ async function handleBlocking(
         'Create Tool Call Server session',
       );
 
-      callbackToken = sealPtcCallbackTokenForGateway({
+      callbackToken = await sealPtcCallbackTokenForGateway({
         executionId: execution_id,
         sessionId: session_id,
         callbackToken: toolCallResponse.data.callback_token,
         timeoutSeconds: timeoutMsToGrantSeconds(timeout),
+        allowedToolNames: tools.map(tool => tool.name),
       });
     } catch (error) {
-      logger.error('Failed to create Tool Call Server session:', error);
-      await deleteExecutionState(execution_id);
+      logger.error('Failed to create Tool Call Server session or callback token:', error);
+      await cleanupExecution(execution_id, 'blocking');
       return res.status(503).json({ error: 'Tool Call Server unavailable' });
     }
 

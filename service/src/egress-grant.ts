@@ -9,6 +9,9 @@ const TOKEN_PREFIX = 'ceg1';
 const AAD = Buffer.from('codeapi-egress-grant:v1', 'utf8');
 const MIN_SECRET_BYTES = 32;
 const TOKEN_RE = /^[A-Za-z0-9_-]+$/;
+const LEGACY_GRANT_ID_PREFIX = 'legacy_';
+const LEGACY_MAX_OUTPUT_FILES = 50;
+const LEGACY_MAX_REQUESTS = 1000;
 
 export type EgressGrantErrorReason =
   | 'missing_secret'
@@ -31,6 +34,8 @@ export class EgressGrantError extends Error {
 export interface EgressGrantClaims {
   v: typeof EGRESS_GRANT_VERSION;
   typ: 'grant';
+  grant_id: string;
+  legacy_grant?: true;
   exec_id: string;
   tenant_id: string;
   user_id: string;
@@ -39,6 +44,8 @@ export interface EgressGrantClaims {
   read_sessions: string[];
   output_session_id: string;
   max_upload_bytes: number;
+  max_output_files: number;
+  max_requests: number;
   iat: number;
   exp: number;
   chc_user_id?: string;
@@ -53,6 +60,7 @@ export type EgressHandleClaims =
       v: typeof EGRESS_GRANT_VERSION;
       typ: 'session';
       dir: 'read' | 'write';
+      grant_id?: string;
       exec_id: string;
       session_id: string;
       iat: number;
@@ -62,6 +70,7 @@ export type EgressHandleClaims =
       v: typeof EGRESS_GRANT_VERSION;
       typ: 'object';
       dir: 'read';
+      grant_id?: string;
       exec_id: string;
       session_id: string;
       object_id: string;
@@ -72,9 +81,11 @@ export type EgressHandleClaims =
   | {
       v: typeof EGRESS_GRANT_VERSION;
       typ: 'ptc-callback';
+      grant_id?: string;
       exec_id: string;
       session_id: string;
       callback_token: string;
+      allowed_tool_names?: string[];
       iat: number;
       exp: number;
     };
@@ -189,7 +200,11 @@ function assertInputFiles(value: unknown): asserts value is ExecutionManifestInp
   }
 }
 
-function validateGrant(value: unknown): EgressGrantClaims {
+function legacyGrantId(token: string): string {
+  return `${LEGACY_GRANT_ID_PREFIX}${crypto.createHash('sha256').update(token, 'utf8').digest('base64url').slice(0, 32)}`;
+}
+
+function validateGrant(value: unknown, token: string): EgressGrantClaims {
   const claims = value as Partial<EgressGrantClaims> | null;
   if (claims == null || typeof claims !== 'object') {
     throw new EgressGrantError('malformed', 'Egress grant must be an object');
@@ -197,12 +212,26 @@ function validateGrant(value: unknown): EgressGrantClaims {
   if (claims.v !== EGRESS_GRANT_VERSION || claims.typ !== 'grant') {
     throw new EgressGrantError('wrong_type', 'Egress token is not a grant');
   }
+
+  if (claims.grant_id === undefined) {
+    claims.grant_id = legacyGrantId(token);
+    claims.legacy_grant = true;
+  } else {
+    assertString(claims.grant_id, 'grant_id');
+  }
+
   for (const field of ['exec_id', 'tenant_id', 'user_id', 'session_key', 'output_session_id'] as const) {
     assertString(claims[field], field);
   }
   assertInputFiles(claims.input_files);
   assertStringArray(claims.read_sessions, 'read_sessions');
-  for (const field of ['max_upload_bytes', 'iat', 'exp'] as const) {
+  if (claims.max_output_files === undefined) {
+    claims.max_output_files = LEGACY_MAX_OUTPUT_FILES;
+  }
+  if (claims.max_requests === undefined) {
+    claims.max_requests = LEGACY_MAX_REQUESTS;
+  }
+  for (const field of ['max_upload_bytes', 'max_output_files', 'max_requests', 'iat', 'exp'] as const) {
     if (typeof claims[field] !== 'number' || !Number.isFinite(claims[field])) {
       throw new EgressGrantError('malformed', `Egress ${field} is invalid`);
     }
@@ -217,6 +246,9 @@ function validateHandle(value: unknown): EgressHandleClaims {
   }
   if (claims.v !== EGRESS_GRANT_VERSION) {
     throw new EgressGrantError('wrong_type', 'Egress handle version is unsupported');
+  }
+  if (claims.grant_id !== undefined) {
+    assertString(claims.grant_id, 'grant_id');
   }
   assertString(claims.exec_id, 'exec_id');
   for (const field of ['iat', 'exp'] as const) {
@@ -243,6 +275,9 @@ function validateHandle(value: unknown): EgressHandleClaims {
   if (claims.typ === 'ptc-callback') {
     assertString(claims.session_id, 'session_id');
     assertString(claims.callback_token, 'callback_token');
+    if (claims.allowed_tool_names !== undefined) {
+      assertStringArray(claims.allowed_tool_names, 'allowed_tool_names');
+    }
     return claims as EgressHandleClaims;
   }
   throw new EgressGrantError('wrong_type', 'Egress token is not a recognized handle');
@@ -252,6 +287,7 @@ export function sealEgressGrant(claims: Omit<EgressGrantClaims, 'v' | 'typ'>, se
   return sealToken({
     v: EGRESS_GRANT_VERSION,
     typ: 'grant',
+    grant_id: claims.grant_id,
     exec_id: claims.exec_id,
     tenant_id: claims.tenant_id,
     user_id: claims.user_id,
@@ -260,6 +296,8 @@ export function sealEgressGrant(claims: Omit<EgressGrantClaims, 'v' | 'typ'>, se
     read_sessions: claims.read_sessions,
     output_session_id: claims.output_session_id,
     max_upload_bytes: claims.max_upload_bytes,
+    max_output_files: claims.max_output_files,
+    max_requests: claims.max_requests,
     iat: claims.iat,
     exp: claims.exp,
     ...(claims.chc_user_id ? { chc_user_id: claims.chc_user_id } : {}),
@@ -271,7 +309,7 @@ export function sealEgressGrant(claims: Omit<EgressGrantClaims, 'v' | 'typ'>, se
 }
 
 export function openEgressGrant(token: string, secret: string, nowSeconds?: number): EgressGrantClaims {
-  return validateGrant(openToken(secret, token, nowSeconds));
+  return validateGrant(openToken(secret, token, nowSeconds), token);
 }
 
 export function sealEgressHandle(claims: WithoutVersion<EgressHandleClaims>, secret: string): string {
@@ -282,8 +320,9 @@ export function openEgressHandle(token: string, secret: string, nowSeconds?: num
   return validateHandle(openToken(secret, token, nowSeconds));
 }
 
-export function egressGrantFromExecutionClaims(claims: ExecutionManifestClaims): Omit<EgressGrantClaims, 'v' | 'typ'> {
+export function egressGrantFromExecutionClaims(claims: ExecutionManifestClaims, grantId: string): Omit<EgressGrantClaims, 'v' | 'typ'> {
   return {
+    grant_id: grantId,
     exec_id: claims.exec_id,
     tenant_id: claims.tenant_id,
     user_id: claims.user_id,
@@ -292,6 +331,8 @@ export function egressGrantFromExecutionClaims(claims: ExecutionManifestClaims):
     read_sessions: claims.read_sessions,
     output_session_id: claims.output_session_id,
     max_upload_bytes: claims.max_upload_bytes,
+    max_output_files: claims.max_output_files,
+    max_requests: claims.max_requests,
     iat: claims.iat,
     exp: claims.exp,
     ...(claims.chc_user_id ? { chc_user_id: claims.chc_user_id } : {}),
@@ -316,6 +357,10 @@ function opaqueLabel(prefix: string, value: string): string {
   return `${prefix}:${crypto.createHash('sha256').update(value, 'utf8').digest('base64url').slice(0, 32)}`;
 }
 
+function sandboxWorkspaceSessionId(): string {
+  return `sbx_${crypto.randomBytes(16).toString('base64url')}`;
+}
+
 function collectMaskedInputFiles(payload: t.PayloadBody): ExecutionManifestInputFile[] {
   return payload.files
     .filter(isPayloadFileRef)
@@ -330,10 +375,11 @@ function collectMaskedInputFiles(payload: t.PayloadBody): ExecutionManifestInput
 export function prepareSandboxEgress(args: {
   payload: t.PayloadBody;
   claims: ExecutionManifestClaims;
+  grantId: string;
   secret: string;
 }): PreparedSandboxEgress {
   const { claims, secret } = args;
-  const grant = sealEgressGrant(egressGrantFromExecutionClaims(claims), secret);
+  const grant = sealEgressGrant(egressGrantFromExecutionClaims(claims, args.grantId), secret);
   const sessionHandles = new Map<string, string>();
   const now = claims.iat;
 
@@ -343,6 +389,7 @@ export function prepareSandboxEgress(args: {
     const handle = sealEgressHandle({
       typ: 'session',
       dir: 'read',
+      grant_id: args.grantId,
       exec_id: claims.exec_id,
       session_id: sessionId,
       iat: now,
@@ -360,6 +407,7 @@ export function prepareSandboxEgress(args: {
         id: sealEgressHandle({
           typ: 'object',
           dir: 'read',
+          grant_id: args.grantId,
           exec_id: claims.exec_id,
           session_id: file.storage_session_id,
           object_id: file.id,
@@ -376,12 +424,14 @@ export function prepareSandboxEgress(args: {
   const outputSessionHandle = sealEgressHandle({
     typ: 'session',
     dir: 'write',
+    grant_id: args.grantId,
     exec_id: claims.exec_id,
     session_id: claims.output_session_id,
     iat: now,
     exp: claims.exp,
   }, secret);
-  maskedPayload.session_id = outputSessionHandle;
+  maskedPayload.session_id = sandboxWorkspaceSessionId();
+  maskedPayload.output_session_id = outputSessionHandle;
 
   const maskedInputFiles = collectMaskedInputFiles(maskedPayload);
   const sandboxVisibleClaims: ExecutionManifestClaims = { ...claims };
@@ -405,8 +455,8 @@ export function prepareSandboxEgress(args: {
   };
 }
 
-function inputFileKey(file: Pick<ExecutionManifestInputFile, 'session_id' | 'id'>): string {
-  return `${file.session_id}\0${file.id}`;
+function inputFileKey(file: Pick<ExecutionManifestInputFile, 'session_id' | 'id' | 'name'>): string {
+  return `${file.session_id}\0${file.id}\0${file.name}`;
 }
 
 function isDirkeepName(name: string): boolean {
@@ -416,6 +466,9 @@ function isDirkeepName(name: string): boolean {
 function verifyHandleExec(handle: EgressHandleClaims, grant: EgressGrantClaims): void {
   if (handle.exec_id !== grant.exec_id) {
     throw new EgressGrantError('scope_mismatch', 'Egress handle execution does not match grant');
+  }
+  if (handle.grant_id && handle.grant_id !== grant.grant_id) {
+    throw new EgressGrantError('scope_mismatch', 'Egress handle grant does not match request grant');
   }
 }
 
@@ -471,7 +524,12 @@ function unwrapObjectHandle(
     throw new EgressGrantError('scope_mismatch', 'Egress object handle session does not match file ref');
   }
   const allowedInputs = new Set(grant.input_files.map(inputFileKey));
-  if (!allowedInputs.has(inputFileKey({ session_id: handle.session_id, id: handle.object_id })) && !isDirkeepName(handle.name)) {
+  const isAllowedDirkeep =
+    isDirkeepName(handle.name) && grant.read_sessions.includes(handle.session_id);
+  if (
+    !allowedInputs.has(inputFileKey({ session_id: handle.session_id, id: handle.object_id, name: handle.name })) &&
+    !isAllowedDirkeep
+  ) {
     throw new EgressGrantError('scope_mismatch', 'Egress object handle is outside the grant input scope');
   }
   return handle.object_id;
@@ -533,18 +591,22 @@ export function restoreSandboxExecuteResult<T extends { session_id: string; file
 }
 
 export function sealPtcCallbackToken(args: {
+  grantId?: string;
   executionId: string;
   sessionId: string;
   callbackToken: string;
+  allowedToolNames?: string[];
   expiresAt: number;
   issuedAt: number;
   secret: string;
 }): string {
   return sealEgressHandle({
     typ: 'ptc-callback',
+    ...(args.grantId ? { grant_id: args.grantId } : {}),
     exec_id: args.executionId,
     session_id: args.sessionId,
     callback_token: args.callbackToken,
+    ...(args.allowedToolNames ? { allowed_tool_names: args.allowedToolNames } : {}),
     iat: args.issuedAt,
     exp: args.expiresAt,
   }, args.secret);

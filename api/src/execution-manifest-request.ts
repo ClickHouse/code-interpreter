@@ -9,6 +9,7 @@ import {
 
 interface ExecuteRequestBody {
   session_id?: string;
+  output_session_id?: string;
   files?: TFile[];
 }
 
@@ -45,7 +46,9 @@ export function collectExecuteRequestInputFiles(body: ExecuteRequestBody): Execu
        * the value by design, so falling back to `body.session_id` here is
        * correct, not a category error. Same rationale lives in
        * `service/src/service/router.ts` where the prefix is chosen. */
-      const storageId = typeof file.storage_session_id === 'string' ? file.storage_session_id : body.session_id;
+      const storageId = typeof file.storage_session_id === 'string'
+        ? file.storage_session_id
+        : body.output_session_id ?? body.session_id;
       if (!storageId) {
         throw new ExecutionManifestError('scope_mismatch', 'Execution manifest input file scope does not match request');
       }
@@ -67,7 +70,8 @@ export function assertManifestMatchesExecuteRequest(
   manifest: ExecutionManifestClaims,
   body: ExecuteRequestBody,
 ): void {
-  if (!body.session_id || manifest.output_session_id !== body.session_id) {
+  const outputSessionId = body.output_session_id ?? body.session_id;
+  if (!outputSessionId || manifest.output_session_id !== outputSessionId) {
     throw new ExecutionManifestError('scope_mismatch', 'Execution manifest output session does not match request');
   }
 

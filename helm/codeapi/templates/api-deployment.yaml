@@ -38,6 +38,8 @@ spec:
               containerPort: {{ .Values.api.service.port }}
               protocol: TCP
           env:
+            - name: CODEAPI_HARDENED_SANDBOX_MODE
+              value: {{ .Values.hardenedSandboxMode | quote }}
             # Redis connection
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
@@ -60,11 +62,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
-            - name: CODEAPI_EGRESS_GRANT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "codeapi.fullname" . }}-secrets
-                  key: codeapi-egress-grant-secret
             - name: EGRESS_GRANT_TTL_SECONDS
               value: {{ .Values.egressGrant.ttlSeconds | quote }}
             # Server config

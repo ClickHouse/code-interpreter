@@ -16,6 +16,8 @@ export interface ExecuteRequestBody {
    *  Intra-monorepo wire — service-api and sandbox ship together, so
    *  the rename is hard with no backward-compat alias. */
   session_id?: string;
+  /** Output storage session id/handle used for generated file uploads. */
+  output_session_id?: string;
   language: string;
   version: string;
   args?: string[];
@@ -125,6 +127,7 @@ function getJob(body: ExecuteRequestBody, egressGrantToken?: string): Job {
       compile: compile_memory_limit ?? rt.memory_limits.compile,
     },
     extra_env_vars: sanitizeEnvVars(env_vars),
+    output_session_id: body.output_session_id,
     egress_grant: egressGrantToken,
   });
 }

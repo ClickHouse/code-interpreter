@@ -2,9 +2,11 @@ import express from 'express';
 import { loadPackages } from './runtime';
 import { logger } from './logger';
 import { config } from './config';
+import { validateHardenedSandboxStartup } from './secure-startup';
 import v2Router from './api/v2';
 
 const app = express();
+validateHardenedSandboxStartup();
 
 app.use(express.urlencoded({ extended: true }));
 /** No global `express.json()` is registered here on purpose. A global parser

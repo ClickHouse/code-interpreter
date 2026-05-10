@@ -1,6 +1,7 @@
 // src/queue.ts
 import IORedis from 'ioredis';
 import { Queue, QueueEvents } from 'bullmq';
+import { setMaxListeners } from 'events';
 import type { CommonRedisOptions } from 'ioredis';
 import type * as tls from 'tls';
 import type * as t from './types';
@@ -55,6 +56,13 @@ const otherQueue = new Queue<t.JobData, t.JobResult, Jobs.execute>(Queues.other,
 
 const pyQueueEvents = new QueueEvents(Queues.python, { connection });
 const otherQueueEvents = new QueueEvents(Queues.other, { connection });
+
+/* job.waitUntilFinished() attaches a short-lived `closing` listener to the
+ * shared Queue for every in-flight HTTP request waiting on a result. Bursts
+ * above Node's default listener limit are normal for CodeAPI throughput, so
+ * keep the leak warning enabled elsewhere while disabling it for these shared
+ * BullMQ coordination objects. */
+setMaxListeners(0, pyQueue, otherQueue, pyQueueEvents, otherQueueEvents);
 
 const webhookQueue = new Queue<t.WebhookJobData>('stripe-webhooks', {
   connection,

@@ -35,6 +35,12 @@ spec:
           env:
             - name: SERVICE_NAME
               value: egress-gateway
+            - name: CODEAPI_HARDENED_SANDBOX_MODE
+              value: {{ .Values.hardenedSandboxMode | quote }}
+            - name: CODEAPI_EGRESS_LEDGER_REQUIRED
+              value: {{ .Values.egressGrant.ledgerRequired | quote }}
+            - name: CODEAPI_EGRESS_LEDGER_TTL_GRACE_SECONDS
+              value: {{ .Values.egressGrant.ledgerTtlGraceSeconds | quote }}
             - name: EGRESS_GATEWAY_PORT
               value: {{ .Values.egressGateway.service.port | quote }}
             - name: EGRESS_GATEWAY_FILE_SERVER_URL
@@ -53,9 +59,18 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
+            - name: REDIS_HOST
+              value: {{ include "codeapi.redis.host" . }}
+            - name: REDIS_PORT
+              value: {{ include "codeapi.redis.port" . | quote }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: redis-password
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: http
             initialDelaySeconds: 10
             periodSeconds: 30

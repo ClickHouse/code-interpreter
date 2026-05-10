@@ -335,7 +335,18 @@ export function verifyExecutionManifestWithKey(
   options: ExecutionManifestVerifyOptions = {},
 ): ExecutionManifestClaims {
   if (verifier.publicKey) {
-    return verifyExecutionManifestWithPublicKey(token, verifier.publicKey, options);
+    try {
+      return verifyExecutionManifestWithPublicKey(token, verifier.publicKey, options);
+    } catch (error) {
+      if (
+        error instanceof ExecutionManifestError &&
+        error.reason === 'invalid_signature' &&
+        verifier.secret
+      ) {
+        return verifyExecutionManifest(token, verifier.secret, options);
+      }
+      throw error;
+    }
   }
   return verifyExecutionManifest(token, verifier.secret ?? '', options);
 }

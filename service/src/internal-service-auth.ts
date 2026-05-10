@@ -57,3 +57,11 @@ export function requireInternalServiceAuth(req: Request, res: Response, next: Ne
 
   return res.status(401).json({ error: 'Unauthorized' });
 }
+
+export function requireConfiguredInternalServiceAuth(req: Request, res: Response, next: NextFunction): void | Response {
+  if (!internalServiceAuthEnabled()) {
+    return res.status(503).json({ error: 'Internal service auth is not configured' });
+  }
+
+  return requireInternalServiceAuth(req, res, next);
+}

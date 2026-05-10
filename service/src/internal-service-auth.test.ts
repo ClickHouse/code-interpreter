@@ -6,6 +6,7 @@ import {
   internalServiceAuthEnabled,
   internalServiceHeaders,
   isAuthorizedInternalServiceRequest,
+  requireConfiguredInternalServiceAuth,
   requireInternalServiceAuth,
 } from './internal-service-auth';
 
@@ -136,5 +137,34 @@ describe('internal service auth', () => {
     expect(nextCalled).toBe(false);
     expect(statusCode).toBe(401);
     expect(body).toEqual({ error: 'Unauthorized' });
+  });
+
+  test('configured-token middleware fails closed when no token is configured', () => {
+    delete process.env[INTERNAL_SERVICE_TOKEN_ENV];
+
+    let statusCode = 0;
+    let body: unknown;
+    let nextCalled = false;
+
+    const req = { headers: {} } as Request;
+    const res = {
+      status(code: number) {
+        statusCode = code;
+        return this;
+      },
+      json(value: unknown) {
+        body = value;
+        return this;
+      },
+    } as Response;
+    const next: NextFunction = () => {
+      nextCalled = true;
+    };
+
+    requireConfiguredInternalServiceAuth(req, res, next);
+
+    expect(nextCalled).toBe(false);
+    expect(statusCode).toBe(503);
+    expect(body).toEqual({ error: 'Internal service auth is not configured' });
   });
 });

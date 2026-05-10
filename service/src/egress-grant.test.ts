@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import crypto from 'crypto';
 import type { ExecutionManifestClaims } from './execution-manifest';
 import { env } from './config';
 import {
@@ -6,7 +7,6 @@ import {
   normalizeProgrammaticTimeoutMs,
   prepareSandboxJobSecurity,
   refreshEgressGrantClaims,
-  sealPtcCallbackTokenForGateway,
   timeoutMsToGrantSeconds,
 } from './sandbox-egress';
 import {
@@ -26,6 +26,9 @@ import { openEgressRouteHandle } from './egress-route-params';
 import type * as t from './types';
 
 const SECRET = 'test-egress-secret-32-bytes-minimum';
+const GRANT_ID = 'grant_123';
+const TOKEN_PREFIX = 'ceg1';
+const AAD = Buffer.from('codeapi-egress-grant:v1', 'utf8');
 
 function claims(overrides: Partial<ExecutionManifestClaims> = {}): ExecutionManifestClaims {
   return {
@@ -45,6 +48,13 @@ function claims(overrides: Partial<ExecutionManifestClaims> = {}): ExecutionMani
     principal_source: 'librechat',
     auth_context_hash: 'hash_123',
     ...overrides,
+  };
+}
+
+function grantClaims(overrides: Partial<ExecutionManifestClaims> = {}) {
+  return {
+    grant_id: GRANT_ID,
+    ...claims(overrides),
   };
 }
 
@@ -86,29 +96,69 @@ function expectEgressError(fn: () => unknown, reason: EgressGrantError['reason']
   }
 }
 
+function sealRawEgressToken(claims: unknown, secret = SECRET): string {
+  const key = crypto.createHash('sha256').update(secret, 'utf8').digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(AAD);
+  const ciphertext = Buffer.concat([
+    cipher.update(Buffer.from(JSON.stringify(claims), 'utf8')),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  return [
+    TOKEN_PREFIX,
+    iv.toString('base64url'),
+    ciphertext.toString('base64url'),
+    tag.toString('base64url'),
+  ].join('.');
+}
+
 describe('egress encrypted grants and handles', () => {
   test('exports the sandbox-to-gateway grant header name', () => {
     expect(EGRESS_GRANT_HEADER).toBe('X-CodeAPI-Egress-Grant');
   });
 
   test('round-trips encrypted grants without exposing raw claims in the token', () => {
-    const token = sealEgressGrant(claims(), SECRET);
+    const token = sealEgressGrant(grantClaims(), SECRET);
     expect(token).toStartWith('ceg1.');
     expect(token).not.toContain('tenant_abc');
     expect(token).not.toContain('sess_input');
     expect(openEgressGrant(token, SECRET, 150)).toMatchObject({
       typ: 'grant',
       v: EGRESS_GRANT_VERSION,
+      grant_id: GRANT_ID,
       tenant_id: 'tenant_abc',
       user_id: 'user_123',
       output_session_id: 'sess_output',
     });
-    expect(openEgressGrant(token, SECRET, 150)).not.toHaveProperty('max_output_files');
-    expect(openEgressGrant(token, SECRET, 150)).not.toHaveProperty('max_requests');
+    expect(openEgressGrant(token, SECRET, 150)).toHaveProperty('max_output_files', 10);
+    expect(openEgressGrant(token, SECRET, 150)).toHaveProperty('max_requests', 100);
+  });
+
+  test('accepts legacy rollout grants with synthetic ledger identity and bounded budgets', () => {
+    const {
+      max_output_files: _maxOutputFiles,
+      max_requests: _maxRequests,
+      ...legacyBaseClaims
+    } = claims();
+    const legacyClaims = {
+      typ: 'grant',
+      ...legacyBaseClaims,
+    };
+    const token = sealRawEgressToken(legacyClaims);
+    const opened = openEgressGrant(token, SECRET, 150);
+
+    expect(opened.grant_id).toStartWith('legacy_');
+    expect(opened.grant_id.length).toBeGreaterThan('legacy_'.length);
+    expect(opened.legacy_grant).toBe(true);
+    expect(opened.max_output_files).toBe(50);
+    expect(opened.max_requests).toBe(1000);
+    expect(opened.max_upload_bytes).toBe(1024);
   });
 
   test('rejects tampered, expired, wrong-secret, and weak-secret tokens', () => {
-    const token = sealEgressGrant(claims(), SECRET);
+    const token = sealEgressGrant(grantClaims(), SECRET);
     const tamperedParts = token.split('.');
     tamperedParts[2] = `${tamperedParts[2][0] === 'A' ? 'B' : 'A'}${tamperedParts[2].slice(1)}`;
     const tampered = tamperedParts.join('.');
@@ -116,7 +166,7 @@ describe('egress encrypted grants and handles', () => {
     expectEgressError(() => openEgressGrant(tampered, SECRET, 150), 'malformed');
     expectEgressError(() => openEgressGrant(token, SECRET, 1000), 'expired');
     expectEgressError(() => openEgressGrant(token, 'different-egress-secret-32-bytes-min', 150), 'malformed');
-    expectEgressError(() => sealEgressGrant(claims(), 'short'), 'weak_secret');
+    expectEgressError(() => sealEgressGrant(grantClaims(), 'short'), 'weak_secret');
   });
 
   test('keeps file/session handles typed and operation-scoped', () => {
@@ -160,6 +210,7 @@ describe('egress encrypted grants and handles', () => {
 
     const prepared = prepareSandboxEgress({
       payload,
+      grantId: GRANT_ID,
       claims: claims({
         org_id: 'org_raw',
         service_id: 'service_raw',
@@ -197,6 +248,33 @@ describe('egress encrypted grants and handles', () => {
     });
   });
 
+  test('uses a short per-dispatch sandbox session id for workspace isolation', () => {
+    const longOutputSessionId = `sess_${'x'.repeat(180)}`;
+    const longClaims = claims({ output_session_id: longOutputSessionId });
+    const payload: t.PayloadBody = {
+      language: 'python',
+      version: '3.14.4',
+      session_id: longOutputSessionId,
+      files: [],
+    };
+
+    const first = prepareSandboxEgress({ payload, grantId: GRANT_ID, claims: longClaims, secret: SECRET });
+    const second = prepareSandboxEgress({ payload, grantId: GRANT_ID, claims: longClaims, secret: SECRET });
+
+    expect(first.payload.session_id).not.toBe('exec_123');
+    expect(first.payload.session_id).not.toBe(longOutputSessionId);
+    expect(second.payload.session_id).not.toBe(first.payload.session_id);
+    expect(first.payload.session_id).not.toBe(first.payload.output_session_id);
+    expect(first.payload.session_id).toMatch(/^sbx_[A-Za-z0-9_-]+$/);
+    expect(first.payload.session_id!.length).toBeLessThan(64);
+    expect(first.payload.output_session_id!.length).toBeGreaterThan(255);
+    expect(openEgressHandle(first.payload.output_session_id!, SECRET, 150)).toMatchObject({
+      typ: 'session',
+      dir: 'write',
+      session_id: longOutputSessionId,
+    });
+  });
+
   test('restores sandbox response handles before returning to callers', () => {
     const now = Math.floor(Date.now() / 1000);
     const liveClaims = claims({ iat: now - 10, exp: now + 300 });
@@ -206,15 +284,17 @@ describe('egress encrypted grants and handles', () => {
       session_id: 'sess_output',
       files: [{ id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' }],
     };
-    const prepared = prepareSandboxEgress({ payload, claims: liveClaims, secret: SECRET });
+    const prepared = prepareSandboxEgress({ payload, grantId: 'grant_123', claims: liveClaims, secret: SECRET });
     const inputFile = prepared.payload.files[0] as { id: string; storage_session_id: string; name: string };
+    expect(prepared.payload.session_id).not.toBe(prepared.payload.output_session_id);
+    expect(prepared.payload.output_session_id).not.toBe('sess_output');
     const response = {
-      session_id: prepared.payload.session_id!,
+      session_id: prepared.payload.output_session_id!,
       files: [
         {
           id: 'generated_file_id_01',
           name: 'plot.png',
-          storage_session_id: prepared.payload.session_id!,
+          storage_session_id: prepared.payload.output_session_id!,
         },
         {
           id: inputFile.id,
@@ -234,6 +314,48 @@ describe('egress encrypted grants and handles', () => {
     });
   });
 
+  test('restores inherited dirkeep read handles that are not explicit input files', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const liveClaims = claims({ iat: now - 10, exp: now + 300 });
+    const payload: t.PayloadBody = {
+      language: 'python',
+      version: '3.14.4',
+      session_id: 'sess_output',
+      files: [{ id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' }],
+    };
+    const prepared = prepareSandboxEgress({ payload, grantId: 'grant_123', claims: liveClaims, secret: SECRET });
+    const inputFile = prepared.payload.files[0] as { storage_session_id: string };
+    const dirkeepHandle = sealEgressHandle({
+      typ: 'object',
+      dir: 'read',
+      grant_id: 'grant_123',
+      exec_id: 'exec_123',
+      session_id: 'sess_input',
+      object_id: 'dirkeep_1',
+      name: 'inputs/.dirkeep',
+      iat: liveClaims.iat,
+      exp: liveClaims.exp,
+    }, SECRET);
+
+    expect(restoreSandboxExecuteResult({
+      session_id: prepared.payload.output_session_id!,
+      files: [{
+        id: dirkeepHandle,
+        name: 'inputs/.dirkeep',
+        storage_session_id: inputFile.storage_session_id,
+        inherited: true as const,
+      }],
+    }, prepared.egressGrantToken, SECRET)).toEqual({
+      session_id: 'sess_output',
+      files: [{
+        id: 'dirkeep_1',
+        name: 'inputs/.dirkeep',
+        storage_session_id: 'sess_input',
+        inherited: true,
+      }],
+    });
+  });
+
   test('rejects raw object ids returned under read-scoped session handles', () => {
     const now = Math.floor(Date.now() / 1000);
     const liveClaims = claims({ iat: now - 10, exp: now + 300 });
@@ -243,11 +365,11 @@ describe('egress encrypted grants and handles', () => {
       session_id: 'sess_output',
       files: [{ id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' }],
     };
-    const prepared = prepareSandboxEgress({ payload, claims: liveClaims, secret: SECRET });
+    const prepared = prepareSandboxEgress({ payload, grantId: 'grant_123', claims: liveClaims, secret: SECRET });
     const inputFile = prepared.payload.files[0] as { storage_session_id: string };
 
     expectEgressError(() => restoreSandboxExecuteResult({
-      session_id: prepared.payload.session_id!,
+      session_id: prepared.payload.output_session_id!,
       files: [{ id: 'file_123', name: 'inputs/data.csv', storage_session_id: inputFile.storage_session_id }],
     }, prepared.egressGrantToken, SECRET), 'scope_mismatch');
   });
@@ -261,7 +383,7 @@ describe('egress encrypted grants and handles', () => {
       session_id: 'sess_output',
       files: [{ id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' }],
     };
-    const prepared = prepareSandboxEgress({ payload, claims: liveClaims, secret: SECRET });
+    const prepared = prepareSandboxEgress({ payload, grantId: 'grant_123', claims: liveClaims, secret: SECRET });
     const readSession = (prepared.payload.files[0] as { storage_session_id: string }).storage_session_id;
     const wrongWriteSession = sealEgressHandle({
       typ: 'session',
@@ -291,7 +413,7 @@ describe('egress encrypted grants and handles', () => {
       session_id: 'sess_output',
       files: [{ id: 'file_123', storage_session_id: 'sess_input', name: 'inputs/data.csv' }],
     };
-    const prepared = prepareSandboxEgress({ payload, claims: liveClaims, secret: SECRET });
+    const prepared = prepareSandboxEgress({ payload, grantId: 'grant_123', claims: liveClaims, secret: SECRET });
     const wrongExecObject = sealEgressHandle({
       typ: 'object',
       dir: 'read',
@@ -314,11 +436,11 @@ describe('egress encrypted grants and handles', () => {
     }, SECRET);
 
     expectEgressError(() => restoreSandboxExecuteResult({
-      session_id: prepared.payload.session_id!,
+      session_id: prepared.payload.output_session_id!,
       files: [{ id: wrongExecObject, name: 'x', storage_session_id: (prepared.payload.files[0] as { storage_session_id: string }).storage_session_id }],
     }, prepared.egressGrantToken, SECRET), 'scope_mismatch');
     expectEgressError(() => restoreSandboxExecuteResult({
-      session_id: prepared.payload.session_id!,
+      session_id: prepared.payload.output_session_id!,
       files: [{ id: wrongScopeObject, name: 'x', storage_session_id: (prepared.payload.files[0] as { storage_session_id: string }).storage_session_id }],
     }, prepared.egressGrantToken, SECRET), 'scope_mismatch');
   });
@@ -362,25 +484,101 @@ describe('egress encrypted grants and handles', () => {
   });
 
   test('fails closed when egress grants are enabled without an egress gateway URL', () => {
-    const previousSecret = env.EGRESS_GRANT_SECRET;
+    const previousHardened = env.HARDENED_SANDBOX_MODE;
     const previousGatewayUrl = env.EGRESS_GATEWAY_URL;
-    env.EGRESS_GRANT_SECRET = SECRET;
+    env.HARDENED_SANDBOX_MODE = true;
     env.EGRESS_GATEWAY_URL = '';
     try {
       expect(() => prepareSandboxJobSecurity(jobSecurityArgs())).toThrow(
-        'EGRESS_GATEWAY_URL is required when CODEAPI_EGRESS_GRANT_SECRET enables sandbox egress grants',
+        'EGRESS_GATEWAY_URL is required when hardened sandbox mode or egress grant secret is configured',
       );
     } finally {
-      env.EGRESS_GRANT_SECRET = previousSecret;
+      env.HARDENED_SANDBOX_MODE = previousHardened;
       env.EGRESS_GATEWAY_URL = previousGatewayUrl;
     }
   });
 
-  test('builds egress grant claims only when the gateway path is configured', () => {
-    const previousSecret = env.EGRESS_GRANT_SECRET;
+  test('fails closed when a grant secret is configured without an egress gateway URL', () => {
+    const previousHardened = env.HARDENED_SANDBOX_MODE;
     const previousGatewayUrl = env.EGRESS_GATEWAY_URL;
+    const previousGrantSecret = env.EGRESS_GRANT_SECRET;
+    env.HARDENED_SANDBOX_MODE = false;
+    env.EGRESS_GATEWAY_URL = '';
     env.EGRESS_GRANT_SECRET = SECRET;
+    try {
+      expect(() => prepareSandboxJobSecurity(jobSecurityArgs())).toThrow(
+        'EGRESS_GATEWAY_URL is required when hardened sandbox mode or egress grant secret is configured',
+      );
+    } finally {
+      env.HARDENED_SANDBOX_MODE = previousHardened;
+      env.EGRESS_GATEWAY_URL = previousGatewayUrl;
+      env.EGRESS_GRANT_SECRET = previousGrantSecret;
+    }
+  });
+
+  test('preserves direct legacy security outside hardened mode when no gateway URL is configured', () => {
+    const previousHardened = env.HARDENED_SANDBOX_MODE;
+    const previousGatewayUrl = env.EGRESS_GATEWAY_URL;
+    const previousGrantSecret = env.EGRESS_GRANT_SECRET;
+    const previousSecret = env.EXECUTION_MANIFEST_SECRET;
+    const previousPrivateKey = env.EXECUTION_MANIFEST_PRIVATE_KEY;
+    env.HARDENED_SANDBOX_MODE = false;
+    env.EGRESS_GATEWAY_URL = '';
+    env.EGRESS_GRANT_SECRET = '';
+    env.EXECUTION_MANIFEST_SECRET = SECRET;
+    env.EXECUTION_MANIFEST_PRIVATE_KEY = '';
+    try {
+      const prepared = prepareSandboxJobSecurity(jobSecurityArgs());
+      expect(prepared.egressGrantClaims).toBeUndefined();
+      expect(prepared.executionManifestClaims).toMatchObject({
+        exec_id: 'exec_123',
+        tenant_id: 'tenant_abc',
+        user_id: 'user_123',
+      });
+    } finally {
+      env.HARDENED_SANDBOX_MODE = previousHardened;
+      env.EGRESS_GATEWAY_URL = previousGatewayUrl;
+      env.EGRESS_GRANT_SECRET = previousGrantSecret;
+      env.EXECUTION_MANIFEST_SECRET = previousSecret;
+      env.EXECUTION_MANIFEST_PRIVATE_KEY = previousPrivateKey;
+    }
+  });
+
+  test('preserves direct legacy security outside hardened mode when only a gateway URL is configured', () => {
+    const previousHardened = env.HARDENED_SANDBOX_MODE;
+    const previousGatewayUrl = env.EGRESS_GATEWAY_URL;
+    const previousGrantSecret = env.EGRESS_GRANT_SECRET;
+    const previousSecret = env.EXECUTION_MANIFEST_SECRET;
+    const previousPrivateKey = env.EXECUTION_MANIFEST_PRIVATE_KEY;
+    env.HARDENED_SANDBOX_MODE = false;
     env.EGRESS_GATEWAY_URL = 'http://egress-gateway:3190';
+    env.EGRESS_GRANT_SECRET = '';
+    env.EXECUTION_MANIFEST_SECRET = SECRET;
+    env.EXECUTION_MANIFEST_PRIVATE_KEY = '';
+    try {
+      const prepared = prepareSandboxJobSecurity(jobSecurityArgs());
+      expect(prepared.egressGrantClaims).toBeUndefined();
+      expect(prepared.executionManifestClaims).toMatchObject({
+        exec_id: 'exec_123',
+        tenant_id: 'tenant_abc',
+        user_id: 'user_123',
+      });
+    } finally {
+      env.HARDENED_SANDBOX_MODE = previousHardened;
+      env.EGRESS_GATEWAY_URL = previousGatewayUrl;
+      env.EGRESS_GRANT_SECRET = previousGrantSecret;
+      env.EXECUTION_MANIFEST_SECRET = previousSecret;
+      env.EXECUTION_MANIFEST_PRIVATE_KEY = previousPrivateKey;
+    }
+  });
+
+  test('builds egress grant claims when hardened mode has a gateway path configured', () => {
+    const previousHardened = env.HARDENED_SANDBOX_MODE;
+    const previousGatewayUrl = env.EGRESS_GATEWAY_URL;
+    const previousGrantSecret = env.EGRESS_GRANT_SECRET;
+    env.HARDENED_SANDBOX_MODE = true;
+    env.EGRESS_GATEWAY_URL = 'http://egress-gateway:3190';
+    env.EGRESS_GRANT_SECRET = '';
     try {
       const prepared = prepareSandboxJobSecurity(jobSecurityArgs());
       expect(prepared.egressGrantClaims).toMatchObject({
@@ -390,78 +588,31 @@ describe('egress encrypted grants and handles', () => {
       });
       expect(prepared.executionManifestClaims).toBeUndefined();
     } finally {
-      env.EGRESS_GRANT_SECRET = previousSecret;
+      env.HARDENED_SANDBOX_MODE = previousHardened;
       env.EGRESS_GATEWAY_URL = previousGatewayUrl;
+      env.EGRESS_GRANT_SECRET = previousGrantSecret;
     }
   });
 
-  test('fails closed when sandbox-originated PTC lacks the gateway sealing secret', () => {
-    const previousSecret = env.EGRESS_GRANT_SECRET;
-    env.EGRESS_GRANT_SECRET = '';
-
-    try {
-      expect(() => sealPtcCallbackTokenForGateway({
-        executionId: 'exec_123',
-        sessionId: 'sess_output',
-        callbackToken: 'raw-callback-token',
-        timeoutSeconds: 300,
-      })).toThrow('CODEAPI_EGRESS_GRANT_SECRET is required');
-    } finally {
-      env.EGRESS_GRANT_SECRET = previousSecret;
-    }
-  });
-
-  test('bounds sandbox-originated PTC callback token expiry to the execution timeout', () => {
-    const previousSecret = env.EGRESS_GRANT_SECRET;
-    const previousTtlSeconds = env.EGRESS_GRANT_TTL_SECONDS;
-    const previousDateNow = Date.now;
+  test('builds egress grant claims outside hardened mode when a grant secret explicitly opts in', () => {
+    const previousHardened = env.HARDENED_SANDBOX_MODE;
+    const previousGatewayUrl = env.EGRESS_GATEWAY_URL;
+    const previousGrantSecret = env.EGRESS_GRANT_SECRET;
+    env.HARDENED_SANDBOX_MODE = false;
+    env.EGRESS_GATEWAY_URL = 'http://egress-gateway:3190';
     env.EGRESS_GRANT_SECRET = SECRET;
-    env.EGRESS_GRANT_TTL_SECONDS = 900;
-    Date.now = () => 1000 * 1000;
-
     try {
-      const token = sealPtcCallbackTokenForGateway({
-        executionId: 'exec_123',
-        sessionId: 'sess_output',
-        callbackToken: 'raw-callback-token',
-        timeoutSeconds: 5,
+      const prepared = prepareSandboxJobSecurity(jobSecurityArgs());
+      expect(prepared.egressGrantClaims).toMatchObject({
+        exec_id: 'exec_123',
+        tenant_id: 'tenant_abc',
+        user_id: 'user_123',
       });
-
-      expect(openPtcCallbackToken(token, SECRET, 1000)).toMatchObject({
-        iat: 1000,
-        exp: 1005,
-      });
+      expect(prepared.executionManifestClaims).toBeUndefined();
     } finally {
-      env.EGRESS_GRANT_SECRET = previousSecret;
-      env.EGRESS_GRANT_TTL_SECONDS = previousTtlSeconds;
-      Date.now = previousDateNow;
-    }
-  });
-
-  test('caps sandbox-originated PTC callback token expiry at the global grant TTL', () => {
-    const previousSecret = env.EGRESS_GRANT_SECRET;
-    const previousTtlSeconds = env.EGRESS_GRANT_TTL_SECONDS;
-    const previousDateNow = Date.now;
-    env.EGRESS_GRANT_SECRET = SECRET;
-    env.EGRESS_GRANT_TTL_SECONDS = 3;
-    Date.now = () => 1000 * 1000;
-
-    try {
-      const token = sealPtcCallbackTokenForGateway({
-        executionId: 'exec_123',
-        sessionId: 'sess_output',
-        callbackToken: 'raw-callback-token',
-        timeoutSeconds: 300,
-      });
-
-      expect(openPtcCallbackToken(token, SECRET, 1000)).toMatchObject({
-        iat: 1000,
-        exp: 1003,
-      });
-    } finally {
-      env.EGRESS_GRANT_SECRET = previousSecret;
-      env.EGRESS_GRANT_TTL_SECONDS = previousTtlSeconds;
-      Date.now = previousDateNow;
+      env.HARDENED_SANDBOX_MODE = previousHardened;
+      env.EGRESS_GATEWAY_URL = previousGatewayUrl;
+      env.EGRESS_GRANT_SECRET = previousGrantSecret;
     }
   });
 
@@ -474,7 +625,7 @@ describe('egress encrypted grants and handles', () => {
     };
     const staleClaims = claims({ iat: 10, exp: 20 });
     const refreshedClaims = refreshEgressGrantClaims(staleClaims, 1000, 90);
-    const prepared = prepareSandboxEgress({ payload, claims: refreshedClaims, secret: SECRET });
+    const prepared = prepareSandboxEgress({ payload, grantId: 'grant_123', claims: refreshedClaims, secret: SECRET });
 
     expect(openEgressGrant(prepared.egressGrantToken, SECRET, 1089)).toMatchObject({
       iat: 1000,

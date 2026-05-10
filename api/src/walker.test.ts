@@ -482,6 +482,27 @@ describe('walkDir / regular file handling', () => {
     expect(names).toEqual(['keep.py']);
   });
 
+  it('keeps supported extensionless output basenames', async () => {
+    await fsp.writeFile(path.join(tmpDir, 'Dockerfile'), 'FROM scratch');
+    await fsp.mkdir(path.join(tmpDir, 'ci'));
+    await fsp.writeFile(path.join(tmpDir, 'ci', 'Jenkinsfile'), 'pipeline {}');
+    await fsp.mkdir(path.join(tmpDir, 'infra'));
+    await fsp.writeFile(path.join(tmpDir, 'infra', 'Vagrantfile'), 'Vagrant.configure("2")');
+
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    const names = internals.generatedFiles.map(f => f.name).sort();
+    expect(names).toEqual([
+      'Dockerfile',
+      path.join('ci', 'Jenkinsfile'),
+      path.join('infra', 'Vagrantfile'),
+    ].sort());
+  });
+
   it('filters files exceeding max_file_size', async () => {
     await fsp.writeFile(path.join(tmpDir, 'big.py'), 'x'.repeat(100));
 

@@ -38,10 +38,17 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: sandbox-runner
+              {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.workerSandbox.sandbox.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "codeapi.egressGateway.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.egressGateway.service.port }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -58,7 +65,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: service-worker
+              {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.workerSandbox.sandbox.port }}
@@ -76,7 +83,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: egress-gateway
+              {{- include "codeapi.egressGateway.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.egressGateway.service.port }}
@@ -96,7 +103,13 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: sandbox-runner
+              {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "codeapi.api.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.egressGateway.service.port }}
@@ -114,17 +127,18 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: file-server
+              {{- include "codeapi.fileServer.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.fileServer.service.port }}
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: tool-call-server
+              {{- include "codeapi.toolCallServer.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.toolCallServer.service.port }}
+    {{- include "codeapi.redisEgress" . | nindent 4 }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -156,17 +170,24 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: file-server
+              {{- include "codeapi.fileServer.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.fileServer.service.port }}
     - to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: tool-call-server
+              {{- include "codeapi.toolCallServer.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.toolCallServer.service.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "codeapi.egressGateway.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.egressGateway.service.port }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -183,10 +204,10 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: api
+              {{- include "codeapi.api.selectorLabels" . | nindent 14 }}
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: egress-gateway
+              {{- include "codeapi.egressGateway.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.fileServer.service.port }}
@@ -227,10 +248,10 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: api
+              {{- include "codeapi.api.selectorLabels" . | nindent 14 }}
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: egress-gateway
+              {{- include "codeapi.egressGateway.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.toolCallServer.service.port }}
