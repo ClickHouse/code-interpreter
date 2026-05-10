@@ -129,7 +129,7 @@ Required for NsJail to function:
 - `capability sys_admin` - Create namespaces, mount filesystems
 - `capability sys_chroot` - Change root filesystem  
 - `mount`, `pivot_root` - Set up isolated filesystem
-- `/piston/**`, `/tmp/**` - Sandbox working directories
+- `/pkgs/**`, `/tmp/**` - Sandbox working directories
 - `/sys/fs/cgroup/**` - Resource limits via cgroups
 
 ## What the Profile Denies

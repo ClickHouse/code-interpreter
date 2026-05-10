@@ -149,10 +149,10 @@ export function getRuntimes(): Runtime[] {
   return runtimes;
 }
 
-const INSTALLED_MARKER = '.ppman-installed';
+const INSTALLED_MARKER = '.package-installed';
 
-export function loadPackages(dataDirectory: string): void {
-  const pkgdir = path.join(dataDirectory, 'packages');
+export function loadPackages(packagesDirectory: string): void {
+  const pkgdir = packagesDirectory;
   if (!fs.existsSync(pkgdir)) {
     logger.warn({ pkgdir }, 'Package directory does not exist');
     return;

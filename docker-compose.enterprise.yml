@@ -7,7 +7,7 @@ services:
     devices:
       - ${KVM_DEVICE_PATH:-/dev/kvm}:/dev/kvm
     volumes:
-      - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
+      - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
     logging:
       driver: "json-file"
       options:

@@ -4,7 +4,7 @@ echo "Starting Sandbox (direct NsJail, no microVM) on port 2000..."
 
 ROOTFS="${SANDBOX_ROOTFS:-/sandbox-rootfs}"
 
-mkdir -p /sandbox_api /piston
+mkdir -p /sandbox_api /pkgs
 
 if mount -o remount,rw /sys/fs/cgroup 2>/dev/null; then
     echo "[sandbox] Remounted cgroupfs as rw"
@@ -58,10 +58,10 @@ exec unshare --mount bash -c '
 
     mount -o bind,ro "$ROOTFS/usr/local"    /usr/local   || { echo "FATAL: cannot bind /usr/local"; exit 1; }
     mount -o bind,ro "$ROOTFS/sandbox_api"  /sandbox_api || { echo "FATAL: cannot bind /sandbox_api"; exit 1; }
-    mount -o bind,ro "$ROOTFS/piston"       /piston      || { echo "FATAL: cannot bind /piston"; exit 1; }
+    mount -o bind,ro "$ROOTFS/pkgs"       /pkgs      || { echo "FATAL: cannot bind /pkgs"; exit 1; }
 
     if [ -d /host-packages ]; then
-        mount --bind /host-packages /piston/packages 2>/dev/null || \
+        mount --bind /host-packages /pkgs 2>/dev/null || \
             echo "WARNING: could not bind /host-packages - sandbox will run without packages"
     fi
 

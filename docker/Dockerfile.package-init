@@ -4,7 +4,7 @@
 #
 # Usage:
 #   docker build -f docker/Dockerfile.package-init -t codeapi-package-init .
-#   docker run -v packages:/piston/packages codeapi-package-init
+#   docker run -v packages:/pkgs codeapi-package-init
 
 FROM buildpack-deps:bookworm
 
@@ -20,7 +20,7 @@ RUN apt-get update && \
     libfreetype6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /piston/packages
+RUN mkdir -p /pkgs
 
 COPY docker/package-init.sh /package-init.sh
 COPY javascript-packages.txt /javascript-packages.txt

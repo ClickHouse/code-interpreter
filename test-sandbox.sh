@@ -220,6 +220,120 @@ test_sched_setaffinity_blocked() {
     fi
 }
 
+test_kernel_attack_surface_blocked() {
+    log_info "Testing kernel attack-surface syscalls are blocked..."
+    local probe_code payload
+    probe_code=$(cat <<'PY'
+import ctypes
+import errno
+import os
+import platform
+import signal
+import socket
+import subprocess
+
+libc = ctypes.CDLL(None, use_errno=True)
+
+subprocess.run(["/bin/sh", "-c", "echo subprocess_ok"], check=True)
+
+def expect_socket_blocked(name, family, sock_type, proto=0):
+    try:
+        sock = socket.socket(family, sock_type, proto)
+        sock.close()
+        print(f"{name}=OK")
+        raise SystemExit(1)
+    except OSError as exc:
+        print(f"{name}=errno:{exc.errno}")
+        if exc.errno != errno.EPERM:
+            raise SystemExit(1)
+
+expect_socket_blocked("AF_KEY", getattr(socket, "AF_KEY", 15), socket.SOCK_RAW, 2)
+expect_socket_blocked("AF_NETLINK", socket.AF_NETLINK, socket.SOCK_RAW, 0)
+expect_socket_blocked("AF_RXRPC", getattr(socket, "AF_RXRPC", 33), socket.SOCK_DGRAM, 0)
+
+syscalls = {
+    "x86_64": {"clone": 56, "clone3": 435, "vmsplice": 278},
+    "amd64": {"clone": 56, "clone3": 435, "vmsplice": 278},
+    "aarch64": {"clone": 220, "clone3": 435, "vmsplice": 75},
+    "arm64": {"clone": 220, "clone3": 435, "vmsplice": 75},
+}
+arch = platform.machine().lower()
+if arch not in syscalls:
+    raise SystemExit(f"unsupported arch for syscall smoke test: {arch}")
+
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNET = 0x40000000
+
+ctypes.set_errno(0)
+rc = libc.syscall(syscalls[arch]["clone"], CLONE_NEWUSER | CLONE_NEWNET | signal.SIGCHLD, 0, 0, 0, 0)
+err = ctypes.get_errno()
+print(f"clone_namespace=rc:{rc}:errno:{err}")
+if rc == 0:
+    os._exit(1)
+if rc > 0:
+    os.waitpid(rc, 0)
+    raise SystemExit(1)
+if err != errno.EPERM:
+    raise SystemExit(1)
+
+class CloneArgs(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_ulonglong),
+        ("pidfd", ctypes.c_ulonglong),
+        ("child_tid", ctypes.c_ulonglong),
+        ("parent_tid", ctypes.c_ulonglong),
+        ("exit_signal", ctypes.c_ulonglong),
+        ("stack", ctypes.c_ulonglong),
+        ("stack_size", ctypes.c_ulonglong),
+        ("tls", ctypes.c_ulonglong),
+        ("set_tid", ctypes.c_ulonglong),
+        ("set_tid_size", ctypes.c_ulonglong),
+        ("cgroup", ctypes.c_ulonglong),
+    ]
+
+args = CloneArgs(flags=CLONE_NEWUSER | CLONE_NEWNET, exit_signal=signal.SIGCHLD)
+ctypes.set_errno(0)
+rc = libc.syscall(syscalls[arch]["clone3"], ctypes.byref(args), ctypes.sizeof(args))
+err = ctypes.get_errno()
+print(f"clone3=rc:{rc}:errno:{err}")
+if rc == 0:
+    os._exit(1)
+if rc > 0:
+    os.waitpid(rc, 0)
+    raise SystemExit(1)
+if err != errno.ENOSYS:
+    raise SystemExit(1)
+
+ctypes.set_errno(0)
+rc = libc.syscall(syscalls[arch]["vmsplice"], -1, 0, 0, 0)
+err = ctypes.get_errno()
+print(f"vmsplice=rc:{rc}:errno:{err}")
+if rc != -1 or err != errno.EPERM:
+    raise SystemExit(1)
+PY
+)
+    payload=$(jq -n --arg code "$probe_code" '{"language":"python","version":"3.14.4","files":[{"content":$code}]}')
+    result=$(execute_sandbox "$payload")
+
+    stdout=$(echo "$result" | jq -r '.run.stdout // empty')
+    code=$(echo "$result" | jq -r '.run.code // empty')
+    if [[ "$code" == "0" ]] \
+        && [[ "$stdout" == *"subprocess_ok"* ]] \
+        && [[ "$stdout" == *"AF_KEY=errno:1"* ]] \
+        && [[ "$stdout" == *"AF_NETLINK=errno:1"* ]] \
+        && [[ "$stdout" == *"AF_RXRPC=errno:1"* ]] \
+        && [[ "$stdout" == *"clone_namespace=rc:-1:errno:1"* ]] \
+        && [[ "$stdout" == *"clone3=rc:-1:errno:38"* ]] \
+        && [[ "$stdout" == *"vmsplice=rc:-1:errno:1"* ]]; then
+        log_success "Kernel attack-surface syscalls blocked"
+        return 0
+    else
+        log_error "Kernel attack-surface syscall hardening failed"
+        echo "$result" | jq .
+        return 1
+    fi
+}
+
 test_bun() {
     log_info "Testing Bun/JavaScript execution..."
     # Get available bun version dynamically
@@ -272,6 +386,7 @@ test_chdb || FAILED=$((FAILED + 1))
 test_file_write || FAILED=$((FAILED + 1))
 test_network_blocked || FAILED=$((FAILED + 1))
 test_sched_setaffinity_blocked || FAILED=$((FAILED + 1))
+test_kernel_attack_surface_blocked || FAILED=$((FAILED + 1))
 test_bun || FAILED=$((FAILED + 1))
 test_escape_attempt || FAILED=$((FAILED + 1))
 

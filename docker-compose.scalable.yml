@@ -194,6 +194,7 @@ services:
       - LAUNCHER_LOG_LEVEL=3
       # Sandbox config (passed through to microVM guest)
       - SANDBOX_LOG_LEVEL=INFO
+      - SANDBOX_PACKAGES_DIRECTORY=/pkgs
       - SANDBOX_MAX_PROCESS_COUNT=100
       - SANDBOX_MAX_CONCURRENT_JOBS=8
       - SANDBOX_RUN_CPU_TIME=60000
@@ -203,7 +204,7 @@ services:
       - SANDBOX_ALLOWED_LOCAL_NETWORK_PORT=3033
       - SANDBOX_FORWARD_TARGET=tool_call_server:3033
     volumes:
-      - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
+      - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
     depends_on:
       redis:
         condition: service_healthy

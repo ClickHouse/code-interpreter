@@ -8,7 +8,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MARKER_FILE="/piston/packages/.initialized"
+MARKER_FILE="/pkgs/.initialized"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 PYTHON_SITE_VERSION="${PYTHON_VERSION%.*}"
@@ -71,15 +71,15 @@ echo "=============================================="
 echo ""
 
 packages_ready() {
-    [ -f "/piston/packages/python/${PYTHON_VERSION}/.ppman-installed" ] &&
-    [ -d "/piston/packages/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/PIL" ] &&
-    [ -d "/piston/packages/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/markitdown" ] &&
-    [ -d "/piston/packages/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/chdb" ] &&
-    [ -f "/piston/packages/node/${NODE_VERSION}/.ppman-installed" ] &&
-    js_packages_ready "/piston/packages/node/${NODE_VERSION}" &&
-    [ -f "/piston/packages/bun/${BUN_VERSION}/.ppman-installed" ] &&
-    js_packages_ready "/piston/packages/bun/${BUN_VERSION}" &&
-    [ -f "/piston/packages/bash/${BASH_PACKAGE_VERSION}/.ppman-installed" ]
+    [ -f "/pkgs/python/${PYTHON_VERSION}/.package-installed" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/PIL" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/markitdown" ] &&
+    [ -d "/pkgs/python/${PYTHON_VERSION}/lib/python${PYTHON_SITE_VERSION}/site-packages/chdb" ] &&
+    [ -f "/pkgs/node/${NODE_VERSION}/.package-installed" ] &&
+    js_packages_ready "/pkgs/node/${NODE_VERSION}" &&
+    [ -f "/pkgs/bun/${BUN_VERSION}/.package-installed" ] &&
+    js_packages_ready "/pkgs/bun/${BUN_VERSION}" &&
+    [ -f "/pkgs/bash/${BASH_PACKAGE_VERSION}/.package-installed" ]
 }
 
 if [ -f "$MARKER_FILE" ] && [ "$FORCE_REBUILD" != "true" ]; then
@@ -88,16 +88,16 @@ if [ -f "$MARKER_FILE" ] && [ "$FORCE_REBUILD" != "true" ]; then
         echo "Set FORCE_REBUILD=true to force reinstall"
         echo ""
         echo "Installed packages:"
-        ls -la /piston/packages/ 2>/dev/null || echo "  (none)"
+        ls -la /pkgs/ 2>/dev/null || echo "  (none)"
         exit 0
     fi
     echo "Initialization marker exists, but one or more required packages are missing"
     echo "Continuing package initialization"
 fi
 
-if [ "$FORCE_REBUILD" = "true" ] && [ -d "/piston/packages" ]; then
+if [ "$FORCE_REBUILD" = "true" ] && [ -d "/pkgs" ]; then
     echo "Force rebuild requested, cleaning existing packages..."
-    rm -rf /piston/packages/* /piston/packages/.initialized
+    rm -rf /pkgs/* /pkgs/.initialized
 fi
 
 # ==============================
@@ -109,9 +109,9 @@ echo "  Installing Python ${PYTHON_VERSION}"
 echo "=============================================="
 echo ""
 
-PKG_DEST="/piston/packages/python/${PYTHON_VERSION}"
+PKG_DEST="/pkgs/python/${PYTHON_VERSION}"
 mkdir -p "$PKG_DEST"
-rm -f "$PKG_DEST/.ppman-installed"
+rm -f "$PKG_DEST/.package-installed"
 
 cd /tmp
 wget -q "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz"
@@ -214,7 +214,7 @@ if [ -f "$PIP_PATH" ]; then
 
     "$PIP_PATH" install --upgrade six 2>/dev/null || true
     if [ "$PYTHON_PACKAGES_INSTALLED" = true ]; then
-        echo "$(date +%s)000" > "$PKG_DEST/.ppman-installed"
+        echo "$(date +%s)000" > "$PKG_DEST/.package-installed"
     fi
 
     echo ""
@@ -234,9 +234,9 @@ echo "  Installing Node.js ${NODE_VERSION}"
 echo "=============================================="
 echo ""
 
-NODE_DEST="/piston/packages/node/${NODE_VERSION}"
+NODE_DEST="/pkgs/node/${NODE_VERSION}"
 mkdir -p "$NODE_DEST"
-rm -f "$NODE_DEST/.ppman-installed"
+rm -f "$NODE_DEST/.package-installed"
 NODE_INSTALLED=false
 
 ARCH=$(uname -m)
@@ -317,7 +317,7 @@ if [ "$NODE_INSTALLED" = true ] && [ "${#JS_PACKAGES[@]}" -gt 0 ] && [ -f "$NODE
         echo "ERROR: Node.js package installation failed"
         INSTALL_FAILED=true
     else
-        echo "$(date +%s)000" > "$NODE_DEST/.ppman-installed"
+        echo "$(date +%s)000" > "$NODE_DEST/.package-installed"
     fi
 
     echo ""
@@ -342,9 +342,9 @@ echo "  Installing Bun ${BUN_VERSION}"
 echo "=============================================="
 echo ""
 
-BUN_DEST="/piston/packages/bun/${BUN_VERSION}"
+BUN_DEST="/pkgs/bun/${BUN_VERSION}"
 mkdir -p "$BUN_DEST"
-rm -f "$BUN_DEST/.ppman-installed"
+rm -f "$BUN_DEST/.package-installed"
 BUN_INSTALLED=false
 
 ARCH=$(uname -m)
@@ -422,7 +422,7 @@ if [ "$BUN_INSTALLED" = true ] && [ "${#JS_PACKAGES[@]}" -gt 0 ] && [ -f "$BUN_D
         echo "ERROR: Bun package installation failed"
         INSTALL_FAILED=true
     else
-        echo "$(date +%s)000" > "$BUN_DEST/.ppman-installed"
+        echo "$(date +%s)000" > "$BUN_DEST/.package-installed"
     fi
 
     echo ""
@@ -448,7 +448,7 @@ echo "=============================================="
 echo ""
 
 SYSTEM_BASH_VERSION=$(bash --version | sed -nE '1s/.* ([0-9]+[.][0-9]+[.][0-9]+).*/\1/p')
-BASH_DEST="/piston/packages/bash/${BASH_PACKAGE_VERSION}"
+BASH_DEST="/pkgs/bash/${BASH_PACKAGE_VERSION}"
 mkdir -p "$BASH_DEST"
 
 cat > "$BASH_DEST/pkg-info.json" << EOF
@@ -468,7 +468,7 @@ EOF
 chmod +x "$BASH_DEST/run"
 
 echo "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:." > "$BASH_DEST/.env"
-echo "$(date +%s)000" > "$BASH_DEST/.ppman-installed"
+echo "$(date +%s)000" > "$BASH_DEST/.package-installed"
 
 echo "Bash ${BASH_PACKAGE_VERSION} registered (using system binary ${SYSTEM_BASH_VERSION})"
 
@@ -482,7 +482,7 @@ echo "=============================================="
 echo ""
 
 echo "Setting permissions..."
-chmod -R a+rX /piston/packages/ 2>/dev/null || true
+chmod -R a+rX /pkgs/ 2>/dev/null || true
 
 if [ "$INSTALL_FAILED" = true ]; then
     echo ""
@@ -494,7 +494,7 @@ if [ "$INSTALL_FAILED" = true ]; then
     echo "Marker file NOT created -- next run will retry."
     echo ""
     echo "Partial packages on disk:"
-    ls -la /piston/packages/
+    ls -la /pkgs/
     echo ""
     exit 1
 fi
@@ -505,7 +505,7 @@ initialized_at=$(date -Iseconds)
 python_version=${PYTHON_VERSION}
 node_version=${NODE_VERSION}
 bun_version=${BUN_VERSION}
-packages=$(ls /piston/packages/ 2>/dev/null | tr '\n' ',')
+packages=$(ls /pkgs/ 2>/dev/null | tr '\n' ',')
 MARKER
 
 echo ""
@@ -514,5 +514,5 @@ echo "  Package initialization complete!"
 echo "=============================================="
 echo ""
 echo "Installed packages:"
-ls -la /piston/packages/
+ls -la /pkgs/
 echo ""

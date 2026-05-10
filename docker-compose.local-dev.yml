@@ -19,13 +19,14 @@ services:
     ports:
       - 2000:2000
     volumes:
-      - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
+      - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
     environment:
       - KVM_ENABLED=${KVM_ENABLED:-true}
       - LAUNCHER_VCPUS=2
       - LAUNCHER_RAM_MIB=2048
       - LAUNCHER_LOG_LEVEL=3
       - SANDBOX_LOG_LEVEL=DEBUG
+      - SANDBOX_PACKAGES_DIRECTORY=/pkgs
       - SANDBOX_MAX_PROCESS_COUNT=100
       - SANDBOX_RUN_CPU_TIME=60000
       - SANDBOX_RUN_TIMEOUT=300000

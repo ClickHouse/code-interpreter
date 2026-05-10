@@ -21,9 +21,9 @@ mkdir -p /tmp/sandbox
 # Mount virtiofs shares if running inside a libkrun microVM.
 # The launcher exposes host directories as virtiofs tags that need explicit mounting.
 if grep -q virtiofs /proc/filesystems 2>/dev/null; then
-    if [ -d /piston/packages ]; then
-        mount -t virtiofs packages /piston/packages 2>/dev/null && \
-            echo "Mounted virtiofs 'packages' at /piston/packages" || true
+    if [ -d /pkgs ]; then
+        mount -t virtiofs packages /pkgs 2>/dev/null && \
+            echo "Mounted virtiofs 'packages' at /pkgs" || true
     fi
 fi
 
@@ -197,8 +197,8 @@ EOF
 fi
 
 # Ensure package directories are readable by sandbox UID
-if [ -d "/piston/packages" ]; then
-    chmod -R a+rX /piston/packages 2>/dev/null || true
+if [ -d "/pkgs" ]; then
+    chmod -R a+rX /pkgs 2>/dev/null || true
 fi
 
 # NsJail smoke test: verify sandbox can start before accepting traffic.

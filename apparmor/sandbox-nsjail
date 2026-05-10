@@ -44,7 +44,7 @@ profile sandbox-nsjail flags=(attach_disconnected,mediate_deleted) {
   # ==========================================================================
   
   # Full access to sandbox working directories
-  /piston/** rwlk,
+  /pkgs/** rwlk,
   /tmp/** rwlk,
   /mnt/** rwlk,
   

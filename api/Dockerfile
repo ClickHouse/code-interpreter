@@ -76,7 +76,7 @@ COPY api/config ./config
 
 RUN bun run build
 
-RUN mkdir -p /piston/packages /tmp/sandbox
+RUN mkdir -p /pkgs /tmp/sandbox
 
 RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
 

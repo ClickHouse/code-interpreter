@@ -1,2 +1,2 @@
 while True:
-    print("Piston is secure")
+    print("Sandbox is secure")

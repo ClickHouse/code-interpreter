@@ -58,14 +58,22 @@ kubectl get jobs -l app.kubernetes.io/component=package-init
 kubectl logs job/codeapi-package-init
 ```
 
+When deploying the `/pkgs` package-root migration, update sandbox env values to
+`SANDBOX_PACKAGES_DIRECTORY=/pkgs` and force a package rebuild on the first rollout
+so generated Python/Node/Bun paths are recreated under `/pkgs`:
+
+```bash
+helm upgrade codeapi . --set workerSandbox.packages.initJob.forceRebuild=true
+```
+
 To manually populate packages instead (e.g., from a pre-built directory):
 
 ```bash
 kubectl run pvc-populator --image=alpine --command -- sleep 3600 \
-  --overrides='{"spec":{"containers":[{"name":"pvc-populator","image":"alpine","command":["sleep","3600"],"volumeMounts":[{"name":"packages","mountPath":"/packages"}]}],"volumes":[{"name":"packages","persistentVolumeClaim":{"claimName":"codeapi-piston-packages"}}]}}'
+  --overrides='{"spec":{"containers":[{"name":"pvc-populator","image":"alpine","command":["sleep","3600"],"volumeMounts":[{"name":"packages","mountPath":"/packages"}]}],"volumes":[{"name":"packages","persistentVolumeClaim":{"claimName":"codeapi-packages"}}]}}'
 
 kubectl wait --for=condition=ready pod/pvc-populator --timeout=60s
-kubectl cp ./data/piston/packages/. pvc-populator:/packages/
+kubectl cp ./data/pkgs/. pvc-populator:/packages/
 kubectl delete pod pvc-populator
 kubectl rollout restart deployment/codeapi-worker-sandbox
 ```
@@ -204,7 +212,7 @@ kubectl logs deployment/codeapi-worker-sandbox --container worker --tail=5
 |                                                                      |
 |  +---------------------------------------------------------------+   |
 |  |              PersistentVolume (Packages)                       |   |
-|  |  /piston/packages - Python, Node, Bun runtimes                |   |
+|  |  /pkgs - Python, Node, Bun runtimes                            |   |
 |  |  ReadOnlyMany - shared across all worker-sandbox pods          |   |
 |  +---------------------------------------------------------------+   |
 |                                                                      |
@@ -277,7 +285,7 @@ Chart v0.2.0 replaces the Piston/isolate sandbox engine with NsJail. This is a b
 | Working directory | `/home` | `/mnt/data` |
 | Security model | isolate + chroot | namespaces + cgroups + seccomp-bpf |
 | Privileged mode | Required (unchanged) | Required (unchanged) |
-| Package format | Piston packages | Piston packages (unchanged) |
+| Package format | Piston packages | Runtime package directories |
 | API contract | `/api/v2/execute` | `/api/v2/execute` (unchanged) |
 
 ### Upgrade steps

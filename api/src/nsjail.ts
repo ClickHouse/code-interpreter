@@ -34,6 +34,7 @@ const syscallDefines = process.arch === 'arm64'
       '#define io_uring_setup 425',
       '#define io_uring_enter 426',
       '#define io_uring_register 427',
+      '#define clone3 435',
       '#define umount2 39',
       '#define seccomp 277',
     ]
@@ -41,6 +42,7 @@ const syscallDefines = process.arch === 'arm64'
       '#define io_uring_setup 425',
       '#define io_uring_enter 426',
       '#define io_uring_register 427',
+      '#define clone3 435',
       '#define umount2 166',
       '#define seccomp 317',
       '#define kexec_file_load 320',
@@ -54,6 +56,10 @@ const SECCOMP_POLICY = [
   ...syscallDefines,
   '#define AF_INET 2',
   '#define AF_INET6 10',
+  '#define AF_NETLINK 16',
+  '#define AF_KEY 15',
+  '#define AF_RXRPC 33',
+  '#define CLONE_NAMESPACE_FLAGS 0x7e020000',
   '#define KVM_IOCTL_MAGIC 0xAE00',
   'POLICY sandbox {',
   '  KILL {',
@@ -68,9 +74,13 @@ const SECCOMP_POLICY = [
   '    acct, quotactl,',
   '    ioctl(fd, request) { (request & 0xFF00) == KVM_IOCTL_MAGIC }',
   '  },',
+  '  ERRNO(38) {',
+  '    clone3',
+  '  },',
   '  ERRNO(1) {',
-  '    io_uring_setup, io_uring_enter, io_uring_register, sched_setaffinity,',
-  '    socket(domain) { domain == AF_INET || domain == AF_INET6 }',
+  '    io_uring_setup, io_uring_enter, io_uring_register, sched_setaffinity, vmsplice,',
+  '    clone(flags) { (flags & CLONE_NAMESPACE_FLAGS) != 0 },',
+  '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC }',
   '  }',
   '}',
   'USE sandbox DEFAULT ALLOW',
@@ -311,9 +321,15 @@ function buildArgs(opts: BuildArgsOptions): string[] {
   }
 
   if (extraPkgdirs) {
-    const packagesRoot = path.join(config.data_directory, 'packages');
+    const packagesRoot = config.packages_directory;
     for (const dir of extraPkgdirs) {
-      if (!path.isAbsolute(dir) || !dir.startsWith(packagesRoot) || dir.includes(':')) {
+      const relativeToPackages = path.relative(packagesRoot, dir);
+      if (
+        !path.isAbsolute(dir) ||
+        relativeToPackages.startsWith('..') ||
+        path.isAbsolute(relativeToPackages) ||
+        dir.includes(':')
+      ) {
         continue;
       }
       args.push('-R', `${dir}:${dir}`);

@@ -17,7 +17,7 @@ Each code execution runs in a fresh NsJail sandbox with the following isolation:
 | Layer | Mechanism | Effect |
 |-------|-----------|--------|
 | **Namespaces** | PID, mount, network, user, IPC, UTS, cgroup | Complete process and filesystem isolation |
-| **Seccomp-bpf** | Kafel policy in `nsjail.ts` | Blocks dangerous syscalls (`ptrace`, `mount`, `bpf`, etc.) and returns `EPERM` for runtime probes like `io_uring` |
+| **Seccomp-bpf** | Kafel policy in `nsjail.ts` | Blocks dangerous syscalls (`ptrace`, `mount`, `bpf`, etc.), kernel-control socket families (`AF_KEY`, `AF_NETLINK`, `AF_RXRPC`), nested namespace creation, and returns `EPERM`/`ENOSYS` for runtime probes like `io_uring` and `clone3` |
 | **cgroups v2** | Memory, swap, PID limits | Prevents resource exhaustion |
 | **rlimits** | AS, fsize, nofile, nproc, cpu | Per-process resource caps |
 | **User mapping** | UID/GID 65534 (`nobody`) | No privilege escalation |
@@ -37,7 +37,7 @@ All prefixed with `SANDBOX_` unless noted:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SANDBOX_LOG_LEVEL` | `INFO` | Log verbosity |
-| `SANDBOX_DATA_DIRECTORY` | `/piston` | Root directory for language packages |
+| `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Directory containing language packages |
 | `SANDBOX_DISABLE_NETWORKING` | `true` | Isolate sandbox from the network |
 | `SANDBOX_ALLOWED_LOCAL_NETWORK_PORT` | `0` | Allow sandbox to reach this host port (for tool calling) |
 | `SANDBOX_OUTPUT_MAX_SIZE` | `1024` | Max stdout/stderr bytes before truncation |
@@ -61,13 +61,13 @@ All prefixed with `SANDBOX_` unless noted:
 
 ## Supported Runtimes
 
-Runtimes are auto-discovered from `/piston/packages` at startup. Each package provides `compile` and `run` shell scripts. Currently tested and supported:
+Runtimes are auto-discovered from `/pkgs` at startup. Each package provides `compile` and `run` shell scripts. Currently tested and supported:
 
 - **Python** 3.14 -- includes `matplotlib`, `numpy`, `pandas`, `scipy`, chDB (`chdb`), and other scientific packages
 - **Node.js** 24 -- runs `.js` files with curated offline npm packages
 - **Bun** (JavaScript/TypeScript) -- runs `.js`, `.ts`, and `.bun` files with the same curated offline package set
 
-Other Piston-format packages (Go, Rust, Java, GCC) can be installed but may require additional system libraries to be added to the sandbox image.
+Other package-format-compatible runtimes (Go, Rust, Java, GCC) can be installed but may require additional system libraries to be added to the sandbox image.
 
 ## Filesystem Layout Inside the Sandbox
 
@@ -85,7 +85,7 @@ Other Piston-format packages (Go, Rust, Java, GCC) can be installed but may requ
 /dev/null           Device node (read-only)
 /dev/urandom        Device node (read-only)
 /dev/zero           Device node (read-only)
-/piston/packages/   Language runtime packages (read-only bind mount)
+/pkgs/   Language runtime packages (read-only bind mount)
 ```
 
 ## API Endpoints

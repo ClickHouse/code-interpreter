@@ -134,12 +134,13 @@ services:
         ports:
             - 2000:2000
         volumes:
-            - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
+            - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
         environment:
             - KVM_ENABLED=${KVM_ENABLED:-true}
             - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - EGRESS_GATEWAY_URL=http://egress_gateway:3190
             - SANDBOX_EXECUTE_BODY_LIMIT=${SANDBOX_EXECUTE_BODY_LIMIT:-50mb}
+            - SANDBOX_PACKAGES_DIRECTORY=/pkgs
             - SANDBOX_LOG_LEVEL=DEBUG
             - SANDBOX_OUTPUT_MAX_SIZE=65536
             - SANDBOX_MAX_CONCURRENT_JOBS=${SANDBOX_MAX_CONCURRENT_JOBS:-8}

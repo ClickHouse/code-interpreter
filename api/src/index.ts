@@ -21,7 +21,7 @@ app.use(express.urlencoded({ extended: true }));
  * `services/codeapi/api/src/api/v2.ts` is responsible for installing the
  * right parser per route. */
 
-loadPackages(config.data_directory);
+loadPackages(config.packages_directory);
 
 logger.info('Registering routes');
 app.use('/api/v2', v2Router);

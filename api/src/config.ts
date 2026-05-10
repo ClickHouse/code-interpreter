@@ -28,11 +28,28 @@ const requireExecutionManifest = (
   ?? (egressGatewayUrl ? 'true' : 'false')
 ) === 'true';
 
+function cleanDirectory(raw: string | undefined): string | undefined {
+  if (!raw?.trim()) return undefined;
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  return trimmed || '/';
+}
+
+export function legacyPackagesDirectory(raw: string | undefined): string | undefined {
+  const trimmed = cleanDirectory(raw);
+  if (!trimmed) return undefined;
+  const legacyPackages = trimmed.endsWith('/packages')
+    ? trimmed
+    : trimmed === '/' ? '/packages' : `${trimmed}/packages`;
+  return legacyPackages === '/piston/packages' ? '/pkgs' : legacyPackages;
+}
+
 export const config = {
   hardened_sandbox_mode: process.env.CODEAPI_HARDENED_SANDBOX_MODE === 'true',
   log_level: process.env.SANDBOX_LOG_LEVEL ?? 'DEBUG',
   bind_address: `0.0.0.0:${process.env.PORT ?? 2000}`,
-  data_directory: process.env.SANDBOX_DATA_DIRECTORY ?? '/piston',
+  packages_directory: cleanDirectory(process.env.SANDBOX_PACKAGES_DIRECTORY)
+    ?? legacyPackagesDirectory(process.env.SANDBOX_DATA_DIRECTORY)
+    ?? '/pkgs',
   disable_networking: (process.env.SANDBOX_DISABLE_NETWORKING ?? 'true') === 'true',
   use_cgroupv2: (process.env.SANDBOX_USE_CGROUPV2 ?? 'true') === 'true',
   allowed_local_network_port: Number(process.env.SANDBOX_ALLOWED_LOCAL_NETWORK_PORT ?? 0),

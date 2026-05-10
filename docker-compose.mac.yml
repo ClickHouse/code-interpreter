@@ -6,7 +6,7 @@ services:
     devices:
       - /dev/null:/dev/kvm
     volumes:
-      - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/piston/packages:ro
+      - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/pkgs:ro
     environment:
       - KVM_ENABLED=false
       - SANDBOX_USE_CGROUPV2=false

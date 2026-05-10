@@ -107,7 +107,7 @@ COPY api/config ./config
 COPY api/src/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 
-RUN mkdir -p /piston/packages /tmp/sandbox
+RUN mkdir -p /pkgs /tmp/sandbox
 
 RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
 RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \

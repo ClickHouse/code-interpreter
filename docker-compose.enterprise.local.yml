@@ -11,7 +11,7 @@ services:
     ports:
       - 2000:2000
     volumes:
-      - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
+      - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
     logging:
       driver: "json-file"
       options:

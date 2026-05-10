@@ -28,7 +28,7 @@ cd "$SCRIPT_DIR"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 NODE_VERSION="${NODE_VERSION:-24.15.0}"
 BUN_VERSION="${BUN_VERSION:-1.3.13}"
-PACKAGES_DIR="./data/piston/packages"
+PACKAGES_DIR="./data/pkgs"
 JS_PACKAGE_MANIFEST="${JS_PACKAGE_MANIFEST:-${SCRIPT_DIR}/javascript-packages.txt}"
 
 load_js_packages() {
@@ -68,7 +68,7 @@ esac
 
 if [ "${FORCE_REBUILD:-}" = "1" ]; then
     echo "Force rebuild requested, cleaning existing packages..."
-    docker run --rm -v "$PWD/data/piston:/piston" alpine sh -c "rm -rf /piston/packages/*" 2>/dev/null || rm -rf "$PACKAGES_DIR"/*
+    docker run --rm -v "$PWD/data/pkgs:/pkgs" alpine sh -c "rm -rf /pkgs/*" 2>/dev/null || rm -rf "$PACKAGES_DIR"/*
 fi
 
 mkdir -p "$PACKAGES_DIR"
@@ -87,7 +87,7 @@ install_python() {
         return 0
     fi
 
-    local pkg_dest="/piston/packages/python/${PYTHON_VERSION}"
+    local pkg_dest="/pkgs/python/${PYTHON_VERSION}"
     local python_minor="${PYTHON_VERSION%.*}"
 
     echo "=============================================="
@@ -97,7 +97,7 @@ install_python() {
     docker exec "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
-        rm -f ${pkg_dest}/.ppman-installed
+        rm -f ${pkg_dest}/.package-installed
         cd /tmp
         wget -q https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz
         tar xf Python-${PYTHON_VERSION}.tar.xz
@@ -129,7 +129,7 @@ chmod +x ${pkg_dest}/run"
     "
 
     if [ "${SKIP_PYTHON_PACKAGES:-}" = "1" ]; then
-        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.ppman-installed"
+        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.package-installed"
     fi
 
     docker exec "$CONTAINER_NAME" "${pkg_dest}/bin/python3" -m pip install --upgrade pip 2>/dev/null || true
@@ -143,7 +143,7 @@ install_python_packages() {
         return 0
     fi
 
-    local pip_path="/piston/packages/python/${PYTHON_VERSION}/bin/pip3"
+    local pip_path="/pkgs/python/${PYTHON_VERSION}/bin/pip3"
 
     echo "=============================================="
     echo "  Installing Python packages"
@@ -207,7 +207,7 @@ install_python_packages() {
 
     docker exec "$CONTAINER_NAME" "$pip_path" install --upgrade six 2>/dev/null || true
     if [ "$python_packages_installed" = true ]; then
-        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > /piston/packages/python/${PYTHON_VERSION}/.ppman-installed"
+        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > /pkgs/python/${PYTHON_VERSION}/.package-installed"
     fi
 
     echo "Installed Python packages:"
@@ -220,7 +220,7 @@ install_node() {
         return 0
     fi
 
-    local pkg_dest="/piston/packages/node/${NODE_VERSION}"
+    local pkg_dest="/pkgs/node/${NODE_VERSION}"
 
     echo "=============================================="
     echo "  Installing Node.js ${NODE_VERSION}"
@@ -229,7 +229,7 @@ install_node() {
     docker exec "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
-        rm -f ${pkg_dest}/.ppman-installed
+        rm -f ${pkg_dest}/.package-installed
         cd /tmp
         curl -fsSL -o node.tar.xz https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz
         tar -xJf node.tar.xz --strip-components=1 -C ${pkg_dest}
@@ -262,7 +262,7 @@ chmod +x ${pkg_dest}/run"
     "
 
     if [ "${SKIP_JS_PACKAGES:-}" = "1" ]; then
-        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.ppman-installed"
+        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.package-installed"
     fi
 
     echo "Node.js ${NODE_VERSION} installed: $(docker exec "$CONTAINER_NAME" "${pkg_dest}/bin/node" --version)"
@@ -274,7 +274,7 @@ install_node_packages() {
         return 0
     fi
 
-    local pkg_dest="/piston/packages/node/${NODE_VERSION}"
+    local pkg_dest="/pkgs/node/${NODE_VERSION}"
     local npm_path="${pkg_dest}/bin/npm"
 
     echo "=============================================="
@@ -302,7 +302,7 @@ install_node_packages() {
         --save-exact \
         "${JS_PACKAGES[@]}"
 
-    docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.ppman-installed"
+    docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.package-installed"
 
     echo "Installed Node.js packages (local):"
     docker exec "$CONTAINER_NAME" env "PATH=${pkg_dest}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:." "$npm_path" ls --prefix "$pkg_dest" --depth=0 2>/dev/null | head -40 || true
@@ -317,7 +317,7 @@ install_bun() {
         return 0
     fi
 
-    local pkg_dest="/piston/packages/bun/${BUN_VERSION}"
+    local pkg_dest="/pkgs/bun/${BUN_VERSION}"
 
     echo "=============================================="
     echo "  Installing Bun ${BUN_VERSION}"
@@ -326,7 +326,7 @@ install_bun() {
     docker exec "$CONTAINER_NAME" bash -c "
         set -e
         mkdir -p ${pkg_dest}
-        rm -f ${pkg_dest}/.ppman-installed
+        rm -f ${pkg_dest}/.package-installed
         cd /tmp
         curl -fsSL -o bun.zip https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip
         unzip -o bun.zip
@@ -365,7 +365,7 @@ chmod +x ${pkg_dest}/run"
     "
 
     if [ "${SKIP_JS_PACKAGES:-}" = "1" ]; then
-        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.ppman-installed"
+        docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.package-installed"
     fi
 
     echo "Bun ${BUN_VERSION} installed: $(docker exec "$CONTAINER_NAME" "${pkg_dest}/bun" --version)"
@@ -377,7 +377,7 @@ install_bun_packages() {
         return 0
     fi
 
-    local pkg_dest="/piston/packages/bun/${BUN_VERSION}"
+    local pkg_dest="/pkgs/bun/${BUN_VERSION}"
     local packages
     printf -v packages "%q " "${JS_PACKAGES[@]}"
 
@@ -402,7 +402,7 @@ install_bun_packages() {
         BUN_INSTALL=${pkg_dest} ./bun install -g --exact ${packages}
     "
 
-    docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.ppman-installed"
+    docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.package-installed"
 
     echo "Installed Bun packages (local):"
     docker exec "$CONTAINER_NAME" bash -c "cd ${pkg_dest} && ./bun pm ls --depth 0 2>/dev/null | head -40" || true
@@ -416,7 +416,7 @@ install_bash() {
     bash_package_version="${BASH_PACKAGE_VERSION:-5.2.0}"
     local system_bash_version
     system_bash_version=$(docker exec "$CONTAINER_NAME" bash --version | head -1 | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
-    local pkg_dest="/piston/packages/bash/${bash_package_version}"
+    local pkg_dest="/pkgs/bash/${bash_package_version}"
 
     echo "=============================================="
     echo "  Registering Bash ${bash_package_version}"
@@ -450,11 +450,11 @@ chmod +x ${pkg_dest}/run"
     # to ~/.bun/install/global.
     docker exec "$CONTAINER_NAME" bash -c "
         cat > ${pkg_dest}/.env <<EOF
-PATH=/piston/packages/bun/${BUN_VERSION}/bin:/piston/packages/bun/${BUN_VERSION}:/piston/packages/node/${NODE_VERSION}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.
-NODE_PATH=/piston/packages/node/${NODE_VERSION}/node_modules
-BUN_INSTALL=/piston/packages/bun/${BUN_VERSION}
+PATH=/pkgs/bun/${BUN_VERSION}/bin:/pkgs/bun/${BUN_VERSION}:/pkgs/node/${NODE_VERSION}/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.
+NODE_PATH=/pkgs/node/${NODE_VERSION}/node_modules
+BUN_INSTALL=/pkgs/bun/${BUN_VERSION}
 EOF
-        echo \$(date +%s)000 > ${pkg_dest}/.ppman-installed
+        echo \$(date +%s)000 > ${pkg_dest}/.package-installed
     "
 
     echo "Bash ${bash_package_version} registered (using system binary ${system_bash_version})"
@@ -470,7 +470,7 @@ main() {
 
     echo "Starting builder container..."
     docker run \
-        -v "$PWD/data/piston:/piston" \
+        -v "$PWD/data/pkgs:/pkgs" \
         -dit \
         --name "$CONTAINER_NAME" \
         buildpack-deps:bookworm >/dev/null

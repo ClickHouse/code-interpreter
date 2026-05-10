@@ -217,6 +217,8 @@ spec:
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL
               value: "INFO"
+            - name: SANDBOX_PACKAGES_DIRECTORY
+              value: "/pkgs"
             - name: SANDBOX_MAX_PROCESS_COUNT
               value: {{ .Values.workerSandbox.sandbox.maxProcessCount | quote }}
             - name: SANDBOX_RUN_CPU_TIME
@@ -243,7 +245,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            - name: piston-packages
+            - name: packages
               mountPath: /host-packages
               readOnly: true
             {{- if .Values.workerSandbox.kvmEnabled }}
@@ -296,7 +298,7 @@ spec:
               {{- toYaml . | nindent 14 }}
             {{- end }}
       volumes:
-        - name: piston-packages
+        - name: packages
           {{- if .Values.workerSandbox.packages.hostPath }}
           hostPath:
             path: {{ .Values.workerSandbox.packages.hostPath }}
@@ -306,7 +308,7 @@ spec:
             claimName: {{ .Values.workerSandbox.packages.persistence.existingClaim }}
           {{- else if .Values.workerSandbox.packages.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "codeapi.fullname" . }}-piston-packages
+            claimName: {{ include "codeapi.fullname" . }}-packages
           {{- else }}
           emptyDir: {}
           {{- end }}

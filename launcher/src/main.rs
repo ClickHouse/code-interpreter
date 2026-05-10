@@ -335,6 +335,7 @@ fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
         "SANDBOX_MAX_OPEN_FILES",
         "SANDBOX_MAX_OUTPUT_FILES",
         "SANDBOX_MAX_PATH_LENGTH",
+        "SANDBOX_PACKAGES_DIRECTORY",
         "SANDBOX_MAX_PROCESS_COUNT",
         "SANDBOX_OUTPUT_MAX_SIZE",
         "SANDBOX_REQUIRE_EGRESS_MANIFEST",

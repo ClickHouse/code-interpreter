@@ -1,7 +1,6 @@
 {{/*
 Persistent Volume Claim for language runtime packages
 These are the language runtimes (Python, Node, Bun, etc.) that the NsJail sandbox uses.
-NOTE: PVC name retains "piston" for backward compatibility with existing volumes.
 
 NOTE on access modes:
 - ReadWriteOnce (RWO): Works for single-node clusters or when all worker pods run on same node
@@ -17,7 +16,7 @@ If using the initJob to populate packages:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "codeapi.fullname" . }}-piston-packages
+  name: {{ include "codeapi.fullname" . }}-packages
   labels:
     {{- include "codeapi.labels" . | nindent 4 }}
   {{- if .Values.workerSandbox.packages.initJob.enabled }}
