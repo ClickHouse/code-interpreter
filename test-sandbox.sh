@@ -12,14 +12,126 @@ NC='\033[0m'
 log_info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[PASS]${NC} $1"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
 SANDBOX_URL="${SANDBOX_URL:-http://localhost:2000}"
+CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="${CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY:-MC4CAQAwBQYDK2VwBCIEIBoxzSJjQ5jTVyuohHtlD+uDGqv/tZ6hQS2CmxuOg2Wn}"
+EXECUTION_MANIFEST_TTL_SECONDS="${EXECUTION_MANIFEST_TTL_SECONDS:-300}"
+EXECUTION_MANIFEST_MAX_UPLOAD_BYTES="${EXECUTION_MANIFEST_MAX_UPLOAD_BYTES:-52428800}"
+EXECUTION_MANIFEST_MAX_OUTPUT_FILES="${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-50}"
+EXECUTION_MANIFEST_MAX_REQUESTS="${EXECUTION_MANIFEST_MAX_REQUESTS:-1000}"
+EXEC_COUNTER=0
+
+command -v jq >/dev/null || { log_error "jq is required"; exit 1; }
+command -v node >/dev/null || { log_error "node is required to sign local execution manifests"; exit 1; }
+
+prepare_execute_body() {
+    local payload="$1"
+    EXEC_COUNTER=$((EXEC_COUNTER + 1))
+    PAYLOAD_JSON="$payload" \
+    SESSION_ID="local-smoke-session-$(date +%s)-$EXEC_COUNTER" \
+    EXECUTION_ID="local-smoke-exec-$(date +%s)-$EXEC_COUNTER" \
+    NOW_SECONDS="$(date +%s)" \
+    CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="$CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY" \
+    EXECUTION_MANIFEST_TTL_SECONDS="$EXECUTION_MANIFEST_TTL_SECONDS" \
+    EXECUTION_MANIFEST_MAX_UPLOAD_BYTES="$EXECUTION_MANIFEST_MAX_UPLOAD_BYTES" \
+    EXECUTION_MANIFEST_MAX_OUTPUT_FILES="$EXECUTION_MANIFEST_MAX_OUTPUT_FILES" \
+    EXECUTION_MANIFEST_MAX_REQUESTS="$EXECUTION_MANIFEST_MAX_REQUESTS" \
+    node <<'NODE'
+const crypto = require('crypto');
+
+function canonicalJson(value) {
+  if (value === null) return 'null';
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('non-finite number');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (typeof value === 'object' && value !== undefined) {
+    return `{${Object.keys(value)
+      .filter(key => value[key] !== undefined)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  throw new Error('unsupported manifest value');
+}
+
+function numberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.ceil(value) : fallback;
+}
+
+const payload = JSON.parse(process.env.PAYLOAD_JSON);
+payload.session_id ||= process.env.SESSION_ID;
+
+const inputFiles = (Array.isArray(payload.files) ? payload.files : [])
+  .map((file, index) => {
+    if (file == null || typeof file !== 'object' || typeof file.id !== 'string' || file.id === '') {
+      return null;
+    }
+    const sessionId = typeof file.storage_session_id === 'string' && file.storage_session_id !== ''
+      ? file.storage_session_id
+      : payload.session_id;
+    return {
+      id: file.id,
+      session_id: sessionId,
+      name: typeof file.name === 'string' && file.name !== '' ? file.name : `file${index}.code`,
+    };
+  })
+  .filter(Boolean)
+  .sort((a, b) => (
+    a.session_id.localeCompare(b.session_id) ||
+    a.id.localeCompare(b.id) ||
+    a.name.localeCompare(b.name)
+  ));
+
+const now = numberEnv('NOW_SECONDS', Math.floor(Date.now() / 1000));
+const claims = {
+  v: 1,
+  exec_id: process.env.EXECUTION_ID,
+  tenant_id: 'local-smoke-tenant',
+  user_id: 'local-smoke-user',
+  session_key: 'local-smoke-tenant:user:local-smoke-user',
+  input_files: inputFiles,
+  read_sessions: Array.from(new Set(inputFiles.map(file => file.session_id))).sort(),
+  output_session_id: payload.session_id,
+  max_upload_bytes: numberEnv('EXECUTION_MANIFEST_MAX_UPLOAD_BYTES', 52428800),
+  max_output_files: numberEnv('EXECUTION_MANIFEST_MAX_OUTPUT_FILES', 50),
+  max_requests: numberEnv('EXECUTION_MANIFEST_MAX_REQUESTS', 1000),
+  iat: now,
+  exp: now + numberEnv('EXECUTION_MANIFEST_TTL_SECONDS', 300),
+  principal_source: 'local_sandbox_smoke',
+};
+const manifestPayload = canonicalJson(claims);
+const rawPrivateKey = process.env.CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY.trim().replace(/\\n/g, '\n');
+const key = rawPrivateKey.includes('BEGIN ')
+  ? rawPrivateKey
+  : crypto.createPrivateKey({
+      key: Buffer.from(rawPrivateKey, 'base64'),
+      format: 'der',
+      type: 'pkcs8',
+    });
+const signature = crypto.sign(null, Buffer.from(manifestPayload, 'utf8'), key);
+payload.execution_manifest = `${Buffer.from(manifestPayload).toString('base64url')}.${signature.toString('base64url')}`;
+process.stdout.write(JSON.stringify(payload));
+NODE
+}
+
+execute_sandbox() {
+    local payload="$1"
+    local body
+    body="$(prepare_execute_body "$payload")"
+    curl -s "$SANDBOX_URL/api/v2/execute" \
+        -H 'Content-Type: application/json' \
+        -d "$body"
+}
 
 test_basic_python() {
     log_info "Testing basic Python execution..."
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d '{"language":"python","version":"3.14.4","files":[{"content":"print(42)"}]}')
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"print(42)"}]}')
     
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     if [[ "$stdout" == "42"* ]]; then
@@ -34,9 +146,7 @@ test_basic_python() {
 
 test_numpy() {
     log_info "Testing numpy import..."
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d '{"language":"python","version":"3.14.4","files":[{"content":"import numpy as np\nprint(np.array([1,2,3]).sum())"}]}')
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import numpy as np\nprint(np.array([1,2,3]).sum())"}]}')
     
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     if [[ "$stdout" == "6"* ]]; then
@@ -51,9 +161,7 @@ test_numpy() {
 
 test_chdb() {
     log_info "Testing chDB import and query..."
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d '{"language":"python","version":"3.14.4","files":[{"content":"import chdb\nprint(chdb.query(\"SELECT sum(number) FROM numbers(5)\", \"CSV\"))"}]}')
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import chdb\nprint(chdb.query(\"SELECT sum(number) FROM numbers(5)\", \"CSV\"))"}]}')
 
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     if [[ "$stdout" == "10"* ]]; then
@@ -68,9 +176,7 @@ test_chdb() {
 
 test_file_write() {
     log_info "Testing file write in sandbox..."
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d '{"language":"python","version":"3.14.4","files":[{"content":"with open(\"/mnt/data/test.txt\", \"w\") as f:\n    f.write(\"hello\")\nwith open(\"/mnt/data/test.txt\") as f:\n    print(f.read())"}]}')
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"with open(\"/mnt/data/test.txt\", \"w\") as f:\n    f.write(\"hello\")\nwith open(\"/mnt/data/test.txt\") as f:\n    print(f.read())"}]}')
     
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     if [[ "$stdout" == "hello"* ]]; then
@@ -85,9 +191,7 @@ test_file_write() {
 
 test_network_blocked() {
     log_info "Testing network is blocked..."
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d '{"language":"python","version":"3.14.4","files":[{"content":"import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(2)\n    s.connect((\"8.8.8.8\", 53))\n    print(\"NETWORK_ALLOWED\")\nexcept Exception as e:\n    print(\"NETWORK_BLOCKED\")"}]}')
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(2)\n    s.connect((\"8.8.8.8\", 53))\n    print(\"NETWORK_ALLOWED\")\nexcept Exception as e:\n    print(\"NETWORK_BLOCKED\")"}]}')
     
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     if [[ "$stdout" == "NETWORK_BLOCKED"* ]]; then
@@ -108,9 +212,7 @@ test_bun() {
         log_warn "Bun runtime not available, skipping"
         return 0
     fi
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d "{\"language\":\"javascript\",\"version\":\"$bun_version\",\"runtime\":\"bun\",\"files\":[{\"content\":\"console.log(1 + 2)\"}]}")
+    result=$(execute_sandbox "{\"language\":\"javascript\",\"version\":\"$bun_version\",\"runtime\":\"bun\",\"files\":[{\"content\":\"console.log(1 + 2)\"}]}")
     
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     if [[ "$stdout" == "3"* ]]; then
@@ -125,9 +227,7 @@ test_bun() {
 
 test_escape_attempt() {
     log_info "Testing escape attempt (should fail)..."
-    result=$(curl -s "$SANDBOX_URL/api/v2/execute" \
-        -H 'Content-Type: application/json' \
-        -d '{"language":"python","version":"3.14.4","files":[{"content":"import os\ntry:\n    os.system(\"cat /etc/shadow\")\n    print(\"ESCAPE_POSSIBLE\")\nexcept:\n    print(\"ESCAPE_BLOCKED\")"}]}')
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import os\ntry:\n    os.system(\"cat /etc/shadow\")\n    print(\"ESCAPE_POSSIBLE\")\nexcept:\n    print(\"ESCAPE_BLOCKED\")"}]}')
     
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
     stderr=$(echo "$result" | jq -r '.run.stderr // empty')

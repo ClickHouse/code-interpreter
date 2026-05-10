@@ -7,10 +7,11 @@ import { config } from '../config';
 import { Job, ValidationError } from '../job';
 import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError } from '../execution-manifest';
 import { verifyExecuteRequestManifest } from '../execution-manifest-request';
+import { EGRESS_GRANT_HEADER } from '../egress';
 
 const router = express.Router();
 
-interface ExecuteRequestBody {
+export interface ExecuteRequestBody {
   /** Top-level execution session id (one sandbox `/exec` invocation).
    *  Intra-monorepo wire — service-api and sandbox ship together, so
    *  the rename is hard with no backward-compat alias. */
@@ -27,6 +28,8 @@ interface ExecuteRequestBody {
   run_cpu_time?: number;
   compile_cpu_time?: number;
   env_vars?: Record<string, string>;
+  egress_grant?: string;
+  execution_manifest?: string;
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -49,7 +52,23 @@ export function sanitizeEnvVars(raw: Record<string, string> | undefined): Record
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function getJob(body: ExecuteRequestBody): Job {
+/**
+ * Service-worker sends large opaque capabilities in the JSON body because
+ * skill-heavy executions can make encrypted grants/manifests exceed HTTP
+ * header limits and fail with 431 before this route can validate them.
+ * Header fallback keeps rolling upgrades compatible.
+ */
+export function tokenFromBodyOrHeader(
+  body: ExecuteRequestBody,
+  field: 'egress_grant' | 'execution_manifest',
+  headerValue: string | undefined,
+): string | undefined {
+  const bodyValue = body[field];
+  if (typeof bodyValue === 'string' && bodyValue !== '') return bodyValue;
+  return headerValue;
+}
+
+function getJob(body: ExecuteRequestBody, egressGrantToken?: string): Job {
   const {
     session_id, language, version, args, stdin, files,
     compile_memory_limit, run_memory_limit,
@@ -106,6 +125,7 @@ function getJob(body: ExecuteRequestBody): Job {
       compile: compile_memory_limit ?? rt.memory_limits.compile,
     },
     extra_env_vars: sanitizeEnvVars(env_vars),
+    egress_grant: egressGrantToken,
   });
 }
 
@@ -161,8 +181,10 @@ router.use((req: Request, res: Response, next: NextFunction) => {
  * ~100kb body limit. The parser is installed *here* rather than globally
  * in `index.ts` because a global parser would run before this route and
  * its limit would be the effective cap (see the long comment in
- * `index.ts` for the routing-order rationale). */
-router.post('/execute', express.json({ limit: '50mb' }), async (req: Request, res: Response) => {
+ * `index.ts` for the routing-order rationale). Keep the limit configurable:
+ * analyst workflows may send large scripts or replay payloads, while file
+ * bytes should still move through the gateway/file path. */
+router.post('/execute', express.json({ limit: config.execute_body_limit }), async (req: Request, res: Response) => {
   let job: Job | undefined;
   let cleanedUp = false;
 
@@ -177,7 +199,8 @@ router.post('/execute', express.json({ limit: '50mb' }), async (req: Request, re
   if (config.require_execution_manifest) {
     try {
       verifyExecuteRequestManifest({
-        headerValue: req.header(EXECUTION_MANIFEST_HEADER),
+        headerValue: tokenFromBodyOrHeader(req.body, 'execution_manifest', req.header(EXECUTION_MANIFEST_HEADER)),
+        publicKey: config.execution_manifest_public_key,
         secret: config.execution_manifest_secret,
         body: req.body,
       });
@@ -193,7 +216,10 @@ router.post('/execute', express.json({ limit: '50mb' }), async (req: Request, re
   }
 
   try {
-    job = getJob(req.body);
+    job = getJob(
+      req.body,
+      tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
+    );
   } catch (error) {
     /** Validation paths in `getJob`/`sanitizeEnvVars` may throw either
      * plain `{ message }` objects (the historical shape used by the

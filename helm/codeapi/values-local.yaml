@@ -22,6 +22,14 @@ workerSandbox:
     repository: codeapi-worker-sandbox
     tag: latest
     pullPolicy: Never
+  workerImage:
+    repository: codeapi-worker
+    tag: latest
+    pullPolicy: Never
+  sandboxImage:
+    repository: codeapi-sandbox-runner
+    tag: latest
+    pullPolicy: Never
   extraEnv:
     - name: LOCAL_MODE
       value: "true"
@@ -80,6 +88,12 @@ fileServer:
 toolCallServer:
   image:
     repository: codeapi-tool-call-server
+    tag: latest
+    pullPolicy: Never
+
+egressGateway:
+  image:
+    repository: codeapi-egress-gateway
     tag: latest
     pullPolicy: Never
 

@@ -17,7 +17,7 @@ echo ""
 cat "$SCRIPT_DIR/test-sandbox.sh" | docker run --rm -i --network "$NETWORK" \
     -e SANDBOX_URL="http://${SANDBOX_HOST}:2000" \
     alpine:latest sh -c '
-        apk add --no-cache bash curl jq >/dev/null 2>&1
+        apk add --no-cache bash curl jq nodejs >/dev/null 2>&1
         cat > /tmp/test.sh
         chmod +x /tmp/test.sh
         /tmp/test.sh

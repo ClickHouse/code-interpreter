@@ -3,6 +3,9 @@ API Deployment
 This creates the API pods that handle HTTP requests.
 It doesn't run workers - just submits jobs to the queue.
 */}}
+{{- if and .Values.api.enabled (not .Values.egressGateway.enabled) }}
+{{- fail "api.enabled requires egressGateway.enabled=true because sandbox-originated file and PTC traffic must not bypass the egress gateway" }}
+{{- end }}
 {{- if .Values.api.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -50,14 +53,25 @@ spec:
               value: "http://{{ include "codeapi.fullname" . }}-file-server:{{ .Values.fileServer.service.port }}"
             - name: TOOL_CALL_SERVER_URL
               value: "http://{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
+            - name: EGRESS_GATEWAY_URL
+              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: CODEAPI_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: codeapi-internal-service-token
+            - name: CODEAPI_EGRESS_GRANT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: codeapi-egress-grant-secret
+            - name: EGRESS_GRANT_TTL_SECONDS
+              value: {{ .Values.egressGrant.ttlSeconds | quote }}
             # Server config
             - name: PORT
               value: {{ .Values.api.service.port | quote }}
+            - name: CODEAPI_HTTP_JSON_LIMIT
+              value: {{ .Values.api.httpJsonLimit | quote }}
             {{- with .Values.api.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

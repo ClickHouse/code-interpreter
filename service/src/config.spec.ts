@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { languageConfig, resolveLanguage } from './config';
+import { languageConfig, resolveEgressGrantTtlSeconds, resolveLanguage } from './config';
 import { Languages } from './enum';
 import { createPayload } from './payload';
 import type { AuthenticatedRequest } from './types';
@@ -70,5 +70,22 @@ describe('runtime version configuration', () => {
       version: '1.3.13',
       fileName: 'main.ts',
     });
+  });
+});
+
+describe('egress grant TTL configuration', () => {
+  it('defaults to job timeout plus grace without a fixed 30 minute cap', () => {
+    expect(resolveEgressGrantTtlSeconds(undefined, 45 * 60 * 1000)).toBe(55 * 60);
+  });
+
+  it('honors explicit positive TTL overrides', () => {
+    expect(resolveEgressGrantTtlSeconds('7200', 300000)).toBe(7200);
+    expect(resolveEgressGrantTtlSeconds('1.2', 300000)).toBe(2);
+  });
+
+  it('falls back to the job-based default for invalid overrides', () => {
+    expect(resolveEgressGrantTtlSeconds('0', 300000)).toBe(900);
+    expect(resolveEgressGrantTtlSeconds('-1', 300000)).toBe(900);
+    expect(resolveEgressGrantTtlSeconds('not-a-number', 300000)).toBe(900);
   });
 });

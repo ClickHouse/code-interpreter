@@ -9,6 +9,7 @@ import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
 import webhookRouter from './webhook/router';
 import { connection } from './queue';
+import { env } from './config';
 import logger from './logger';
 
 const app = express();
@@ -20,7 +21,7 @@ const v1 = Router();
 // IMPORTANT: Move this before any json() middleware
 app.use('/v1/webhook', webhookRouter);
 
-app.use(json({ limit: '50mb' })); // Increased for development - large tool definitions
+app.use(json({ limit: env.HTTP_JSON_LIMIT })); // Large scripts/tool definitions are configurable.
 
 app.use('/v1/newsletter', newsletterRouter);
 

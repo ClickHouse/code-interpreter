@@ -5,7 +5,6 @@ const {
   createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
-  randomBytes,
 } = require('crypto');
 
 const DEFAULT_KID = 'lc-codeapi-local-2026-05';
@@ -191,6 +190,45 @@ function resolveSigningMaterial(librechatEnv) {
   };
 }
 
+function manifestPrivateKeyFromEnv(value) {
+  const normalized = normalizePem(value);
+  if (normalized.includes('BEGIN ')) {
+    return createPrivateKey(normalized);
+  }
+  return createPrivateKey({
+    key: Buffer.from(normalized, 'base64'),
+    format: 'der',
+    type: 'pkcs8',
+  });
+}
+
+function resolveExecutionManifestMaterial(codeApiEnv) {
+  const existingPrivateKey =
+    process.env.CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY ||
+    codeApiEnv.CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY;
+
+  if (existingPrivateKey) {
+    const publicKey =
+      process.env.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY ||
+      codeApiEnv.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY ||
+      createPublicKey(manifestPrivateKeyFromEnv(existingPrivateKey))
+        .export({ type: 'spki', format: 'der' })
+        .toString('base64');
+    return {
+      privateKey: existingPrivateKey,
+      publicKey,
+      generated: false,
+    };
+  }
+
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  return {
+    privateKey: privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64'),
+    publicKey: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
+    generated: true,
+  };
+}
+
 function main() {
   const args = parseArgs(process.argv);
   const repoRoot = path.resolve(__dirname, '..');
@@ -203,9 +241,7 @@ function main() {
   const issuer = librechatFile.env.CODEAPI_JWT_ISSUER || 'librechat';
   const audience = librechatFile.env.CODEAPI_JWT_AUDIENCE || 'codeapi';
   const codeApiFile = readEnvFile(codeApiEnvPath);
-  const manifestSecret =
-    process.env.CODEAPI_EXECUTION_MANIFEST_SECRET ||
-    randomBytes(32).toString('base64url');
+  const executionManifest = resolveExecutionManifestMaterial(codeApiFile.env);
   const singleTenantId =
     librechatFile.env.CODEAPI_JWT_SINGLE_TENANT_ID ||
     codeApiFile.env.CODEAPI_JWT_SINGLE_TENANT_ID ||
@@ -239,8 +275,8 @@ function main() {
     CODEAPI_JWT_KEY_CACHE_TTL_SECONDS: '30',
     CODEAPI_JWT_JWKS_JSON: JSON.stringify({ keys: [signing.publicJwk] }),
     CODEAPI_JWT_SINGLE_TENANT_ID: singleTenantId,
-    CODEAPI_EXECUTION_MANIFEST_SECRET:
-      codeApiFile.env.CODEAPI_EXECUTION_MANIFEST_SECRET || manifestSecret,
+    CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY: executionManifest.privateKey,
+    SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY: executionManifest.publicKey,
   };
 
   writeEnvFile(
@@ -258,6 +294,9 @@ function main() {
   console.log(`kid: ${signing.kid}`);
   if (signing.generated) {
     console.log('Generated a new local Ed25519 signing key for LibreChat.');
+  }
+  if (executionManifest.generated) {
+    console.log('Generated a new local Ed25519 execution-manifest keypair for CodeAPI.');
   }
   if (args.provider === 'both') {
     console.log(

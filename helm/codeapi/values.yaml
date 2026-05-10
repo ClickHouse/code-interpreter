@@ -20,6 +20,20 @@ global:
 internalServiceAuth:
   token: "changeme-in-production"
 
+# Encrypted grants/handles used by service-api/service-worker and the egress
+# gateway. Sandbox-runner never receives this secret.
+egressGrant:
+  secret: "changeme-egress-grant-secret-32-bytes-minimum"
+  ttlSeconds: 900
+
+# Worker signs sandbox execute requests with this private key; sandbox-runner
+# receives only the public verifier so a runner compromise cannot mint new
+# manifests. Values accept base64-encoded DER or PEM with escaped newlines.
+executionManifest:
+  privateKey: "MC4CAQAwBQYDK2VwBCIEIBoxzSJjQ5jTVyuohHtlD+uDGqv/tZ6hQS2CmxuOg2Wn"
+  publicKey: "MCowBQYDK2VwAyEAeY3PRoTS3adfU6E3gQUB5hSZdrdMSw6OrKkH4UhYh0U="
+  ttlSeconds: 300
+
 # =============================================================================
 # API SERVICE (HTTP handlers, scales based on traffic)
 # =============================================================================
@@ -45,6 +59,8 @@ api:
   service:
     type: ClusterIP
     port: 3112
+
+  httpJsonLimit: 50mb
 
   # Ingress (optional, for external access)
   ingress:
@@ -82,6 +98,16 @@ workerSandbox:
     tag: latest
     pullPolicy: IfNotPresent
 
+  workerImage:
+    repository: codeapi-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  sandboxImage:
+    repository: codeapi-sandbox-runner
+    tag: latest
+    pullPolicy: IfNotPresent
+
   # Enable libkrun microVM isolation. Requires /dev/kvm on the node.
   # Set to false to fall back to chroot + NsJail (no guest kernel).
   # Override to false until the node group has nested virtualisation enabled.
@@ -102,6 +128,17 @@ workerSandbox:
       cpu: 2000m
       memory: 3Gi
 
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+  sandboxServiceAccount:
+    create: true
+    name: ""
+    automountServiceAccountToken: false
+    annotations: {}
+
   # Worker configuration
   config:
     pythonConcurrency: 5    # Jobs per worker (= sandbox capacity)
@@ -119,6 +156,7 @@ workerSandbox:
     runCpuTime: 60000
     runTimeout: 300000
     outputMaxSize: 65536
+    executeBodyLimit: 50mb
     disableNetworking: true
 
   # Language runtime packages (mount from host or PVC)
@@ -158,6 +196,13 @@ workerSandbox:
 
   # Extra environment variables for worker containers
   extraEnv: []
+
+  # Extra environment variables for the sandbox-runner container only. Keep
+  # control-plane, storage, Redis, and gateway encryption secrets out of this
+  # list; use it only for sandbox verifier/runtime knobs such as
+  # SANDBOX_LOG_LEVEL. Secret/token-like names are rejected by template
+  # validation; the manifest public verifier is chart-managed.
+  sandboxExtraEnv: []
 
   # Horizontal Pod Autoscaler
   # NOTE: Custom metrics require KEDA or Prometheus Adapter to be installed.
@@ -251,6 +296,33 @@ toolCallServer:
     sessionExpiry: 600
 
 # =============================================================================
+# EGRESS GATEWAY (only sandbox-runner outbound capability endpoint)
+# =============================================================================
+egressGateway:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: codeapi-egress-gateway
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  service:
+    type: ClusterIP
+    port: 3190
+
+  config:
+    maxToolCallBytes: 1048576
+
+# =============================================================================
 # REDIS (Job queue and state store)
 # =============================================================================
 redis:
@@ -333,6 +405,11 @@ metrics:
 # NETWORK POLICIES
 # =============================================================================
 networkPolicy:
-  enabled: false  # Enable for production to restrict pod-to-pod traffic
+  enabled: true
+  redis:
+    # Used only when redis.enabled=false. If empty, NetworkPolicy permits TCP
+    # egress on the configured Redis port to any destination because standard
+    # Kubernetes NetworkPolicy cannot target redis.external.host by DNS name.
+    externalCIDRs: []
   toolCallServer:
     allowExternalEgress: false  # Allow tool call server to reach external APIs

@@ -23,7 +23,14 @@ import {
 } from '../metrics';
 import { Jobs } from '../enum';
 import { env } from '../config';
-import { maybeBuildExecutionManifestClaims } from '../execution-manifest-claims';
+import {
+  normalizeEgressGatewayUrl,
+  normalizeProgrammaticTimeoutMs,
+  prepareSandboxJobSecurity,
+  sealPtcCallbackTokenForGateway,
+  timeoutMsToGrantSeconds,
+} from '../sandbox-egress';
+import { findUnregisteredToolCall } from '../tool-scope';
 import { summarizeRequestedFiles } from '../execution-log';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
 import { buildReplayExecutionState } from './programmatic-state';
@@ -355,15 +362,15 @@ async function runReplayIteration(
   userId: string,
 ): Promise<t.ExecuteResult> {
   const history = await loadToolHistory(state.execution_id);
-  const payload = buildReplayPayload(req, state, history);
+  const rawPayload = buildReplayPayload(req, state, history);
   const sessionKey = state.sessionKey ?? state.userId;
-  const executionManifestClaims = maybeBuildExecutionManifestClaims({
+  const sandboxSecurity = prepareSandboxJobSecurity({
     req,
     executionId: state.execution_id,
     userId,
     sessionKey,
     outputSessionId: state.session_id,
-    payload,
+    payload: rawPayload,
     tenantId: state.tenantId,
     canonicalUserId: state.canonicalUserId,
     orgId: state.orgId,
@@ -374,7 +381,7 @@ async function runReplayIteration(
   });
 
   if (DEBUG_MODE) {
-    const firstFile = payload.files[0] as { content?: string } | undefined;
+    const firstFile = rawPayload.files[0] as { content?: string } | undefined;
     logger.debug('Replay enqueue details', {
       execution_id: state.execution_id,
       historySize: Object.keys(history).length,
@@ -388,15 +395,17 @@ async function runReplayIteration(
   const job = await queue.add(Jobs.execute, {
     code: state.userCode ?? '',
     userId,
-    payload,
+    payload: sandboxSecurity.payload,
     apiKeyId,
     isPyPlot: state.isPyPlot ?? false,
     apiKeyString,
     principalSource: state.principalSource,
     executionId: state.execution_id,
-    tenantId: executionManifestClaims?.tenant_id,
-    canonicalUserId: executionManifestClaims?.user_id,
-    executionManifestClaims,
+    tenantId: state.tenantId,
+    canonicalUserId: state.canonicalUserId,
+    executionManifestClaims: sandboxSecurity.executionManifestClaims,
+    egressGrantClaims: sandboxSecurity.egressGrantClaims,
+    egressGrantToken: sandboxSecurity.egressGrantToken,
     SANDBOX_ENDPOINT: env.SANDBOX_ENDPOINT,
   }, {
     removeOnComplete: { age: 60, count: 1 },
@@ -433,8 +442,14 @@ async function handleReplayInitial(
     tools,
     user_id,
     files,
-    timeout = 300000,
   } = req.body as t.ProgrammaticRequestBody;
+  let timeout: number;
+  try {
+    timeout = normalizeProgrammaticTimeoutMs((req.body as t.ProgrammaticRequestBody).timeout);
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+    return;
+  }
 
   /** Accept both `language` (canonical) and `lang` (legacy alias used
    * by `danny-avila/agents` bash PTC client). If both are present,
@@ -836,6 +851,23 @@ async function runAndRespond(
       });
       return;
     }
+    const unregisteredToolCall = findUnregisteredToolCall(pending, state.tools);
+    if (unregisteredToolCall != null) {
+      logger.warn('Sandbox requested unregistered replay tool call', {
+        execution_id: state.execution_id,
+        call_id: unregisteredToolCall.call_id,
+        tool_name: unregisteredToolCall.tool_name,
+      });
+      await cleanupExecution(state.execution_id, 'replay');
+      res.status(200).json({
+        status: 'error',
+        error: `Sandbox requested an unregistered tool: ${unregisteredToolCall.tool_name}`,
+        stdout: cleanStdout,
+        stderr: result.stderr,
+        session_id: state.session_id,
+      });
+      return;
+    }
     /** Record the call_ids we just handed to the client as "issued" so
      * the next continuation can reject any `tool_results[i].call_id`
      * that was never actually requested. Replay then treats persisted
@@ -1046,10 +1078,15 @@ async function handleBlocking(
     tools,
     user_id,
     files,
-    timeout = 300000,
     continuation_token,
     tool_results,
   } = req.body as t.ProgrammaticRequestBody;
+  let timeout: number;
+  try {
+    timeout = normalizeProgrammaticTimeoutMs((req.body as t.ProgrammaticRequestBody).timeout);
+  } catch (error) {
+    return res.status(400).json({ error: (error as Error).message });
+  }
 
   // CASE 1: Continuation
   if (continuation_token != null && continuation_token !== '' && tool_results) {
@@ -1235,13 +1272,20 @@ async function handleBlocking(
     });
 
     let callbackUrl: string;
+    try {
+      callbackUrl = normalizeEgressGatewayUrl(env.EGRESS_GATEWAY_URL);
+    } catch (error) {
+      logger.error('Blocking PTC requires egress gateway callback URL:', error);
+      await cleanupExecution(execution_id, 'blocking');
+      return res.status(503).json({ error: 'Egress gateway unavailable' });
+    }
+
     let callbackToken: string;
 
     try {
       const toolCallResponse = await retryToolCallServerRequest(
         () => axios.post<{
           success: boolean;
-          callback_url: string;
           callback_token: string;
         }>(`${env.TOOL_CALL_SERVER_URL}/sessions`, {
           execution_id,
@@ -1252,17 +1296,21 @@ async function handleBlocking(
         'Create Tool Call Server session',
       );
 
-      callbackUrl = toolCallResponse.data.callback_url;
-      callbackToken = toolCallResponse.data.callback_token;
+      callbackToken = sealPtcCallbackTokenForGateway({
+        executionId: execution_id,
+        sessionId: session_id,
+        callbackToken: toolCallResponse.data.callback_token,
+        timeoutSeconds: timeoutMsToGrantSeconds(timeout),
+      });
     } catch (error) {
       logger.error('Failed to create Tool Call Server session:', error);
       await deleteExecutionState(execution_id);
       return res.status(503).json({ error: 'Tool Call Server unavailable' });
     }
 
-    let payload: t.PayloadBody;
+    let rawPayload: t.PayloadBody;
     try {
-      payload = createProgrammaticPayload({
+      rawPayload = createProgrammaticPayload({
         req,
         session_id,
         execution_id,
@@ -1278,27 +1326,29 @@ async function handleBlocking(
         error: (error as Error).message || 'Failed to generate code payload',
       });
     }
-    const executionManifestClaims = maybeBuildExecutionManifestClaims({
+    const sandboxSecurity = prepareSandboxJobSecurity({
       req,
       executionId: execution_id,
       userId,
       sessionKey,
       outputSessionId: session_id,
-      payload,
+      payload: rawPayload,
     });
 
     const job = await pyQueue.add(Jobs.execute, {
       code,
       userId,
-      payload,
+      payload: sandboxSecurity.payload,
       apiKeyId,
       isPyPlot: false,
       apiKeyString,
       principalSource: req.codeApiAuthContext?.principalSource,
       executionId: execution_id,
-      tenantId: executionManifestClaims?.tenant_id,
-      canonicalUserId: executionManifestClaims?.user_id,
-      executionManifestClaims,
+      tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',
+      canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
+      executionManifestClaims: sandboxSecurity.executionManifestClaims,
+      egressGrantClaims: sandboxSecurity.egressGrantClaims,
+      egressGrantToken: sandboxSecurity.egressGrantToken,
       SANDBOX_ENDPOINT: env.SANDBOX_ENDPOINT,
     }, {
       removeOnComplete: { age: 60, count: 1 },

@@ -26,9 +26,9 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
-  name: {{ include "codeapi.fullname" . }}-worker-sandbox
+  name: {{ include "codeapi.fullname" . }}-service-worker
   labels:
-    {{- include "codeapi.workerSandbox.labels" . | nindent 4 }}
+    {{- include "codeapi.serviceWorker.labels" . | nindent 4 }}
 spec:
   podMetricsEndpoints:
     - path: /metrics
@@ -41,7 +41,29 @@ spec:
       {{- end }}
   selector:
     matchLabels:
-      {{- include "codeapi.workerSandbox.selectorLabels" . | nindent 6 }}
+      {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if .Values.egressGateway.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "codeapi.fullname" . }}-egress-gateway
+  labels:
+    {{- include "codeapi.egressGateway.labels" . | nindent 4 }}
+spec:
+  podMetricsEndpoints:
+    - path: /metrics
+      port: http
+      {{- with .Values.metrics.interval }}
+      interval: {{ . }}
+      {{- end }}
+      {{- with .Values.metrics.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+  selector:
+    matchLabels:
+      {{- include "codeapi.egressGateway.selectorLabels" . | nindent 6 }}
 {{- end }}
 {{- if .Values.fileServer.enabled }}
 ---

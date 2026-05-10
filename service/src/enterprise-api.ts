@@ -4,6 +4,7 @@ import { apiKeyAuth } from './middleware/auth';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
 import { connection } from './queue';
+import { env } from './config';
 import logger from './logger';
 
 const app = express();
@@ -12,7 +13,7 @@ app.set('trust proxy', 1);
 
 const v1 = Router();
 
-app.use(json({ limit: '50mb' })); // Increased for development - large tool definitions
+app.use(json({ limit: env.HTTP_JSON_LIMIT })); // Large scripts/tool definitions are configurable.
 
 app.get('/v1/health', async (_, res) => {
   try {

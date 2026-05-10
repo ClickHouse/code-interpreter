@@ -11,6 +11,7 @@ import {
   toolCallActiveSessions,
 } from './metrics';
 import { internalServiceAuthEnabled, isAuthorizedInternalServiceRequest } from './internal-service-auth';
+import { isRegisteredToolName } from './tool-scope';
 import logger from './toolCallServerLogger';
 
 const INSTANCE_ID = process.env.INSTANCE_ID ?? nanoid();
@@ -415,6 +416,13 @@ async function handleToolCall(req: Request): Promise<Response> {
     };
 
     const { tool_name, input } = body;
+    if (typeof tool_name !== 'string' || tool_name === '') {
+      return errorResponse('Invalid tool name', 400);
+    }
+    if (!isRegisteredToolName(tool_name, session.tools)) {
+      logger.warn(`[${INSTANCE_ID}] Rejected unregistered tool call: ${executionId}/${callId} - ${tool_name}`);
+      return errorResponse('Tool is not registered for this execution', 403);
+    }
 
     // Create pending call record
     const toolCall: ToolCallRequest = {

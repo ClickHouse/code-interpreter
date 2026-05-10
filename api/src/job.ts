@@ -14,6 +14,7 @@ import { getRuntimes } from './runtime';
 import { execute } from './nsjail';
 import { config } from './config';
 import { internalServiceHeaders } from './internal-service-auth';
+import { EGRESS_GRANT_HEADER } from './egress';
 import {
   DIRKEEP,
   SANDBOX_DIR_MODE,
@@ -622,6 +623,7 @@ export class Job {
   cpu_times: { run: number; compile: number };
   memory_limits: { run: number; compile: number };
   extra_env_vars?: Record<string, string>;
+  egressGrantToken?: string;
 
   private log: Logger;
   private submissionDir = '';
@@ -645,6 +647,7 @@ export class Job {
     cpu_times: { run: number; compile: number };
     memory_limits: { run: number; compile: number };
     extra_env_vars?: Record<string, string>;
+    egress_grant?: string;
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.log = rootLogger.child({ job: this.uuid });
@@ -674,6 +677,7 @@ export class Job {
     this.cpu_times = opts.cpu_times;
     this.memory_limits = opts.memory_limits;
     this.extra_env_vars = opts.extra_env_vars;
+    this.egressGrantToken = opts.egress_grant;
   }
 
   async computeFileHash(filePath: string): Promise<string> {
@@ -736,7 +740,7 @@ export class Job {
 
     this.log.info({ submissionDir: this.submissionDir }, 'Priming job');
 
-    if (config.file_server_url && this.files.some(f => f.id && f.storage_session_id)) {
+    if (this.fileEgressBaseUrl() && this.files.some(f => f.id && f.storage_session_id)) {
       await this.autoLoadDirkeep();
     }
 
@@ -749,6 +753,23 @@ export class Job {
       }
     }
     await Promise.all(fileOps);
+  }
+
+  private fileEgressBaseUrl(): string {
+    return config.egress_gateway_url || config.file_server_url;
+  }
+
+  private fileEgressHeaders(headers: Record<string, string> = {}): Record<string, string> {
+    if (!config.egress_gateway_url) {
+      return internalServiceHeaders(headers);
+    }
+    if (!this.egressGrantToken) {
+      throw new Error('EGRESS_GATEWAY_URL is configured but the sandbox request has no egress grant');
+    }
+    return {
+      ...headers,
+      [EGRESS_GRANT_HEADER]: this.egressGrantToken,
+    };
   }
 
   private async autoLoadDirkeep(): Promise<void> {
@@ -796,9 +817,9 @@ export class Job {
     const timeout = setTimeout(() => controller.abort(), AUTO_LOAD_DIRKEEP_TIMEOUT_MS);
     try {
       const res = await fetch(
-        `${config.file_server_url}/sessions/${encodeURIComponent(sid)}/objects?detail=normalized`,
+        `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(sid)}/objects?detail=normalized`,
         {
-          headers: internalServiceHeaders(),
+          headers: this.fileEgressHeaders(),
           signal: controller.signal,
         },
       );
@@ -858,7 +879,7 @@ export class Job {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const response = await fetch(this.buildDownloadUrl(file), {
-          headers: internalServiceHeaders(),
+          headers: this.fileEgressHeaders(),
         });
 
         if (response.status === 404 && attempt < maxRetries) {
@@ -937,7 +958,7 @@ export class Job {
    * inject `../` or raw `/` and hit unintended endpoints (SSRF-adjacent).
    */
   private buildDownloadUrl(file: TFile): string {
-    return `${config.file_server_url}/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`;
+    return `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`;
   }
 
   /**
@@ -1647,7 +1668,7 @@ export class Job {
       return null;
     }
 
-    const url = `${config.file_server_url}/sessions/${encodeURIComponent(this.uuid)}/objects/${encodeURIComponent(file.id)}`;
+    const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.uuid)}/objects/${encodeURIComponent(file.id)}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
     const stream = fs.createReadStream(file.path);
@@ -1656,7 +1677,7 @@ export class Job {
     try {
       response = await fetch(url, {
         method: 'PUT',
-        headers: internalServiceHeaders({
+        headers: this.fileEgressHeaders({
           /* file-server URL-decodes this header to recover the canonical
            * filename, so paths with `/` survive transport without colliding
            * with the `___` separators or RFC 5987 quoting rules used

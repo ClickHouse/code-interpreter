@@ -47,14 +47,37 @@ export function resolveLanguage(lang: string): Languages | undefined {
 const defaultJobTimeoutMs = Number(process.env.JOB_TIMEOUT) || 300000;
 const defaultMaxFileSize = Number(process.env.MAX_FILE_SIZE) || 25 * 1024 * 1024;
 const defaultExecutionManifestTtlSeconds = Math.min(Math.ceil((defaultJobTimeoutMs + 60000) / 1000), 600);
+const EGRESS_GRANT_GRACE_MS = 10 * 60 * 1000;
+
+export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, jobTimeoutMs: number): number {
+  const defaultTtlSeconds = Math.max(1, Math.ceil((jobTimeoutMs + EGRESS_GRANT_GRACE_MS) / 1000));
+  if (rawTtlSeconds == null || rawTtlSeconds.trim() === '') {
+    return defaultTtlSeconds;
+  }
+
+  const configuredTtlSeconds = Number(rawTtlSeconds);
+  if (!Number.isFinite(configuredTtlSeconds) || configuredTtlSeconds <= 0) {
+    return defaultTtlSeconds;
+  }
+
+  return Math.max(1, Math.ceil(configuredTtlSeconds));
+}
 
 export const env = {
   PORT: process.env.SERVICE_PORT ?? 3112,
   LOCAL_MODE: process.env.LOCAL_MODE === 'true',
   INSTANCE_ID: process.env.INSTANCE_ID ?? nanoid(),
+  HTTP_JSON_LIMIT: process.env.CODEAPI_HTTP_JSON_LIMIT ?? '50mb',
   SANDBOX_ENDPOINT: process.env.SANDBOX_ENDPOINT ?? 'http://localhost:2000/api/v2',
+  EGRESS_GATEWAY_URL: process.env.EGRESS_GATEWAY_URL ?? '',
   FILE_SERVER_URL: process.env.FILE_SERVER_URL ?? 'http://localhost:3000',
   TOOL_CALL_SERVER_URL: process.env.TOOL_CALL_SERVER_URL ?? 'http://localhost:3033',
+  EGRESS_GATEWAY_PORT: Number(process.env.EGRESS_GATEWAY_PORT) || 3190,
+  EGRESS_GATEWAY_FILE_SERVER_URL: process.env.EGRESS_GATEWAY_FILE_SERVER_URL ?? process.env.FILE_SERVER_URL ?? 'http://localhost:3000',
+  EGRESS_GATEWAY_TOOL_CALL_SERVER_URL: process.env.EGRESS_GATEWAY_TOOL_CALL_SERVER_URL ?? process.env.TOOL_CALL_SERVER_URL ?? 'http://localhost:3033',
+  EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES: Number(process.env.EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES) || 1024 * 1024,
+  EGRESS_GRANT_SECRET: process.env.CODEAPI_EGRESS_GRANT_SECRET ?? '',
+  EGRESS_GRANT_TTL_SECONDS: resolveEgressGrantTtlSeconds(process.env.EGRESS_GRANT_TTL_SECONDS, defaultJobTimeoutMs),
   PYTHON_CONCURRENCY: Number(process.env.PYTHON_CONCURRENCY) || 5,
   OTHER_CONCURRENCY: Number(process.env.OTHER_CONCURRENCY) || 15,
   JOB_WINDOW: Number(process.env.JOB_WINDOW) || 1000,
@@ -94,7 +117,11 @@ export const env = {
    *  is multi-homed, otherwise a missing tenantId would silently bucket
    *  cross-tenant requests under the same `'legacy'` prefix. */
   TENANT_ISOLATION_STRICT: process.env.CODEAPI_TENANT_ISOLATION_STRICT === 'true',
-  // Signed execution manifests. If the secret is unset, manifest generation is disabled.
+  // Signed execution manifests. Prefer private/public key mode for split-runner
+  // deployments so sandbox-runner receives only a verifier, not a signing secret.
+  EXECUTION_MANIFEST_PRIVATE_KEY: process.env.CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY ?? '',
+  EXECUTION_MANIFEST_PUBLIC_KEY: process.env.CODEAPI_EXECUTION_MANIFEST_PUBLIC_KEY ?? '',
+  // Legacy HMAC fallback for non-split deployments. Do not mount into sandbox-runner.
   EXECUTION_MANIFEST_SECRET: process.env.CODEAPI_EXECUTION_MANIFEST_SECRET ?? '',
   EXECUTION_MANIFEST_TTL_SECONDS: Math.min(
     Number(process.env.EXECUTION_MANIFEST_TTL_SECONDS) || defaultExecutionManifestTtlSeconds,

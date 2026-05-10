@@ -1,0 +1,98 @@
+{{/*
+Egress Gateway
+Only sandbox-runner can call this service. It validates encrypted grants and
+delegates to file-server/tool-call-server with internal credentials.
+*/}}
+{{- if .Values.egressGateway.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codeapi.fullname" . }}-egress-gateway
+  labels:
+    {{- include "codeapi.egressGateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.egressGateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "codeapi.egressGateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "codeapi.egressGateway.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: egress-gateway
+          image: "{{ .Values.egressGateway.image.repository }}:{{ .Values.egressGateway.image.tag }}"
+          imagePullPolicy: {{ .Values.egressGateway.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.egressGateway.service.port }}
+              protocol: TCP
+          env:
+            - name: SERVICE_NAME
+              value: egress-gateway
+            - name: EGRESS_GATEWAY_PORT
+              value: {{ .Values.egressGateway.service.port | quote }}
+            - name: EGRESS_GATEWAY_FILE_SERVER_URL
+              value: "http://{{ include "codeapi.fullname" . }}-file-server:{{ .Values.fileServer.service.port }}"
+            - name: EGRESS_GATEWAY_TOOL_CALL_SERVER_URL
+              value: "http://{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
+            - name: EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES
+              value: {{ printf "%.0f" (.Values.egressGateway.config.maxToolCallBytes | float64) | quote }}
+            - name: CODEAPI_EGRESS_GRANT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: codeapi-egress-grant-secret
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: codeapi-internal-service-token
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.egressGateway.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codeapi.fullname" . }}-egress-gateway
+  labels:
+    {{- include "codeapi.egressGateway.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.egressGateway.service.type }}
+  ports:
+    - port: {{ .Values.egressGateway.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "codeapi.egressGateway.selectorLabels" . | nindent 4 }}
+{{- end }}

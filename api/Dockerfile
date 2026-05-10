@@ -45,6 +45,7 @@ RUN apt-get update && \
     procps \
     iptables \
     socat \
+    curl \
     jq \
     poppler-utils \
     fonts-dejavu \
@@ -117,6 +118,7 @@ FROM fedora:41
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \
     socat \
+    curl \
     util-linux \
     gawk \
     findutils \

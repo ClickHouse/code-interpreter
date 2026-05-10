@@ -25,6 +25,7 @@ COPY tsconfig.json ./
 RUN bun build ./src/file-server.ts --minify --outdir .build --target bun
 RUN bun build ./src/api-server.ts --minify --outdir .build-api --target bun
 RUN bun build ./src/worker-server.ts --minify --outdir .build-worker --target bun
+RUN bun build ./src/egress-gateway.ts --minify --outdir .build-egress-gateway --target bun
 
 # File server production
 FROM oven/bun:1.3.13 AS production
@@ -51,6 +52,14 @@ COPY --from=install /temp/prod/node_modules ./node_modules
 COPY --from=builder /app/.build-worker ./.build-worker
 COPY --from=builder /app/src/*.py ./src/
 CMD ["bun", "run", ".build-worker/worker-server.js"]
+
+# Egress gateway (sandbox outbound delegation)
+FROM oven/bun:1.3.13 AS egress-gateway
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=install /temp/prod/node_modules ./node_modules
+COPY --from=builder /app/.build-egress-gateway ./.build-egress-gateway
+CMD ["bun", "run", ".build-egress-gateway/egress-gateway.js"]
 
 # Development stage  
 FROM base AS development

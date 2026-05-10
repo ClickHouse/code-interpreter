@@ -30,7 +30,7 @@ app.set('trust proxy', 1);
 
 const v1 = Router();
 
-app.use(json({ limit: '50mb' }));
+app.use(json({ limit: env.HTTP_JSON_LIMIT }));
 
 // Health check
 app.get('/v1/health', async (_, res) => {

@@ -65,21 +65,25 @@ type Route = {
   status: number;
   contentDisposition?: string;
   body?: string;
+  onRequest?: (req: Request) => void;
 };
 
 let server: ReturnType<typeof Bun.serve>;
 let serverPort = 0;
 const routes = new Map<string, Route>();
 let originalFileServerUrl: string;
+let originalEgressGatewayUrl: string;
 
 beforeAll(() => {
   originalFileServerUrl = config.file_server_url;
+  originalEgressGatewayUrl = config.egress_gateway_url;
   server = Bun.serve({
     port: 0,
     fetch(req) {
       const url = new URL(req.url);
       const route = routes.get(url.pathname);
       if (!route) return new Response('not found', { status: 404 });
+      route.onRequest?.(req);
       const headers = new Headers();
       if (route.contentDisposition) {
         headers.set('content-disposition', route.contentDisposition);
@@ -100,6 +104,7 @@ beforeAll(() => {
 
 afterAll(() => {
   (config as { file_server_url: string }).file_server_url = originalFileServerUrl;
+  (config as { egress_gateway_url: string }).egress_gateway_url = originalEgressGatewayUrl;
   server.stop(true);
 });
 
@@ -111,6 +116,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  (config as { egress_gateway_url: string }).egress_gateway_url = originalEgressGatewayUrl;
+  (config as { file_server_url: string }).file_server_url = `http://127.0.0.1:${serverPort}`;
   await fsp.rm(tmpDir, { recursive: true, force: true });
 });
 
@@ -142,6 +149,47 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     const expectedFull = path.join(tmpDir, 'proj', 'notes.txt');
     const contents = await fsp.readFile(expectedFull, 'utf8');
     expect(contents).toBe('hello from a nested artifact\n');
+  });
+
+  it('uses the egress gateway URL and grant header when configured', async () => {
+    const file: TFile = {
+      id: 'opaque-object-handle',
+      storage_session_id: 'opaque-session-handle',
+      name: 'gateway-fallback.txt',
+    };
+    let sawGrantHeader = false;
+    let sawInternalHeader = false;
+    routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
+      status: 200,
+      contentDisposition: 'attachment; filename="gateway.txt"',
+      body: 'gateway bytes',
+      onRequest(req) {
+        sawGrantHeader = req.headers.get('x-codeapi-egress-grant') === 'opaque-grant';
+        sawInternalHeader = req.headers.has('x-codeapi-internal-token');
+      },
+    });
+    (config as { egress_gateway_url: string }).egress_gateway_url = `http://127.0.0.1:${serverPort}`;
+    (config as { file_server_url: string }).file_server_url = 'http://127.0.0.1:1';
+
+    const job = new Job({
+      session_id: 'opaque-output-session-handle',
+      runtime: makeRuntime(),
+      files: [file],
+      args: [],
+      stdin: '',
+      timeouts: { compile: 5000, run: 5000 },
+      cpu_times: { compile: 5000, run: 5000 },
+      memory_limits: { compile: 100_000_000, run: 100_000_000 },
+      egress_grant: 'opaque-grant',
+    });
+    asInternals(job).submissionDir = tmpDir;
+
+    const writtenName = await job.downloadAndWriteFile(file);
+
+    expect(writtenName).toBe('gateway.txt');
+    expect(sawGrantHeader).toBe(true);
+    expect(sawInternalHeader).toBe(false);
+    expect(await fsp.readFile(path.join(tmpDir, 'gateway.txt'), 'utf8')).toBe('gateway bytes');
   });
 
   it('falls back to the legacy filename= form when filename*= is absent', async () => {

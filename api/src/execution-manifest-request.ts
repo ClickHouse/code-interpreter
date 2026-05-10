@@ -4,7 +4,7 @@ import {
   ExecutionManifestError,
   type ExecutionManifestClaims,
   type ExecutionManifestInputFile,
-  verifyExecutionManifest,
+  verifyExecutionManifestWithKey,
 } from './execution-manifest';
 
 interface ExecuteRequestBody {
@@ -96,14 +96,18 @@ export function assertManifestMatchesExecuteRequest(
 
 export function verifyExecuteRequestManifest(args: {
   headerValue: string | undefined;
-  secret: string;
+  publicKey?: string;
+  secret?: string;
   body: ExecuteRequestBody;
   nowSeconds?: number;
 }): ExecutionManifestClaims {
   if (!args.headerValue) {
     throw new ExecutionManifestError('missing_header', `${EXECUTION_MANIFEST_HEADER} is required`);
   }
-  const manifest = verifyExecutionManifest(args.headerValue, args.secret, {
+  const manifest = verifyExecutionManifestWithKey(args.headerValue, {
+    publicKey: args.publicKey,
+    secret: args.secret,
+  }, {
     nowSeconds: args.nowSeconds,
   });
   assertManifestMatchesExecuteRequest(manifest, args.body);

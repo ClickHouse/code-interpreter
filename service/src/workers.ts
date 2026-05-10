@@ -7,14 +7,21 @@ import { jobProcessingDuration, jobsCompleted, jobsFailed, activeJobs, workerRun
 import { Jobs, Queues } from './enum';
 import { connection } from './queue';
 import { env } from './config';
-import { EXECUTION_MANIFEST_HEADER, signExecutionManifest } from './execution-manifest';
 import { summarizeSandboxResponse, summarizeText } from './execution-log';
+import { prepareSandboxEgress, restoreSandboxExecuteResult } from './egress-grant';
+import { refreshEgressGrantClaims } from './sandbox-egress';
+import { buildSandboxExecuteRequest } from './sandbox-dispatch';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
 const WORKER_ID = `${INSTANCE_ID}-${process.pid}`;
 
 type Log = Omit<CreateLogInput, 'userId' | 'input'>;
+type SandboxLogResponse = Log & {
+  session_id: string;
+  files?: t.FileRefs;
+  run?: CreateLogInput['run'];
+};
 type ApiKeysModule = typeof import('@librechat/api-keys');
 
 let apiKeysModulePromise: Promise<ApiKeysModule> | null = null;
@@ -85,24 +92,41 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
   const timer = setTimeout(() => controller.abort(), env.JOB_TIMEOUT);
 
   try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (job.data.executionManifestClaims) {
+    let sandboxPayload = payload;
+    let executionManifestClaims = job.data.executionManifestClaims;
+    let egressGrantToken = job.data.egressGrantToken;
+
+    if (job.data.egressGrantClaims) {
+      if (!env.EGRESS_GRANT_SECRET) {
+        throw new Error('CODEAPI_EGRESS_GRANT_SECRET is required to dispatch egress-scoped sandbox jobs');
+      }
       const nowSeconds = Math.floor(Date.now() / 1000);
-      headers[EXECUTION_MANIFEST_HEADER] = signExecutionManifest(
-        {
-          ...job.data.executionManifestClaims,
-          iat: nowSeconds,
-          exp: nowSeconds + env.EXECUTION_MANIFEST_TTL_SECONDS,
-        },
-        env.EXECUTION_MANIFEST_SECRET,
-      );
+      const prepared = prepareSandboxEgress({
+        payload,
+        claims: refreshEgressGrantClaims(job.data.egressGrantClaims, nowSeconds),
+        secret: env.EGRESS_GRANT_SECRET,
+      });
+      sandboxPayload = prepared.payload;
+      egressGrantToken = prepared.egressGrantToken;
+      executionManifestClaims = (env.EXECUTION_MANIFEST_PRIVATE_KEY || env.EXECUTION_MANIFEST_SECRET)
+        ? prepared.executionManifestClaims
+        : undefined;
     }
 
-    const response = await axios.post<Log & { files?: t.FileRefs }>(
+    const sandboxRequest = buildSandboxExecuteRequest({
+      payload: sandboxPayload,
+      egressGrantToken,
+      executionManifestClaims,
+      executionManifestPrivateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,
+      executionManifestSecret: env.EXECUTION_MANIFEST_SECRET,
+      executionManifestTtlSeconds: env.EXECUTION_MANIFEST_TTL_SECONDS,
+    });
+
+    const response = await axios.post<SandboxLogResponse>(
       `${SANDBOX_ENDPOINT}/${Jobs.execute}`,
-      payload,
+      sandboxRequest.body,
       {
-        headers,
+        headers: sandboxRequest.headers,
         signal: controller.signal
       }
     );
@@ -111,9 +135,13 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       throw new Error('Error from sandbox');
     }
 
-    logger.info('Sandbox response', summarizeSandboxResponse(response.data));
+    const responseData = egressGrantToken
+      ? restoreSandboxExecuteResult(response.data, egressGrantToken, env.EGRESS_GRANT_SECRET)
+      : response.data;
 
-    const { files } = response.data;
+    logger.info('Sandbox response', summarizeSandboxResponse(responseData));
+
+    const { files } = responseData;
     try {
       if (
         env.LOGGING_ENABLED === true &&
@@ -122,7 +150,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         const { createLog } = await getApiKeysModule();
         createLog({
           userId: job.data.userId,
-          ...response.data,
+          ...responseData,
           input: code,
         }).catch((err: unknown) => logger.error('Error creating log', err));
       } else if (env.LOGGING_ENABLED === true) {
@@ -134,12 +162,12 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     } catch (err) {
       logger.error('Error creating log', err);
     }
-    const run = response.data.run as CreateLogInput['run'] | undefined;
+    const run = responseData.run as CreateLogInput['run'] | undefined;
     const stdout = applySystemReplacements(run?.stdout ?? '');
     const stderr = filterSystemLogs(run?.stderr ?? '', isPyPlot);
 
     const result: t.ExecuteResult = {
-      session_id: response.data.session_id,
+      session_id: responseData.session_id,
       /* `files` is optional on the sandbox response (e.g. dry-run
        * execute with no outputs); the public `ExecuteResult.files` is
        * required and downstream callers always iterate it. Default to
@@ -160,7 +188,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
     if (result.message || result.signal) {
       logger.warn('Sandbox execution error metadata', {
-        session_id: response.data.session_id,
+        session_id: responseData.session_id,
         code: result.code,
         signal: result.signal,
         message: summarizeText(result.message),

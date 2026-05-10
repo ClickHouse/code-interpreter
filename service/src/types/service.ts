@@ -166,6 +166,17 @@ export interface PayloadBody {
   files: Array<PayloadFile | { id: string; storage_session_id: string; name: string }>;
   /** Top-level execution session id (passed to sandbox to seed Job.uuid). */
   session_id?: string;
+  /**
+   * Opaque encrypted grant consumed only by sandbox-runner for gateway file
+   * egress. This intentionally rides in the JSON body instead of an HTTP
+   * header because large skill/file batches can exceed server header limits.
+   */
+  egress_grant?: string;
+  /**
+   * Signed execution scope consumed only by sandbox-runner. Kept in the body
+   * for the same reason as `egress_grant`.
+   */
+  execution_manifest?: string;
   args?: string[];
   /**
    * Extra environment variables to inject into the sandboxed process via nsjail -E.
@@ -210,6 +221,11 @@ export type JobData = {
   tenantId?: string;
   canonicalUserId?: string;
   executionManifestClaims?: ExecutionManifestClaims;
+  /** Raw grant claims retained only for service-worker dispatch so grant
+   * expiry is anchored to sandbox start, not BullMQ enqueue time. */
+  egressGrantClaims?: ExecutionManifestClaims;
+  /** Opaque encrypted grant passed to sandbox-runner for gateway-only file egress. */
+  egressGrantToken?: string;
 };
 export type JobResult = ExecuteResult;
 export type ExecuteJob = Job<JobData, JobResult, Jobs.execute>;

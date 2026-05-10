@@ -87,6 +87,45 @@ app.kubernetes.io/component: worker-sandbox
 {{- end }}
 
 {{/*
+Service Worker specific labels
+*/}}
+{{- define "codeapi.serviceWorker.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: service-worker
+{{- end }}
+
+{{- define "codeapi.serviceWorker.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: service-worker
+{{- end }}
+
+{{/*
+Sandbox Runner specific labels
+*/}}
+{{- define "codeapi.sandboxRunner.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: sandbox-runner
+{{- end }}
+
+{{- define "codeapi.sandboxRunner.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: sandbox-runner
+{{- end }}
+
+{{/*
+Egress Gateway specific labels
+*/}}
+{{- define "codeapi.egressGateway.labels" -}}
+{{ include "codeapi.labels" . }}
+app.kubernetes.io/component: egress-gateway
+{{- end }}
+
+{{- define "codeapi.egressGateway.selectorLabels" -}}
+{{ include "codeapi.selectorLabels" . }}
+app.kubernetes.io/component: egress-gateway
+{{- end }}
+
+{{/*
 File Server specific labels
 */}}
 {{- define "codeapi.fileServer.labels" -}}
@@ -131,6 +170,37 @@ Redis port
 {{- "6379" }}
 {{- else }}
 {{- .Values.redis.external.port | default "6379" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Redis NetworkPolicy egress. Kubernetes NetworkPolicy cannot match DNS names,
+so external Redis can be scoped with CIDRs when available; otherwise the chart
+allows the configured Redis port to any destination for the control-plane pods
+that explicitly need Redis.
+*/}}
+{{- define "codeapi.redisEgress" -}}
+{{- if .Values.redis.enabled }}
+- to:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: redis
+  ports:
+    - protocol: TCP
+      port: {{ include "codeapi.redis.port" . }}
+{{- else if .Values.networkPolicy.redis.externalCIDRs }}
+{{- range .Values.networkPolicy.redis.externalCIDRs }}
+- to:
+    - ipBlock:
+        cidr: {{ . | quote }}
+  ports:
+    - protocol: TCP
+      port: {{ include "codeapi.redis.port" $ }}
+{{- end }}
+{{- else }}
+- ports:
+    - protocol: TCP
+      port: {{ include "codeapi.redis.port" . }}
 {{- end }}
 {{- end }}
 

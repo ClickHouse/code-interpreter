@@ -83,6 +83,6 @@ export function buildExecutionManifestClaims(args: {
 }
 
 export function maybeBuildExecutionManifestClaims(args: Parameters<typeof buildExecutionManifestClaims>[0]): ExecutionManifestClaims | undefined {
-  if (!env.EXECUTION_MANIFEST_SECRET) return undefined;
+  if (!env.EXECUTION_MANIFEST_PRIVATE_KEY && !env.EXECUTION_MANIFEST_SECRET) return undefined;
   return buildExecutionManifestClaims(args);
 }

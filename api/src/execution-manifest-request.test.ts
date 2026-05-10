@@ -5,6 +5,7 @@ import {
   type ExecutionManifestClaims,
   type ExecutionManifestErrorReason,
   signExecutionManifest,
+  signExecutionManifestWithPrivateKey,
   verifyExecutionManifest,
 } from './execution-manifest';
 import {
@@ -13,6 +14,8 @@ import {
 } from './execution-manifest-request';
 
 const SECRET = 'test-secret';
+const PRIVATE_KEY = 'MC4CAQAwBQYDK2VwBCIEIBoxzSJjQ5jTVyuohHtlD+uDGqv/tZ6hQS2CmxuOg2Wn';
+const PUBLIC_KEY = 'MCowBQYDK2VwAyEAeY3PRoTS3adfU6E3gQUB5hSZdrdMSw6OrKkH4UhYh0U=';
 
 function claims(overrides: Partial<ExecutionManifestClaims> = {}): ExecutionManifestClaims {
   return {
@@ -61,6 +64,29 @@ describe('execute request manifest validation', () => {
     ]);
     expect(verifyExecuteRequestManifest({
       headerValue: token,
+      secret: SECRET,
+      body,
+      nowSeconds: 150,
+    })).toEqual(claims());
+  });
+
+  test('accepts an asymmetric manifest with only the public verifier key', () => {
+    const token = signExecutionManifestWithPrivateKey(claims(), PRIVATE_KEY);
+
+    expect(verifyExecuteRequestManifest({
+      headerValue: token,
+      publicKey: PUBLIC_KEY,
+      body,
+      nowSeconds: 150,
+    })).toEqual(claims());
+  });
+
+  test('preserves the legacy HMAC verifier fallback when no public key is configured', () => {
+    const token = signExecutionManifest(claims(), SECRET);
+
+    expect(verifyExecuteRequestManifest({
+      headerValue: token,
+      publicKey: '',
       secret: SECRET,
       body,
       nowSeconds: 150,

@@ -23,6 +23,28 @@ export class ExecutionManifestError extends Error {
   }
 }
 
+export interface ExecutionManifestSigner {
+  /** Preferred signer for split-runner deployments. The sandbox-runner only
+   * receives the matching public key, so runner compromise does not create a
+   * new manifest-minting capability. Accepts PEM or base64-encoded PKCS#8 DER. */
+  privateKey?: string;
+  /** Legacy HMAC fallback for non-split deployments. Do not mount this into
+   * sandbox-runner; it can both verify and mint manifests. */
+  secret?: string;
+}
+
+export interface ExecutionManifestVerifier {
+  /** Preferred verifier for sandbox-runner. Accepts PEM or base64-encoded SPKI DER. */
+  publicKey?: string;
+  /** Legacy HMAC fallback for non-split deployments. */
+  secret?: string;
+}
+
+export interface ExecutionManifestVerifyOptions {
+  nowSeconds?: number;
+  clockToleranceSeconds?: number;
+}
+
 export interface ExecutionManifestInputFile {
   id: string;
   /** Per-file storage session id. Kept as `session_id` (rather than
@@ -101,6 +123,38 @@ function hmacSha256(data: string, secret: string): Buffer {
   return crypto.createHmac('sha256', secret).update(data, 'utf8').digest();
 }
 
+function normalizeKeyMaterial(key: string): string {
+  return key.trim().replace(/\\n/g, '\n');
+}
+
+function privateKeyFromEnv(key: string): crypto.KeyObject | string {
+  const normalized = normalizeKeyMaterial(key);
+  if (normalized.includes('BEGIN ')) return normalized;
+  return crypto.createPrivateKey({
+    key: Buffer.from(normalized, 'base64'),
+    format: 'der',
+    type: 'pkcs8',
+  });
+}
+
+function publicKeyFromEnv(key: string): crypto.KeyObject | string {
+  const normalized = normalizeKeyMaterial(key);
+  if (normalized.includes('BEGIN ')) return normalized;
+  return crypto.createPublicKey({
+    key: Buffer.from(normalized, 'base64'),
+    format: 'der',
+    type: 'spki',
+  });
+}
+
+function ed25519Sign(data: string, privateKey: string): Buffer {
+  return crypto.sign(null, Buffer.from(data, 'utf8'), privateKeyFromEnv(privateKey));
+}
+
+function ed25519Verify(data: string, publicKey: string, signature: Buffer): boolean {
+  return crypto.verify(null, Buffer.from(data, 'utf8'), publicKeyFromEnv(publicKey), signature);
+}
+
 function validateClaimsShape(value: unknown): asserts value is ExecutionManifestClaims {
   const claims = value as Partial<ExecutionManifestClaims> | null;
   if (claims == null || typeof claims !== 'object') {
@@ -158,25 +212,20 @@ function validateClaimsShape(value: unknown): asserts value is ExecutionManifest
   }
 }
 
-export function signExecutionManifest(claims: ExecutionManifestClaims, secret: string): string {
-  if (!secret) {
-    throw new ExecutionManifestError('missing_secret', 'Execution manifest secret is not configured');
-  }
-
+function payloadForClaims(claims: ExecutionManifestClaims): string {
   validateClaimsShape(claims);
-  const payload = canonicalJson(claims);
-  const signature = hmacSha256(payload, secret);
+  return canonicalJson(claims);
+}
+
+function encodeSignedManifest(payload: string, signature: Buffer): string {
   return `${base64UrlEncode(payload)}.${base64UrlEncode(signature)}`;
 }
 
-export function verifyExecutionManifest(
-  token: string,
-  secret: string,
-  options: { nowSeconds?: number; clockToleranceSeconds?: number } = {},
-): ExecutionManifestClaims {
-  if (!secret) {
-    throw new ExecutionManifestError('missing_secret', 'Execution manifest secret is not configured');
-  }
+function decodeSignedManifest(token: string): {
+  claims: ExecutionManifestClaims;
+  payload: string;
+  signature: Buffer;
+} {
   const [payloadPart, signaturePart, extraPart] = token.split('.');
   if (!payloadPart || !signaturePart || extraPart !== undefined) {
     throw new ExecutionManifestError('malformed', 'Execution manifest token is malformed');
@@ -196,20 +245,97 @@ export function verifyExecutionManifest(
     throw new ExecutionManifestError('malformed', 'Execution manifest payload is not canonical');
   }
 
-  const expected = hmacSha256(canonicalPayload, secret);
-  const actual = base64UrlDecode(signaturePart);
-  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
-    throw new ExecutionManifestError('invalid_signature', 'Execution manifest signature is invalid');
-  }
+  return {
+    claims: parsed,
+    payload: canonicalPayload,
+    signature: base64UrlDecode(signaturePart),
+  };
+}
 
+function assertManifestTimeWindow(
+  claims: ExecutionManifestClaims,
+  options: ExecutionManifestVerifyOptions,
+): void {
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
   const tolerance = options.clockToleranceSeconds ?? 30;
-  if (parsed.exp <= now - tolerance) {
+  if (claims.exp <= now - tolerance) {
     throw new ExecutionManifestError('expired', 'Execution manifest is expired');
   }
-  if (parsed.iat > now + tolerance) {
+  if (claims.iat > now + tolerance) {
     throw new ExecutionManifestError('not_yet_valid', 'Execution manifest is not valid yet');
   }
+}
 
-  return parsed;
+export function signExecutionManifest(claims: ExecutionManifestClaims, secret: string): string {
+  if (!secret) {
+    throw new ExecutionManifestError('missing_secret', 'Execution manifest secret is not configured');
+  }
+
+  const payload = payloadForClaims(claims);
+  return encodeSignedManifest(payload, hmacSha256(payload, secret));
+}
+
+export function signExecutionManifestWithPrivateKey(claims: ExecutionManifestClaims, privateKey: string): string {
+  if (!privateKey) {
+    throw new ExecutionManifestError('missing_secret', 'Execution manifest private key is not configured');
+  }
+
+  const payload = payloadForClaims(claims);
+  return encodeSignedManifest(payload, ed25519Sign(payload, privateKey));
+}
+
+export function signExecutionManifestWithKey(
+  claims: ExecutionManifestClaims,
+  signer: ExecutionManifestSigner,
+): string {
+  if (signer.privateKey) {
+    return signExecutionManifestWithPrivateKey(claims, signer.privateKey);
+  }
+  return signExecutionManifest(claims, signer.secret ?? '');
+}
+
+export function verifyExecutionManifest(
+  token: string,
+  secret: string,
+  options: ExecutionManifestVerifyOptions = {},
+): ExecutionManifestClaims {
+  if (!secret) {
+    throw new ExecutionManifestError('missing_secret', 'Execution manifest secret is not configured');
+  }
+
+  const manifest = decodeSignedManifest(token);
+  const expected = hmacSha256(manifest.payload, secret);
+  if (manifest.signature.length !== expected.length || !crypto.timingSafeEqual(manifest.signature, expected)) {
+    throw new ExecutionManifestError('invalid_signature', 'Execution manifest signature is invalid');
+  }
+  assertManifestTimeWindow(manifest.claims, options);
+  return manifest.claims;
+}
+
+export function verifyExecutionManifestWithPublicKey(
+  token: string,
+  publicKey: string,
+  options: ExecutionManifestVerifyOptions = {},
+): ExecutionManifestClaims {
+  if (!publicKey) {
+    throw new ExecutionManifestError('missing_secret', 'Execution manifest public key is not configured');
+  }
+
+  const manifest = decodeSignedManifest(token);
+  if (!ed25519Verify(manifest.payload, publicKey, manifest.signature)) {
+    throw new ExecutionManifestError('invalid_signature', 'Execution manifest signature is invalid');
+  }
+  assertManifestTimeWindow(manifest.claims, options);
+  return manifest.claims;
+}
+
+export function verifyExecutionManifestWithKey(
+  token: string,
+  verifier: ExecutionManifestVerifier,
+  options: ExecutionManifestVerifyOptions = {},
+): ExecutionManifestClaims {
+  if (verifier.publicKey) {
+    return verifyExecutionManifestWithPublicKey(token, verifier.publicKey, options);
+  }
+  return verifyExecutionManifest(token, verifier.secret ?? '', options);
 }

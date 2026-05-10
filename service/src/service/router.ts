@@ -14,12 +14,12 @@ import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from
 import { sleep, getAxiosErrorDetails } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
-import { maybeBuildExecutionManifestClaims } from '../execution-manifest-claims';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getLegacyApiKeyString, getPrincipalOrReject } from '../auth/principal';
 import { jobsSubmitted } from '../metrics';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
+import { prepareSandboxJobSecurity } from '../sandbox-egress';
 import logger from '../logger';
 
 const { INSTANCE_ID } = env;
@@ -178,18 +178,18 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     });
 
     const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
-    const payload = createPayload({
+    const rawPayload = createPayload({
       req,
       isPyPlot,
       session_id,
     });
-    const executionManifestClaims = maybeBuildExecutionManifestClaims({
+    const sandboxSecurity = prepareSandboxJobSecurity({
       req,
       executionId: execution_id,
       userId,
       sessionKey,
       outputSessionId: session_id,
-      payload,
+      payload: rawPayload,
     });
 
     const queue = language === Languages.py ? pyQueue : otherQueue;
@@ -198,15 +198,17 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     const job = await queue.add(Jobs.execute, {
       code,
       userId,
-      payload,
+      payload: sandboxSecurity.payload,
       apiKeyId,
       isPyPlot,
       apiKeyString,
       principalSource: principal.principalSource,
       executionId: execution_id,
-      tenantId: executionManifestClaims?.tenant_id,
-      canonicalUserId: executionManifestClaims?.user_id,
-      executionManifestClaims,
+      tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',
+      canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
+      executionManifestClaims: sandboxSecurity.executionManifestClaims,
+      egressGrantClaims: sandboxSecurity.egressGrantClaims,
+      egressGrantToken: sandboxSecurity.egressGrantToken,
       SANDBOX_ENDPOINT: env.SANDBOX_ENDPOINT
     }, {
       removeOnComplete: {

@@ -307,6 +307,78 @@ fn null_term(v: &[CString]) -> Vec<*const libc::c_char> {
     ptrs
 }
 
+fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
+    const ALLOW_EXACT: &[&str] = &[
+        "EGRESS_GATEWAY_URL",
+        "HOME",
+        "NSJAIL_CONFIG",
+        "NSJAIL_PATH",
+        "NODE_ENV",
+        "NO_COLOR",
+        "PATH",
+        "PORT",
+        "SANDBOX_ALLOWED_LOCAL_NETWORK_PORT",
+        "SANDBOX_COMPILE_CPU_TIME",
+        "SANDBOX_COMPILE_MEMORY_LIMIT",
+        "SANDBOX_COMPILE_TIMEOUT",
+        "SANDBOX_DATA_DIRECTORY",
+        "SANDBOX_DISABLE_NETWORKING",
+        "SANDBOX_EXECUTE_BODY_LIMIT",
+        "SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY",
+        "SANDBOX_FORWARD_TARGET",
+        "SANDBOX_LIMIT_OVERRIDES",
+        "SANDBOX_LOG_LEVEL",
+        "SANDBOX_MAX_CONCURRENT_JOBS",
+        "SANDBOX_MAX_FILE_SIZE",
+        "SANDBOX_MAX_NESTING_DEPTH",
+        "SANDBOX_MAX_OPEN_FILES",
+        "SANDBOX_MAX_OUTPUT_FILES",
+        "SANDBOX_MAX_PATH_LENGTH",
+        "SANDBOX_MAX_PROCESS_COUNT",
+        "SANDBOX_OUTPUT_MAX_SIZE",
+        "SANDBOX_REQUIRE_EGRESS_MANIFEST",
+        "SANDBOX_RLIMIT_AS",
+        "SANDBOX_RLIMIT_FSIZE",
+        "SANDBOX_RUN_CPU_TIME",
+        "SANDBOX_RUN_MEMORY_LIMIT",
+        "SANDBOX_RUN_TIMEOUT",
+        "SANDBOX_UPLOAD_CONCURRENCY",
+        "SANDBOX_USE_CGROUPV2",
+        "TERM",
+        "TMPDIR",
+        "TZ",
+    ];
+    // Non-gateway deployments still rely on FILE_SERVER_URL for sandbox file IO.
+    // Hardened egress mode keeps blocking it so sandbox traffic goes only to the gateway.
+    const LEGACY_NON_EGRESS_EXACT: &[&str] = &["FILE_SERVER_URL"];
+    const DENY_PREFIXES: &[&str] = &[
+        "AWS_",
+        "CODEAPI_",
+        "LIBRECHAT_",
+        "MINIO_",
+        "REDIS_",
+        "S3_",
+    ];
+    const DENY_SUBSTRINGS: &[&str] = &["SECRET", "TOKEN", "PASSWORD"];
+
+    if !egress_gateway_enabled && LEGACY_NON_EGRESS_EXACT.contains(&key) {
+        return true;
+    }
+
+    if ALLOW_EXACT.contains(&key) {
+        return true;
+    }
+
+    let upper_key = key.to_ascii_uppercase();
+    if DENY_PREFIXES.iter().any(|prefix| upper_key.starts_with(prefix)) ||
+        DENY_SUBSTRINGS.iter().any(|part| upper_key.contains(part))
+    {
+        return false;
+    }
+
+    false
+}
+
 fn main() {
     let vcpus: u8 = env::var("LAUNCHER_VCPUS")
         .ok()
@@ -332,8 +404,12 @@ fn main() {
     let port_map_strs = vec![cstr("2000:2000")];
     let port_map_ptrs = null_term(&port_map_strs);
 
+    let egress_gateway_enabled = env::var("EGRESS_GATEWAY_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
     let env_strs: Vec<CString> = env::vars()
         .filter(|(k, _)| !k.starts_with("LAUNCHER_"))
+        .filter(|(k, _)| is_allowed_guest_env_key(k, egress_gateway_enabled))
         .map(|(k, v)| cstr(&format!("{k}={v}")))
         .collect();
     let env_ptrs = null_term(&env_strs);
@@ -384,5 +460,57 @@ fn main() {
         let ret = ffi::krun_start_enter(ctx);
         eprintln!("[launcher] krun_start_enter returned {ret} (should not return on success)");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_guest_env_key;
+
+    #[test]
+    fn guest_env_allowlist_blocks_control_plane_and_secret_vars() {
+        for key in [
+            "REDIS_HOST",
+            "REDIS_PASSWORD",
+            "TOOL_CALL_SERVER_URL",
+            "CODEAPI_INTERNAL_SERVICE_TOKEN",
+            "CODEAPI_EGRESS_GRANT_SECRET",
+            "CODEAPI_EXECUTION_MANIFEST_SECRET",
+            "SANDBOX_EXECUTION_MANIFEST_SECRET",
+            "SANDBOX_CALLBACK_TOKEN",
+            "SANDBOX_PRIVATE_KEY",
+            "SANDBOX_FAKE_SECRET",
+            "AWS_ACCESS_KEY_ID",
+            "S3_BUCKET",
+            "MINIO_ROOT_PASSWORD",
+            "CODEAPI_JWT_SECRET",
+            "TOOL_CALL_SERVER_URL",
+            "SANDBOX_UNDECLARED_KNOB",
+        ] {
+            assert!(!is_allowed_guest_env_key(key, true), "{key} should not enter the sandbox guest");
+        }
+    }
+
+    #[test]
+    fn guest_env_allowlist_keeps_only_runner_runtime_vars() {
+        for key in [
+            "EGRESS_GATEWAY_URL",
+            "SANDBOX_DISABLE_NETWORKING",
+            "SANDBOX_ALLOWED_LOCAL_NETWORK_PORT",
+            "SANDBOX_FORWARD_TARGET",
+            "SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY",
+            "SANDBOX_RUN_TIMEOUT",
+            "NSJAIL_CONFIG",
+            "PORT",
+            "PATH",
+        ] {
+            assert!(is_allowed_guest_env_key(key, true), "{key} should enter the sandbox guest");
+        }
+    }
+
+    #[test]
+    fn guest_env_allowlist_preserves_legacy_file_server_url_only_without_egress_gateway() {
+        assert!(is_allowed_guest_env_key("FILE_SERVER_URL", false));
+        assert!(!is_allowed_guest_env_key("FILE_SERVER_URL", true));
     }
 }

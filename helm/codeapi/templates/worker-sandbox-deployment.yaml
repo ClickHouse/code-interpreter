@@ -1,92 +1,96 @@
 {{/*
-Worker-Sandbox Deployment (MicroVM)
-Each pod runs a single combined container with:
-  - libkrun microVM launcher (boots sandbox with its own guest kernel)
-  - Worker process (job processor)
-  - supervisor.sh manages both processes
-
-Only requires /dev/kvm — no privileged mode, no Linux capabilities.
-
-Default: 3 replicas = 15 concurrent Python jobs (3 pods × 5 concurrency)
+Split runtime deployments:
+  - service-worker consumes BullMQ/Redis and calls sandbox-runner.
+  - sandbox-runner runs only the sandbox API + microVM/NsJail and egresses only to egress-gateway.
 */}}
+{{- if and .Values.workerSandbox.enabled (not .Values.egressGateway.enabled) }}
+{{- fail "workerSandbox.enabled requires egressGateway.enabled=true because sandbox-runner may only egress to the egress gateway" }}
+{{- end }}
 {{- if .Values.workerSandbox.enabled }}
+{{- $serviceWorkerServiceAccount := .Values.workerSandbox.serviceAccount.name | default (printf "%s-service-worker" (include "codeapi.fullname" .)) }}
+{{- $sandboxRunnerServiceAccount := .Values.workerSandbox.sandboxServiceAccount.name | default (printf "%s-sandbox-runner" (include "codeapi.fullname" .)) }}
+{{- if not .Values.executionManifest.privateKey }}
+{{- fail "workerSandbox.enabled requires executionManifest.privateKey so service-worker can sign sandbox execute manifests" }}
+{{- end }}
+{{- if not .Values.executionManifest.publicKey }}
+{{- fail "workerSandbox.enabled requires executionManifest.publicKey so sandbox-runner can verify signed execute manifests without a signing secret" }}
+{{- end }}
+{{- range .Values.workerSandbox.sandboxExtraEnv }}
+{{- $name := .name | default "" }}
+{{- if and $name (or (regexMatch "(?i)(SECRET|TOKEN|PASSWORD|KEY)" $name) (hasPrefix "REDIS_" $name) (hasPrefix "AWS_" $name) (hasPrefix "S3_" $name) (hasPrefix "MINIO_" $name) (hasPrefix "CODEAPI_" $name) (eq $name "FILE_SERVER_URL") (eq $name "TOOL_CALL_SERVER_URL")) }}
+{{- fail (printf "workerSandbox.sandboxExtraEnv may not set sensitive/control-plane env var %s; sandbox-runner must only receive runtime knobs and the chart-managed manifest public verifier" $name) }}
+{{- end }}
+{{- end }}
+{{- if .Values.workerSandbox.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $serviceWorkerServiceAccount }}
+  labels:
+    {{- include "codeapi.serviceWorker.labels" . | nindent 4 }}
+  {{- with .Values.workerSandbox.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- if .Values.workerSandbox.sandboxServiceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+automountServiceAccountToken: {{ .Values.workerSandbox.sandboxServiceAccount.automountServiceAccountToken }}
+metadata:
+  name: {{ $sandboxRunnerServiceAccount }}
+  labels:
+    {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
+  {{- with .Values.workerSandbox.sandboxServiceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "codeapi.fullname" . }}-worker-sandbox
+  name: {{ include "codeapi.fullname" . }}-service-worker
   labels:
-    {{- include "codeapi.workerSandbox.labels" . | nindent 4 }}
+    {{- include "codeapi.serviceWorker.labels" . | nindent 4 }}
 spec:
   {{- if not .Values.workerSandbox.autoscaling.enabled }}
   replicas: {{ .Values.workerSandbox.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
-      {{- include "codeapi.workerSandbox.selectorLabels" . | nindent 6 }}
+      {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "codeapi.workerSandbox.selectorLabels" . | nindent 8 }}
+        {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 8 }}
     spec:
+      {{- if or .Values.workerSandbox.serviceAccount.create .Values.workerSandbox.serviceAccount.name }}
+      serviceAccountName: {{ $serviceWorkerServiceAccount }}
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      
       initContainers:
         - name: wait-for-redis
           image: busybox:1.36.1
           command: ['sh', '-c', 'until nc -z {{ include "codeapi.redis.host" . }} {{ include "codeapi.redis.port" . }}; do echo waiting for redis; sleep 2; done']
-      
-      {{- if .Values.workerSandbox.kvmEnabled }}
-      securityContext:
-        supplementalGroups: [{{ .Values.workerSandbox.kvmGid | default 108 }}]
-      {{- end }}
-      
+        - name: wait-for-sandbox-runner
+          image: busybox:1.36.1
+          command: ['sh', '-c', 'until nc -z {{ include "codeapi.fullname" . }}-sandbox-runner {{ .Values.workerSandbox.sandbox.port }}; do echo waiting for sandbox-runner; sleep 2; done']
       containers:
-        - name: worker-sandbox
-          image: "{{ .Values.workerSandbox.image.repository }}:{{ .Values.workerSandbox.image.tag }}"
-          imagePullPolicy: {{ .Values.workerSandbox.image.pullPolicy }}
+        - name: service-worker
+          image: "{{ .Values.workerSandbox.workerImage.repository }}:{{ .Values.workerSandbox.workerImage.tag }}"
+          imagePullPolicy: {{ .Values.workerSandbox.workerImage.pullPolicy }}
           ports:
             - name: health
               containerPort: {{ .Values.workerSandbox.healthPort }}
               protocol: TCP
-            - name: sandbox
-              containerPort: {{ .Values.workerSandbox.sandbox.port }}
-              protocol: TCP
           env:
-            # KVM / microVM mode
-            - name: KVM_ENABLED
-              value: {{ .Values.workerSandbox.kvmEnabled | quote }}
-            # Launcher config (microVM, only used when KVM_ENABLED=true)
-            - name: LAUNCHER_VCPUS
-              value: {{ .Values.workerSandbox.launcher.vcpus | default 2 | quote }}
-            - name: LAUNCHER_RAM_MIB
-              value: {{ .Values.workerSandbox.launcher.ramMib | default 2048 | quote }}
-            - name: LAUNCHER_LOG_LEVEL
-              value: {{ .Values.workerSandbox.launcher.logLevel | default 3 | quote }}
-            # Sandbox config (passed through to microVM guest)
-            - name: SANDBOX_LOG_LEVEL
-              value: "INFO"
-            - name: SANDBOX_MAX_PROCESS_COUNT
-              value: {{ .Values.workerSandbox.sandbox.maxProcessCount | quote }}
-            - name: SANDBOX_RUN_CPU_TIME
-              value: {{ .Values.workerSandbox.sandbox.runCpuTime | quote }}
-            - name: SANDBOX_RUN_TIMEOUT
-              value: {{ .Values.workerSandbox.sandbox.runTimeout | quote }}
-            - name: SANDBOX_OUTPUT_MAX_SIZE
-              value: {{ .Values.workerSandbox.sandbox.outputMaxSize | quote }}
-            - name: SANDBOX_DISABLE_NETWORKING
-              value: {{ .Values.workerSandbox.sandbox.disableNetworking | quote }}
-            - name: FILE_SERVER_URL
-              value: "http://{{ include "codeapi.fullname" . }}-file-server:{{ .Values.fileServer.service.port }}"
-            - name: SANDBOX_ALLOWED_LOCAL_NETWORK_PORT
-              value: {{ .Values.toolCallServer.service.port | quote }}
-            - name: SANDBOX_FORWARD_TARGET
-              value: "{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
-            # Worker config
             - name: SANDBOX_ENDPOINT
-              value: "http://localhost:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
+              value: "http://{{ include "codeapi.fullname" . }}-sandbox-runner:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
             - name: REDIS_HOST
               value: {{ include "codeapi.redis.host" . }}
             - name: REDIS_PORT
@@ -96,13 +100,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
                   key: redis-password
-            - name: TOOL_CALL_SERVER_URL
-              value: "http://{{ include "codeapi.fullname" . }}-tool-call-server:{{ .Values.toolCallServer.service.port }}"
-            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+            - name: CODEAPI_EGRESS_GRANT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "codeapi.fullname" . }}-secrets
-                  key: codeapi-internal-service-token
+                  key: codeapi-egress-grant-secret
+            - name: CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codeapi.fullname" . }}-secrets
+                  key: codeapi-execution-manifest-private-key
+            - name: EXECUTION_MANIFEST_TTL_SECONDS
+              value: {{ .Values.executionManifest.ttlSeconds | quote }}
+            - name: EGRESS_GRANT_TTL_SECONDS
+              value: {{ .Values.egressGrant.ttlSeconds | quote }}
             - name: PYTHON_CONCURRENCY
               value: {{ .Values.workerSandbox.config.pythonConcurrency | quote }}
             - name: OTHER_CONCURRENCY
@@ -114,6 +125,113 @@ spec:
             - name: WORKER_HEALTH_PORT
               value: {{ .Values.workerSandbox.healthPort | quote }}
             {{- with .Values.workerSandbox.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.workerSandbox.resources.requests.cpu }}
+              memory: {{ .Values.workerSandbox.resources.requests.memory }}
+            {{- with .Values.workerSandbox.resources.limits }}
+            limits:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codeapi.fullname" . }}-sandbox-runner
+  labels:
+    {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.workerSandbox.autoscaling.enabled }}
+  replicas: {{ .Values.workerSandbox.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- if or .Values.workerSandbox.sandboxServiceAccount.create .Values.workerSandbox.sandboxServiceAccount.name }}
+      serviceAccountName: {{ $sandboxRunnerServiceAccount }}
+      {{- end }}
+      automountServiceAccountToken: {{ .Values.workerSandbox.sandboxServiceAccount.automountServiceAccountToken }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.workerSandbox.kvmEnabled }}
+      securityContext:
+        supplementalGroups: [{{ .Values.workerSandbox.kvmGid | default 108 }}]
+      {{- end }}
+      containers:
+        - name: sandbox-runner
+          image: "{{ .Values.workerSandbox.sandboxImage.repository }}:{{ .Values.workerSandbox.sandboxImage.tag }}"
+          imagePullPolicy: {{ .Values.workerSandbox.sandboxImage.pullPolicy }}
+          ports:
+            - name: sandbox
+              containerPort: {{ .Values.workerSandbox.sandbox.port }}
+              protocol: TCP
+          env:
+            - name: KVM_ENABLED
+              value: {{ .Values.workerSandbox.kvmEnabled | quote }}
+            - name: LAUNCHER_VCPUS
+              value: {{ .Values.workerSandbox.launcher.vcpus | default 2 | quote }}
+            - name: LAUNCHER_RAM_MIB
+              value: {{ .Values.workerSandbox.launcher.ramMib | default 2048 | quote }}
+            - name: LAUNCHER_LOG_LEVEL
+              value: {{ .Values.workerSandbox.launcher.logLevel | default 3 | quote }}
+            - name: EGRESS_GATEWAY_URL
+              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
+            - name: SANDBOX_LOG_LEVEL
+              value: "INFO"
+            - name: SANDBOX_MAX_PROCESS_COUNT
+              value: {{ .Values.workerSandbox.sandbox.maxProcessCount | quote }}
+            - name: SANDBOX_RUN_CPU_TIME
+              value: {{ .Values.workerSandbox.sandbox.runCpuTime | quote }}
+            - name: SANDBOX_RUN_TIMEOUT
+              value: {{ .Values.workerSandbox.sandbox.runTimeout | quote }}
+            - name: SANDBOX_OUTPUT_MAX_SIZE
+              value: {{ .Values.workerSandbox.sandbox.outputMaxSize | quote }}
+            - name: SANDBOX_EXECUTE_BODY_LIMIT
+              value: {{ .Values.workerSandbox.sandbox.executeBodyLimit | quote }}
+            - name: SANDBOX_DISABLE_NETWORKING
+              value: {{ .Values.workerSandbox.sandbox.disableNetworking | quote }}
+            - name: SANDBOX_ALLOWED_LOCAL_NETWORK_PORT
+              value: {{ .Values.egressGateway.service.port | quote }}
+            - name: SANDBOX_FORWARD_TARGET
+              value: "{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
+            - name: SANDBOX_REQUIRE_EGRESS_MANIFEST
+              value: "true"
+            - name: SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY
+              value: {{ .Values.executionManifest.publicKey | quote }}
+            {{- with .Values.workerSandbox.sandboxExtraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
@@ -131,12 +249,12 @@ spec:
           securityContext:
             privileged: false
             seccompProfile:
-              type: Unconfined  # nsjail applies its own per-execution seccomp filter
+              type: Unconfined
             capabilities:
               add:
-                - SYS_ADMIN      # bind-mount /proc,/sys,/dev into rootfs
-                - SYS_CHROOT     # chroot into sandbox rootfs
-                - SYS_PTRACE     # nsjail namespace tracing
+                - SYS_ADMIN
+                - SYS_CHROOT
+                - SYS_PTRACE
                 - SETUID
                 - SETGID
                 - NET_ADMIN
@@ -151,14 +269,14 @@ spec:
           {{- end }}
           livenessProbe:
             httpGet:
-              path: /health
-              port: health
+              path: /api/v2/runtimes
+              port: sandbox
             initialDelaySeconds: 60
             periodSeconds: 30
           readinessProbe:
             httpGet:
-              path: /ready
-              port: health
+              path: /api/v2/runtimes
+              port: sandbox
             initialDelaySeconds: 30
             periodSeconds: 10
           resources:
@@ -169,7 +287,6 @@ spec:
             limits:
               {{- toYaml . | nindent 14 }}
             {{- end }}
-      
       volumes:
         - name: piston-packages
           {{- if .Values.workerSandbox.packages.hostPath }}
@@ -191,7 +308,6 @@ spec:
             path: /dev/kvm
             type: CharDevice
         {{- end }}
-      
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -204,4 +320,20 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codeapi.fullname" . }}-sandbox-runner
+  labels:
+    {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.workerSandbox.sandbox.port }}
+      targetPort: sandbox
+      protocol: TCP
+      name: sandbox
+  selector:
+    {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 4 }}
 {{- end }}

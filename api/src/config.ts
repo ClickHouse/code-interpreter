@@ -22,6 +22,12 @@ export function safeInt(raw: string | undefined, fallback: number, min = 1): num
   return Math.floor(n);
 }
 
+const egressGatewayUrl = process.env.EGRESS_GATEWAY_URL ?? '';
+const requireExecutionManifest = (
+  process.env.SANDBOX_REQUIRE_EGRESS_MANIFEST
+  ?? (egressGatewayUrl ? 'true' : 'false')
+) === 'true';
+
 export const config = {
   log_level: process.env.SANDBOX_LOG_LEVEL ?? 'DEBUG',
   bind_address: `0.0.0.0:${process.env.PORT ?? 2000}`,
@@ -44,13 +50,21 @@ export const config = {
   rlimit_fsize: Number(process.env.SANDBOX_RLIMIT_FSIZE ?? 100),
   nsjail_path: process.env.NSJAIL_PATH ?? '/usr/sbin/nsjail',
   nsjail_config: process.env.NSJAIL_CONFIG ?? '/sandbox_api/config/sandbox.cfg',
+  execute_body_limit: process.env.SANDBOX_EXECUTE_BODY_LIMIT ?? '50mb',
+  egress_gateway_url: egressGatewayUrl,
   file_server_url: process.env.FILE_SERVER_URL ?? '',
   max_nesting_depth: safeInt(process.env.SANDBOX_MAX_NESTING_DEPTH, 10),
   max_path_length: safeInt(process.env.SANDBOX_MAX_PATH_LENGTH, 256),
   max_output_files: safeInt(process.env.SANDBOX_MAX_OUTPUT_FILES, 50),
-  require_execution_manifest: (process.env.SANDBOX_REQUIRE_EGRESS_MANIFEST ?? 'false') === 'true',
-  execution_manifest_secret: process.env.CODEAPI_EXECUTION_MANIFEST_SECRET
-    ?? process.env.SANDBOX_EXECUTION_MANIFEST_SECRET
+  require_execution_manifest: requireExecutionManifest,
+  execution_manifest_public_key: process.env.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY
+    ?? process.env.CODEAPI_EXECUTION_MANIFEST_PUBLIC_KEY
+    ?? '',
+  // Legacy HMAC verifier fallback for rolling upgrades only. Cloud split-runner
+  // deployments should mount SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY instead so a
+  // compromised runner cannot mint valid manifests.
+  execution_manifest_secret: process.env.SANDBOX_EXECUTION_MANIFEST_SECRET
+    ?? process.env.CODEAPI_EXECUTION_MANIFEST_SECRET
     ?? '',
   /* Cap on simultaneous PUTs to file_server during a single job's upload
    * phase. Each PUT streams from disk and holds an open fd + an HTTP

@@ -1,5 +1,5 @@
 services:
-  sandbox:
+  sandbox-runner:
     build:
       target: sandbox-build
     entrypoint: ["/sandbox_api/entrypoint.sh"]

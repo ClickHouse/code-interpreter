@@ -7,10 +7,14 @@ import {
   type ExecutionManifestErrorReason,
   type ExecutionManifestClaims,
   signExecutionManifest,
+  signExecutionManifestWithPrivateKey,
   verifyExecutionManifest,
+  verifyExecutionManifestWithPublicKey,
 } from './execution-manifest';
 
 const SECRET = 'test-secret';
+const PRIVATE_KEY = 'MC4CAQAwBQYDK2VwBCIEIBoxzSJjQ5jTVyuohHtlD+uDGqv/tZ6hQS2CmxuOg2Wn';
+const PUBLIC_KEY = 'MCowBQYDK2VwAyEAeY3PRoTS3adfU6E3gQUB5hSZdrdMSw6OrKkH4UhYh0U=';
 
 function claims(overrides: Partial<ExecutionManifestClaims> = {}): ExecutionManifestClaims {
   return {
@@ -46,6 +50,12 @@ describe('execution manifest signing', () => {
   test('round-trips signed claims', () => {
     const token = signExecutionManifest(claims(), SECRET);
     expect(verifyExecutionManifest(token, SECRET, { nowSeconds: 150 })).toEqual(claims());
+  });
+
+  test('round-trips asymmetric signed claims with public verifier only', () => {
+    const token = signExecutionManifestWithPrivateKey(claims(), PRIVATE_KEY);
+    expect(verifyExecutionManifestWithPublicKey(token, PUBLIC_KEY, { nowSeconds: 150 })).toEqual(claims());
+    expectManifestError(() => verifyExecutionManifest(token, SECRET, { nowSeconds: 150 }), 'invalid_signature');
   });
 
   test('uses canonical JSON independent of insertion order', () => {

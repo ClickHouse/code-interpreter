@@ -77,7 +77,7 @@ if (!isLocalMode) {
   app.use('/v1/webhook', webhookRouter);
 }
 
-app.use(json({ limit: '50mb' }));
+app.use(json({ limit: env.HTTP_JSON_LIMIT }));
 
 if (!isLocalMode) {
   app.use('/v1/newsletter', newsletterRouter);

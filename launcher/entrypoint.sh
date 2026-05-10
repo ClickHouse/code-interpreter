@@ -51,6 +51,7 @@ resolve_host_port() {
     fi
 }
 
+resolve_url EGRESS_GATEWAY_URL
 resolve_url FILE_SERVER_URL
 resolve_host_port SANDBOX_FORWARD_TARGET
 

@@ -26,18 +26,20 @@ services:
             - CODEAPI_JWT_HS256_SECRET=${CODEAPI_JWT_HS256_SECRET:-}
             - CODEAPI_JWT_SINGLE_TENANT_ID=${CODEAPI_JWT_SINGLE_TENANT_ID:-}
             - CODEAPI_TENANT_ISOLATION_STRICT=${CODEAPI_TENANT_ISOLATION_STRICT:-}
-            - CODEAPI_EXECUTION_MANIFEST_SECRET=${CODEAPI_EXECUTION_MANIFEST_SECRET:-}
             - EXECUTION_MANIFEST_TTL_SECONDS=${EXECUTION_MANIFEST_TTL_SECONDS:-}
             - EXECUTION_MANIFEST_MAX_UPLOAD_BYTES=${EXECUTION_MANIFEST_MAX_UPLOAD_BYTES:-}
             - EXECUTION_MANIFEST_MAX_OUTPUT_FILES=${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-}
             - EXECUTION_MANIFEST_MAX_REQUESTS=${EXECUTION_MANIFEST_MAX_REQUESTS:-}
+            - CODEAPI_HTTP_JSON_LIMIT=${CODEAPI_HTTP_JSON_LIMIT:-50mb}
             - MONGODB_URI
             - SANDBOX_ACCESS_TOKEN
             - SERVICE_PORT=3112
-            - SANDBOX_ENDPOINT=http://sandbox:2000/api/v2
+            - SANDBOX_ENDPOINT=http://sandbox-runner:2000/api/v2
+            - EGRESS_GATEWAY_URL=http://egress_gateway:3190
             - FILE_SERVER_URL=http://file_server:3000
             - TOOL_CALL_SERVER_URL=http://tool_call_server:3033
             - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
             - REDIS_HOST=redis
             - REDIS_PORT=6379
             - REDIS_PASSWORD=localdev
@@ -45,33 +47,52 @@ services:
             - redis
             - tool_call_server
 
-    worker:
+    service-worker:
         build:
             context: ${SERVICE_DIR:-./service}
             dockerfile: Dockerfile
             target: worker
-        container_name: worker
+        container_name: service-worker
         environment:
             - LOCAL_MODE=${LOCAL_MODE:-true}
             - CODEAPI_AUTH_PROVIDER=${CODEAPI_AUTH_PROVIDER:-}
             - CODEAPI_JWT_SINGLE_TENANT_ID=${CODEAPI_JWT_SINGLE_TENANT_ID:-}
             - CODEAPI_TENANT_ISOLATION_STRICT=${CODEAPI_TENANT_ISOLATION_STRICT:-}
-            - CODEAPI_EXECUTION_MANIFEST_SECRET=${CODEAPI_EXECUTION_MANIFEST_SECRET:-}
+            - CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY=${CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY:-MC4CAQAwBQYDK2VwBCIEIBoxzSJjQ5jTVyuohHtlD+uDGqv/tZ6hQS2CmxuOg2Wn}
             - EXECUTION_MANIFEST_TTL_SECONDS=${EXECUTION_MANIFEST_TTL_SECONDS:-}
             - EXECUTION_MANIFEST_MAX_UPLOAD_BYTES=${EXECUTION_MANIFEST_MAX_UPLOAD_BYTES:-}
             - EXECUTION_MANIFEST_MAX_OUTPUT_FILES=${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-}
             - EXECUTION_MANIFEST_MAX_REQUESTS=${EXECUTION_MANIFEST_MAX_REQUESTS:-}
-            - SANDBOX_ENDPOINT=http://sandbox:2000/api/v2
-            - FILE_SERVER_URL=http://file_server:3000
-            - TOOL_CALL_SERVER_URL=http://tool_call_server:3033
-            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - SANDBOX_ENDPOINT=http://sandbox-runner:2000/api/v2
+            - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
             - REDIS_HOST=redis
             - REDIS_PORT=6379
             - REDIS_PASSWORD=localdev
             - WORKER_HEALTH_PORT=3113
         depends_on:
-            - redis
-            - sandbox
+            redis:
+                condition: service_started
+            sandbox-runner:
+                condition: service_healthy
+
+    egress_gateway:
+        build:
+            context: ${SERVICE_DIR:-./service}
+            dockerfile: Dockerfile.egress-gateway
+            target: production
+        container_name: egress_gateway
+        ports:
+            - 3190:3190
+        environment:
+            - SERVICE_NAME=egress-gateway
+            - EGRESS_GATEWAY_PORT=3190
+            - EGRESS_GATEWAY_FILE_SERVER_URL=http://file_server:3000
+            - EGRESS_GATEWAY_TOOL_CALL_SERVER_URL=http://tool_call_server:3033
+            - EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES=1048576
+            - CODEAPI_EGRESS_GRANT_SECRET=${CODEAPI_EGRESS_GRANT_SECRET:-localdev-egress-grant-secret-change-me-32b}
+            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+        depends_on:
+            - file_server
             - tool_call_server
 
     tool_call_server:
@@ -91,11 +112,11 @@ services:
         depends_on:
             - redis
 
-    sandbox:
+    sandbox-runner:
         build:
           context: .
           dockerfile: api/Dockerfile
-        container_name: sandbox
+        container_name: sandbox-runner
         restart: always
         privileged: false
         devices:
@@ -106,21 +127,29 @@ services:
             - ${SANDBOX_PACKAGES_PATH:-./data/piston/packages}:/host-packages:ro
         environment:
             - KVM_ENABLED=${KVM_ENABLED:-true}
-            - FILE_SERVER_URL=http://file_server:3000
-            - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
+            - EGRESS_GATEWAY_URL=http://egress_gateway:3190
+            - SANDBOX_EXECUTE_BODY_LIMIT=${SANDBOX_EXECUTE_BODY_LIMIT:-50mb}
             - SANDBOX_LOG_LEVEL=DEBUG
             - SANDBOX_OUTPUT_MAX_SIZE=65536
-            - SANDBOX_RUN_TIMEOUT=60000
-            - SANDBOX_RUN_CPU_TIME=60000
+            - SANDBOX_RUN_TIMEOUT=300000
+            - SANDBOX_RUN_CPU_TIME=300000
             - SANDBOX_COMPILE_TIMEOUT=30000
             - LAUNCHER_VCPUS=2
             - LAUNCHER_RAM_MIB=2048
             - LAUNCHER_LOG_LEVEL=3
-            - SANDBOX_ALLOWED_LOCAL_NETWORK_PORT=3033
-            - SANDBOX_FORWARD_TARGET=tool_call_server:3033
+            - SANDBOX_ALLOWED_LOCAL_NETWORK_PORT=3190
+            - SANDBOX_FORWARD_TARGET=egress_gateway:3190
+            - SANDBOX_REQUIRE_EGRESS_MANIFEST=${SANDBOX_REQUIRE_EGRESS_MANIFEST:-true}
+            - SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY=${SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY:-MCowBQYDK2VwAyEAeY3PRoTS3adfU6E3gQUB5hSZdrdMSw6OrKkH4UhYh0U=}
         depends_on:
-            - file_server
-            - tool_call_server
+            egress_gateway:
+                condition: service_healthy
+        healthcheck:
+            test: ["CMD-SHELL", "curl -fsS http://localhost:2000/api/v2/runtimes >/dev/null || exit 1"]
+            interval: 5s
+            timeout: 3s
+            retries: 60
+            start_period: 20s
 
     file_server:
         build:

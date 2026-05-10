@@ -11,9 +11,9 @@ app.use(express.urlencoded({ extended: true }));
  * runs *before* any route-level middleware, so its limit is the effective
  * cap for every endpoint regardless of any per-route override (a global
  * default-limit parser would always reject `/api/v2/execute`'s large replay
- * payloads with `PayloadTooLargeError` before the route's 50mb parser could
+ * payloads with `PayloadTooLargeError` before the route's configured parser could
  * fire). Each route brings its own JSON parser with the right limit:
- *   - `/api/v2/execute` -> `express.json({ limit: '50mb' })` (replay PTC)
+ *   - `/api/v2/execute` -> configurable JSON limit (replay PTC / scripts)
  *   - other POSTs       -> default `express.json()`
  *   - `GET /api/v2/runtimes`, `GET /` -> no body -> no parser needed.
  * `services/codeapi/api/src/api/v2.ts` is responsible for installing the

@@ -535,7 +535,11 @@ test_expired_token() {
     echo "============================================================================="
 
     local now_ms
-    now_ms=$(date +%s%3N)
+    now_ms=$(
+        node -e 'console.log(Date.now())' 2>/dev/null ||
+        bun -e 'console.log(Date.now())' 2>/dev/null ||
+        python3 -c 'import time; print(int(time.time() * 1000))'
+    )
     local unknown_token
     unknown_token=$(printf '{"execution_id":"does-not-exist","ts":%s}' "$now_ms" | base64 -w0 2>/dev/null || printf '{"execution_id":"does-not-exist","ts":%s}' "$now_ms" | base64)
 
@@ -852,4 +856,3 @@ case "${1:-all}" in
 esac
 
 log_success "All tests completed!"
-

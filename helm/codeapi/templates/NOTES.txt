@@ -12,10 +12,15 @@ API Service:
 {{- end }}
 
 {{- if .Values.workerSandbox.enabled }}
-Worker-Sandbox:
+Service Worker + Sandbox Runner:
   Replicas: {{ .Values.workerSandbox.replicaCount }}
   Python Concurrency: {{ .Values.workerSandbox.config.pythonConcurrency }} per pod
   Total Capacity: {{ mul .Values.workerSandbox.replicaCount .Values.workerSandbox.config.pythonConcurrency }} concurrent Python jobs
+{{- end }}
+
+{{- if .Values.egressGateway.enabled }}
+Egress Gateway:
+  Replicas: {{ .Values.egressGateway.replicaCount }}
 {{- end }}
 
 {{- if .Values.fileServer.enabled }}
@@ -54,8 +59,9 @@ Then access at:
 Scale API pods (for more HTTP capacity):
   kubectl scale deployment/{{ include "codeapi.fullname" . }}-api --replicas=5
 
-Scale Worker-Sandbox pods (for more execution capacity):
-  kubectl scale deployment/{{ include "codeapi.fullname" . }}-worker-sandbox --replicas=10
+Scale execution pods:
+  kubectl scale deployment/{{ include "codeapi.fullname" . }}-service-worker --replicas=10
+  kubectl scale deployment/{{ include "codeapi.fullname" . }}-sandbox-runner --replicas=10
 
 Or upgrade the release:
   helm upgrade {{ .Release.Name }} ./helm/codeapi --set workerSandbox.replicaCount=10
@@ -70,6 +76,8 @@ View pods:
 
 View logs:
   kubectl logs -l app.kubernetes.io/component=api -f
-  kubectl logs -l app.kubernetes.io/component=worker-sandbox -f
+  kubectl logs -l app.kubernetes.io/component=service-worker -f
+  kubectl logs -l app.kubernetes.io/component=sandbox-runner -f
+  kubectl logs -l app.kubernetes.io/component=egress-gateway -f
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
