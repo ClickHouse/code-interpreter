@@ -24,14 +24,16 @@ FROM buildpack-deps:bookworm AS nsjail-builder
 
 WORKDIR /nsjail
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
     bison \
     flex \
     libprotobuf-dev \
     libnl-route-3-dev \
     protobuf-compiler \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    pkg-config
 
 RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
     && git checkout dccf911fd2659e7b08ce9507c25b2b38ec2c5800
@@ -72,8 +74,10 @@ FROM oven/bun:1.3.13-debian AS sandbox-rootfs
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
     coreutils \
     util-linux \
     locales \
@@ -87,7 +91,6 @@ RUN apt-get update && \
     libprotobuf32 \
     libffi8 \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
     && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
@@ -112,6 +115,7 @@ RUN mkdir -p /pkgs /tmp/sandbox
 RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
 RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
          /usr/bin/perl* /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg \
+         /usr/local/bin/apt-install \
          /usr/sbin/adduser /usr/sbin/useradd /usr/sbin/usermod \
          /usr/sbin/groupadd /usr/sbin/groupmod \
          /usr/bin/su \

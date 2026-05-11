@@ -10,15 +10,16 @@ FROM buildpack-deps:bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
     curl unzip wget ca-certificates \
     build-essential libssl-dev libffi-dev libsqlite3-dev \
     zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
     tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
     libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
-    libfreetype6-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libfreetype6-dev
 
 RUN mkdir -p /pkgs
 
