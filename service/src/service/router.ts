@@ -208,8 +208,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
       executionManifestClaims: sandboxSecurity.executionManifestClaims,
       egressGrantClaims: sandboxSecurity.egressGrantClaims,
-      egressGrantToken: sandboxSecurity.egressGrantToken,
-      SANDBOX_ENDPOINT: env.SANDBOX_ENDPOINT
+      egressGrantToken: sandboxSecurity.egressGrantToken
     }, {
       removeOnComplete: {
         age: 60,

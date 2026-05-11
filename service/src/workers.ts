@@ -87,7 +87,7 @@ async function completeJob(job: t.ExecuteJob): Promise<void> {
 }
 
 async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
-  const { code, payload, isPyPlot, SANDBOX_ENDPOINT } = job.data;
+  const { code, payload, isPyPlot } = job.data;
   const language = payload?.language ?? 'unknown';
   const endTimer = jobProcessingDuration.startTimer({ language });
   activeJobs.inc({ language });
@@ -130,7 +130,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     egressGrantTokenForRestore = egressGrantToken;
 
     const response = await axios.post<SandboxLogResponse>(
-      `${SANDBOX_ENDPOINT}/${Jobs.execute}`,
+      `${env.SANDBOX_ENDPOINT}/${Jobs.execute}`,
       sandboxRequest.body,
       {
         headers: sandboxRequest.headers,

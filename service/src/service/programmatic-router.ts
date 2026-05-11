@@ -405,7 +405,6 @@ async function runReplayIteration(
     executionManifestClaims: sandboxSecurity.executionManifestClaims,
     egressGrantClaims: sandboxSecurity.egressGrantClaims,
     egressGrantToken: sandboxSecurity.egressGrantToken,
-    SANDBOX_ENDPOINT: env.SANDBOX_ENDPOINT,
   }, {
     removeOnComplete: { age: 60, count: 1 },
     removeOnFail: { age: 180, count: 1 },
@@ -1349,7 +1348,6 @@ async function handleBlocking(
       executionManifestClaims: sandboxSecurity.executionManifestClaims,
       egressGrantClaims: sandboxSecurity.egressGrantClaims,
       egressGrantToken: sandboxSecurity.egressGrantToken,
-      SANDBOX_ENDPOINT: env.SANDBOX_ENDPOINT,
     }, {
       removeOnComplete: { age: 60, count: 1 },
       removeOnFail: { age: 180, count: 1 },

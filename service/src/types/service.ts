@@ -217,7 +217,6 @@ export type JobData = {
   apiKeyString: string;
   principalSource?: string;
   payload: PayloadBody;
-  SANDBOX_ENDPOINT: string;
   isPyPlot?: boolean;
   executionId?: string;
   tenantId?: string;
