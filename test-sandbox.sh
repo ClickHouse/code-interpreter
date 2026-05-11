@@ -250,6 +250,7 @@ def expect_socket_blocked(name, family, sock_type, proto=0):
 expect_socket_blocked("AF_KEY", getattr(socket, "AF_KEY", 15), socket.SOCK_RAW, 2)
 expect_socket_blocked("AF_NETLINK", socket.AF_NETLINK, socket.SOCK_RAW, 0)
 expect_socket_blocked("AF_RXRPC", getattr(socket, "AF_RXRPC", 33), socket.SOCK_DGRAM, 0)
+expect_socket_blocked("AF_ALG", getattr(socket, "AF_ALG", 38), socket.SOCK_SEQPACKET, 0)
 
 syscalls = {
     "x86_64": {"clone": 56, "clone3": 435, "vmsplice": 278},
@@ -322,6 +323,7 @@ PY
         && [[ "$stdout" == *"AF_KEY=errno:1"* ]] \
         && [[ "$stdout" == *"AF_NETLINK=errno:1"* ]] \
         && [[ "$stdout" == *"AF_RXRPC=errno:1"* ]] \
+        && [[ "$stdout" == *"AF_ALG=errno:1"* ]] \
         && [[ "$stdout" == *"clone_namespace=rc:-1:errno:1"* ]] \
         && [[ "$stdout" == *"clone3=rc:-1:errno:38"* ]] \
         && [[ "$stdout" == *"vmsplice=rc:-1:errno:1"* ]]; then
