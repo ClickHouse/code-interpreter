@@ -1,4 +1,5 @@
 import { config } from './config';
+import { workspaceIsolationConfigErrors } from './workspace-isolation';
 
 export class SandboxSecureStartupError extends Error {
   constructor(message: string) {
@@ -96,5 +97,10 @@ export function validateHardenedSandboxStartup(): void {
   const forbidden = forbiddenEnvNames();
   if (forbidden.length > 0) {
     throw new SandboxSecureStartupError(`Forbidden sandbox-runner env in hardened mode: ${forbidden.join(', ')}`);
+  }
+
+  const workspaceErrors = workspaceIsolationConfigErrors();
+  if (workspaceErrors.length > 0) {
+    throw new SandboxSecureStartupError(workspaceErrors.join('; '));
   }
 }

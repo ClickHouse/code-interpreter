@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 
 #ifndef PR_SET_SPECULATION_CTRL
 #define PR_SET_SPECULATION_CTRL 53
@@ -23,6 +24,8 @@ int main(int argc, char *argv[]) {
 
     prctl(PR_SET_SPECULATION_CTRL, PR_SPEC_STORE_BYPASS, PR_SPEC_FORCE_DISABLE, 0, 0);
     prctl(PR_SET_SPECULATION_CTRL, PR_SPEC_INDIRECT_BRANCH, PR_SPEC_FORCE_DISABLE, 0, 0);
+
+    umask(0077);
 
     execvp(argv[1], &argv[1]);
     perror("exec");

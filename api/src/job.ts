@@ -16,6 +16,18 @@ import { config } from './config';
 import { internalServiceHeaders } from './internal-service-auth';
 import { EGRESS_GRANT_HEADER } from './egress';
 import {
+  applyReadOnlyInputPermissions,
+  applySandboxPathPermissions,
+  applySandboxPathPermissionsNoFollow,
+  cleanupSandboxWorkspace,
+  createSandboxWorkspace,
+  fallbackSandboxIdentity,
+  retainWorkspaceCleanupUntilRemoved,
+  sandboxJobUidPool,
+  type SandboxJobIdentity,
+  type SandboxWorkspaceLease,
+} from './workspace-isolation';
+import {
   DIRKEEP,
   SANDBOX_DIR_MODE,
   SANDBOX_FILE_MODE,
@@ -625,8 +637,22 @@ interface ExecuteResult {
   files: FileRef[];
 }
 
-let remainingJobSpaces = config.max_concurrent_jobs;
 const jobQueue: Array<() => void> = [];
+
+async function acquireJobIdentity(log: Logger): Promise<SandboxJobIdentity> {
+  for (;;) {
+    const identity = sandboxJobUidPool.acquire();
+    if (identity) return identity;
+    log.info('Awaiting job slot');
+    await new Promise<void>(resolve => { jobQueue.push(resolve); });
+  }
+}
+
+function releaseJobIdentity(identity: SandboxJobIdentity): void {
+  sandboxJobUidPool.release(identity);
+  const next = jobQueue.shift();
+  if (next) next();
+}
 
 export class Job {
   uuid: string;
@@ -643,6 +669,8 @@ export class Job {
 
   private log: Logger;
   private submissionDir = '';
+  private workspaceLease: SandboxWorkspaceLease | undefined;
+  private jobIdentity: SandboxJobIdentity | undefined;
   private generatedFiles: GeneratedFile[] = [];
   private sessionFiles: FileRef[] = [];
   private inheritedRefs: FileRef[] = [];
@@ -698,9 +726,11 @@ export class Job {
     this.egressGrantToken = opts.egress_grant;
   }
 
-  async computeFileHash(filePath: string): Promise<string> {
+  async computeFileHash(filePath: string, noFollow = false): Promise<string> {
     const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(filePath);
+    const stream = fs.createReadStream(filePath, noFollow
+      ? { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW }
+      : undefined);
     for await (const chunk of stream) hash.update(chunk as Buffer);
     return hash.digest('hex');
   }
@@ -721,13 +751,24 @@ export class Job {
     return this.generatedFiles.length >= config.max_output_files;
   }
 
+  private sandboxIdentity(): SandboxJobIdentity {
+    return this.jobIdentity ?? fallbackSandboxIdentity();
+  }
+
+  private async applySandboxFilePermissions(filePath: string, noFollow = false): Promise<void> {
+    if (noFollow) {
+      await applySandboxPathPermissionsNoFollow(filePath, this.sandboxIdentity(), SANDBOX_FILE_MODE, 'file');
+      return;
+    }
+    await applySandboxPathPermissions(filePath, this.sandboxIdentity(), SANDBOX_FILE_MODE);
+  }
+
   /**
-   * Chmod every directory between submissionDir (exclusive) and `leaf` (inclusive)
-   * to SANDBOX_DIR_MODE. `mkdir({ recursive: true })` creates ancestors with
-   * umask-derived perms (typically 0755), which blocks the jailed runtime user
-   * from creating siblings/children in those intermediate directories.
+   * Chown/chmod every directory between submissionDir (exclusive) and `leaf`
+   * (inclusive) so the per-job outside UID can create siblings/children while
+   * escaped sibling UIDs cannot traverse the workspace tree.
    */
-  private async chmodAncestors(leaf: string): Promise<void> {
+  private async secureAncestors(leaf: string): Promise<void> {
     const rel = path.relative(this.submissionDir, leaf);
     if (!rel || rel === '..' || rel.startsWith('..' + path.sep)) return;
     const parts = rel.split(path.sep).filter(Boolean);
@@ -738,25 +779,25 @@ export class Job {
        * concurrently. Skip paths we've already chmodded to avoid N*M redundant
        * syscalls (N files × M shared ancestors). */
       if (this.chmoddedDirs.has(cursor)) continue;
-      await fsp.chmod(cursor, SANDBOX_DIR_MODE);
+      await applySandboxPathPermissions(cursor, this.sandboxIdentity(), SANDBOX_DIR_MODE);
       this.chmoddedDirs.add(cursor);
     }
   }
 
   async prime(): Promise<void> {
-    if (remainingJobSpaces < 1) {
-      this.log.info('Awaiting job slot');
-      await new Promise<void>(resolve => { jobQueue.push(resolve); });
-    }
-    remainingJobSpaces--;
+    this.jobIdentity = await acquireJobIdentity(this.log);
+    this.workspaceLease = await createSandboxWorkspace(this.jobIdentity);
+    this.submissionDir = this.workspaceLease.dir;
 
-    const tmpBase = '/tmp/sandbox';
-    await fsp.mkdir(tmpBase, { recursive: true });
-    this.submissionDir = path.join(tmpBase, this.uuid);
-    await fsp.mkdir(this.submissionDir, { recursive: true });
-    await fsp.chmod(this.submissionDir, SANDBOX_DIR_MODE);
-
-    this.log.info({ submissionDir: this.submissionDir }, 'Priming job');
+    this.log.info(
+      {
+        submissionDir: this.submissionDir,
+        workspaceId: this.workspaceLease.workspaceId,
+        uid: this.jobIdentity.uid,
+        gid: this.jobIdentity.gid,
+      },
+      'Priming job',
+    );
 
     if (this.fileEgressBaseUrl() && this.files.some(f => f.id && f.storage_session_id)) {
       await this.autoLoadDirkeep();
@@ -914,7 +955,7 @@ export class Job {
         const finalPath = path.join(this.submissionDir, originalName);
         const finalParent = path.dirname(finalPath);
         await fsp.mkdir(finalParent, { recursive: true });
-        await this.chmodAncestors(finalParent);
+        await this.secureAncestors(finalParent);
 
         const hash = await this.streamToDisk(response, tempPath, finalPath);
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
@@ -925,14 +966,11 @@ export class Job {
           path: finalPath,
           readOnly: readOnly || undefined,
         });
-        /* Defense-in-depth: chmod 444 (read-only for owner+group+other) so
-         * sandboxed code that tries to mutate skill files fails at the
-         * filesystem layer instead of needing the walker to silently drop
-         * the modifications. The sandbox UID (65534) cannot chmod files it
-         * doesn't own back to writable, so this is a one-way seal. */
+        /* Defense-in-depth: keep read-only inputs root-owned + 0444 so the
+         * sandbox UID can read them but cannot chmod them back to writable. */
         if (readOnly) {
           try {
-            await fsp.chmod(finalPath, 0o444);
+            await applyReadOnlyInputPermissions(finalPath);
           } catch (err) {
             this.log.warn({ file: originalName, err }, 'Failed to chmod read-only input');
           }
@@ -1000,7 +1038,7 @@ export class Job {
     const reader = toNodeReadable(body);
     await pipeline(reader, hashTransform, fileStream);
     await fsp.rename(tempPath, finalPath);
-    await fsp.chmod(finalPath, SANDBOX_FILE_MODE);
+    await this.applySandboxFilePermissions(finalPath);
     return hashStream.digest('hex');
   }
 
@@ -1011,9 +1049,9 @@ export class Job {
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
     const parentDir = path.dirname(filePath);
     await fsp.mkdir(parentDir, { recursive: true });
-    await this.chmodAncestors(parentDir);
+    await this.secureAncestors(parentDir);
     await fsp.writeFile(filePath, content);
-    await fsp.chmod(filePath, SANDBOX_FILE_MODE);
+    await this.applySandboxFilePermissions(filePath);
 
     const hash = crypto.createHash('sha256').update(content).digest('hex');
     this.inputFileHashes.set(file.name, { hash, path: filePath });
@@ -1058,6 +1096,7 @@ export class Job {
       outputMaxSize: this.runtime.output_max_size,
       stdin,
       extraPkgdirs,
+      identity: this.sandboxIdentity(),
     });
   }
 
@@ -1282,7 +1321,7 @@ export class Job {
   ): Promise<boolean> {
     if (!keepInfo) return false;
     try {
-      const currentHash = await this.computeFileHash(keepFullPath);
+      const currentHash = await this.computeFileHash(keepFullPath, true);
       return currentHash !== keepInfo.hash;
     } catch (err) {
       this.log.debug({ keepPath, err }, 'walkDir: failed to hash inherited .dirkeep');
@@ -1325,6 +1364,7 @@ export class Job {
     }
     try {
       await fsp.writeFile(keepFullPath, '', { flag: 'wx' });
+      await this.applySandboxFilePermissions(keepFullPath, true);
     } catch (err) {
       this.log.debug({ keepPath, err }, 'walkDir: failed to write .dirkeep marker');
       return { collected: false, truncated: false };
@@ -1440,7 +1480,7 @@ export class Job {
 
     if (inputFileInfo) {
       try {
-        const currentHash = await this.computeFileHash(fullPath);
+        const currentHash = await this.computeFileHash(fullPath, true);
         wasModified = currentHash !== inputFileInfo.hash;
         if (wasModified) this.log.info({ file: relativePath }, 'Input file was modified');
       } catch (err) {
@@ -1460,6 +1500,7 @@ export class Job {
       return { collected: false, truncated: true, stopLoop: true };
     }
 
+    await this.applySandboxFilePermissions(fullPath, true);
     const newId = nanoid();
     const fileData: FileRef = { id: newId, name: relativePath, storage_session_id: this.outputSessionId };
     if (wasModified && inputFileInfo?.originalId && inputFileInfo.originalSessionId) {
@@ -1484,6 +1525,7 @@ export class Job {
     parentDepth: number,
     inputByName: Map<string, TFile>,
   ): Promise<{ collected: boolean; truncated: boolean }> {
+    await applySandboxPathPermissionsNoFollow(fullPath, this.sandboxIdentity(), SANDBOX_DIR_MODE, 'directory');
     const childStatus = await this.walkDir(fullPath, parentDepth + 1, inputByName);
     if (childStatus === 'collected') return { collected: true, truncated: false };
     if (childStatus === 'skipped') return { collected: false, truncated: true };
@@ -1688,26 +1730,38 @@ export class Job {
     const url = `${this.fileEgressBaseUrl()}/sessions/${encodeURIComponent(this.outputSessionId)}/objects/${encodeURIComponent(file.id)}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
-    const stream = fs.createReadStream(file.path);
+    let headers: Record<string, string>;
+    try {
+      headers = this.fileEgressHeaders({
+        /* file-server URL-decodes this header to recover the canonical
+         * filename, so paths with `/` survive transport without colliding
+         * with the `___` separators or RFC 5987 quoting rules used
+         * elsewhere in the protocol. */
+        'X-Original-Filename': encodeURIComponent(file.name),
+        /* file-server stores this Content-Type as object metadata and
+         * serves it back on download, so it has to reflect the real
+         * media type — not a one-size-fits-all `octet-stream`. The
+         * previous multipart path inferred this from the per-part
+         * extension via FormData; we replicate that here. */
+        'Content-Type': mimeTypeFor(file.name),
+        'Content-Length': String(size),
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      this.log.error({ file: file.name, err: error }, 'Error preparing upload');
+      return null;
+    }
+
+    const stream = fs.createReadStream(file.path, { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW });
+    stream.on('error', (error) => {
+      this.log.warn({ file: file.name, err: error }, 'Upload file stream error');
+    });
 
     let response: Response | undefined;
     try {
       response = await fetch(url, {
         method: 'PUT',
-        headers: this.fileEgressHeaders({
-          /* file-server URL-decodes this header to recover the canonical
-           * filename, so paths with `/` survive transport without colliding
-           * with the `___` separators or RFC 5987 quoting rules used
-           * elsewhere in the protocol. */
-          'X-Original-Filename': encodeURIComponent(file.name),
-          /* file-server stores this Content-Type as object metadata and
-           * serves it back on download, so it has to reflect the real
-           * media type — not a one-size-fits-all `octet-stream`. The
-           * previous multipart path inferred this from the per-part
-           * extension via FormData; we replicate that here. */
-          'Content-Type': mimeTypeFor(file.name),
-          'Content-Length': String(size),
-        }),
+        headers,
         /* `Readable.toWeb` adapts the Node stream into a WHATWG
          * `ReadableStream` for fetch's body. The `duplex: 'half'` flag is
          * required by undici/Bun whenever the body is a stream. */
@@ -1745,17 +1799,39 @@ export class Job {
 
   async cleanup(): Promise<void> {
     this.log.info('Cleaning up');
-    remainingJobSpaces++;
-    if (jobQueue.length > 0) {
-      jobQueue.shift()!();
+    let workspaceRemoved = true;
+    const workspaceLease = this.workspaceLease;
+    const jobIdentity = this.jobIdentity;
+
+    if (workspaceLease) {
+      try {
+        workspaceRemoved = await cleanupSandboxWorkspace(workspaceLease);
+      } catch (error) {
+        workspaceRemoved = false;
+        this.log.error({ submissionDir: this.submissionDir, err: error }, 'Failed to clean up');
+      } finally {
+        this.workspaceLease = undefined;
+        this.submissionDir = '';
+      }
     }
 
-    if (this.submissionDir) {
-      try {
-        await fsp.rm(this.submissionDir, { recursive: true, force: true });
-      } catch (error) {
-        this.log.error({ submissionDir: this.submissionDir, err: error }, 'Failed to clean up');
+    if (jobIdentity) {
+      if (!workspaceLease || workspaceRemoved) {
+        releaseJobIdentity(jobIdentity);
+      } else {
+        retainWorkspaceCleanupUntilRemoved(workspaceLease, () => {
+          releaseJobIdentity(jobIdentity);
+          this.log.info(
+            { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
+            'Released retained sandbox job UID slot after workspace cleanup',
+          );
+        });
+        this.log.error(
+          { uid: jobIdentity.uid, gid: jobIdentity.gid, slot: jobIdentity.slot },
+          'Retaining sandbox job UID slot after failed workspace cleanup',
+        );
       }
+      this.jobIdentity = undefined;
     }
   }
 }

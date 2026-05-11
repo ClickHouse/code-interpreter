@@ -11,6 +11,12 @@ const saved = {
   secret: config.execution_manifest_secret,
   fileServer: config.file_server_url,
   port: config.allowed_local_network_port,
+  perJobUids: config.per_job_uids,
+  jobUidCount: config.job_uid_count,
+  maxConcurrentJobs: config.max_concurrent_jobs,
+  jobUidBase: config.job_uid_base,
+  jobGidBase: config.job_gid_base,
+  workspaceReaperMaxAgeSeconds: config.workspace_reaper_max_age_seconds,
 };
 
 function setValidHardenedConfig(): void {
@@ -21,6 +27,12 @@ function setValidHardenedConfig(): void {
   config.execution_manifest_secret = '';
   config.file_server_url = '';
   config.allowed_local_network_port = 3190;
+  config.per_job_uids = true;
+  config.max_concurrent_jobs = 8;
+  config.job_uid_count = 8;
+  config.job_uid_base = 200000;
+  config.job_gid_base = 200000;
+  config.workspace_reaper_max_age_seconds = 3600;
   process.env.CODEAPI_HARDENED_SANDBOX_MODE = 'true';
   process.env.SANDBOX_FORWARD_TARGET = 'egress-gateway:3190';
 }
@@ -37,6 +49,12 @@ function restore(): void {
   config.execution_manifest_secret = saved.secret;
   config.file_server_url = saved.fileServer;
   config.allowed_local_network_port = saved.port;
+  config.per_job_uids = saved.perJobUids;
+  config.job_uid_count = saved.jobUidCount;
+  config.max_concurrent_jobs = saved.maxConcurrentJobs;
+  config.job_uid_base = saved.jobUidBase;
+  config.job_gid_base = saved.jobGidBase;
+  config.workspace_reaper_max_age_seconds = saved.workspaceReaperMaxAgeSeconds;
 }
 
 afterEach(restore);
@@ -111,5 +129,23 @@ describe('hardened sandbox-runner startup config', () => {
     config.execution_manifest_public_key = 'public-key';
     process.env.SANDBOX_FORWARD_TARGET = 'file-server:3000';
     expect(() => validateHardenedSandboxStartup()).toThrow('SANDBOX_FORWARD_TARGET');
+  });
+
+  test('rejects weakened workspace isolation config in hardened mode', () => {
+    setValidHardenedConfig();
+    config.per_job_uids = false;
+    expect(() => validateHardenedSandboxStartup()).toThrow('SANDBOX_PER_JOB_UIDS');
+
+    config.per_job_uids = true;
+    config.job_uid_count = 7;
+    expect(() => validateHardenedSandboxStartup()).toThrow('SANDBOX_JOB_UID_COUNT');
+
+    config.job_uid_count = 8;
+    config.job_uid_base = 1000;
+    expect(() => validateHardenedSandboxStartup()).toThrow('SANDBOX_JOB_UID_BASE');
+
+    config.job_uid_base = 200000;
+    config.workspace_reaper_max_age_seconds = 10;
+    expect(() => validateHardenedSandboxStartup()).toThrow('SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS');
   });
 });

@@ -17,6 +17,8 @@ fi
 
 # Create directories needed by NsJail
 mkdir -p /tmp/sandbox
+chown 0:0 /tmp/sandbox 2>/dev/null || true
+chmod 711 /tmp/sandbox
 
 # Mount virtiofs shares if running inside a libkrun microVM.
 # The launcher exposes host directories as virtiofs tags that need explicit mounting.
@@ -101,7 +103,9 @@ fi
 # SANDBOX_ALLOWED_LOCAL_NETWORK_PORT restricts sandbox to only connect to localhost:port
 ALLOWED_PORT="${SANDBOX_ALLOWED_LOCAL_NETWORK_PORT:-0}"
 
-# NsJail runs sandboxed processes as UID 65534 (nobody)
+# NsJail runs sandboxed processes as inside UID 65534 (nobody), mapped to a
+# per-job outside UID by the sandbox API. The proxy socket remains mounted
+# into each jail, so it does not need per-UID ownership.
 SANDBOX_UID=65534
 
 # Extract API port from bind address (default 2000)
@@ -204,7 +208,24 @@ fi
 # NsJail smoke test: verify sandbox can start before accepting traffic.
 echo "Running NsJail smoke test..."
 SMOKE_DIR=$(mktemp -d)
-chmod 777 "$SMOKE_DIR"
+SMOKE_PER_JOB_UIDS="${SANDBOX_PER_JOB_UIDS:-true}"
+SMOKE_UID_BASE="${SANDBOX_JOB_UID_BASE:-200000}"
+SMOKE_GID_BASE="${SANDBOX_JOB_GID_BASE:-200000}"
+if [ "$SMOKE_PER_JOB_UIDS" = "true" ]; then
+    SMOKE_OUTSIDE_UID="$SMOKE_UID_BASE"
+    SMOKE_OUTSIDE_GID="$SMOKE_GID_BASE"
+else
+    SMOKE_OUTSIDE_UID=65534
+    SMOKE_OUTSIDE_GID=65534
+fi
+	if chown "$SMOKE_OUTSIDE_UID:$SMOKE_OUTSIDE_GID" "$SMOKE_DIR"; then
+	    chmod 711 "$SMOKE_DIR"
+	elif [ "$SMOKE_PER_JOB_UIDS" = "true" ]; then
+	    echo "NsJail smoke test setup failed: SANDBOX_PER_JOB_UIDS=true requires chown support" >&2
+	    exit 1
+	else
+	    chmod 777 "$SMOKE_DIR"
+	fi
 SMOKE_LOG=$(mktemp)
 
 NSJAIL_CGROUP_ARGS=()
@@ -214,9 +235,10 @@ fi
 
 if timeout 10 /usr/sbin/nsjail --config "${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}" \
     "${NSJAIL_CGROUP_ARGS[@]}" --log "$SMOKE_LOG" \
+    --user "65534:${SMOKE_OUTSIDE_UID}:1" --group "65534:${SMOKE_OUTSIDE_GID}:1" \
     -s /usr/bin:/bin -s /usr/lib:/lib -s /usr/lib64:/lib64 \
     -B "$SMOKE_DIR:/mnt/data" \
-    -- /usr/bin/echo "sandbox_ok" > /dev/null 2>&1; then
+    -- /bin/sh -c 'printf "%s\n" sandbox_ok > /mnt/data/smoke.txt && test "$(cat /mnt/data/smoke.txt)" = sandbox_ok' > /dev/null 2>&1; then
     echo "NsJail smoke test passed"
 else
     echo "FATAL: NsJail smoke test failed — sandbox cannot start"

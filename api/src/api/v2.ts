@@ -197,7 +197,9 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
     await job.cleanup();
   };
 
-  req.on('close', () => { cleanupHandler().catch(err => logger.error({ err }, 'Cleanup handler error')); });
+  /* Keep cleanup owned by the route `finally`. Request/response close events
+   * can fire while NsJail is still running; releasing a per-job UID before
+   * the child exits would let another job reuse that UID concurrently. */
 
   if (config.require_execution_manifest) {
     try {

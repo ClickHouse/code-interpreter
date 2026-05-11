@@ -4,17 +4,16 @@ import { config } from './config';
 export const DIRKEEP = '.dirkeep';
 
 /**
- * Sandbox directories must be world-writable so the jailed (nsjail) runtime
- * user — which is uid-mapped and not in our process's groups — can create
- * files inside them during execution.
+ * Sandbox directories are owned by a per-job outside UID/GID and are not
+ * readable by sibling jobs in the runner namespace.
  */
-export const SANDBOX_DIR_MODE = 0o777;
+export const SANDBOX_DIR_MODE = 0o700;
 
 /**
- * Sandbox files must be world-readable/writable so the jailed runtime user
- * can both read inputs and mutate them in place.
+ * Normal sandbox-staged files are owned by the per-job outside UID/GID.
+ * Read-only inputs use a separate root-owned 0444 mode in job.ts.
  */
-export const SANDBOX_FILE_MODE = 0o666;
+export const SANDBOX_FILE_MODE = 0o600;
 
 /** True when `name`'s basename is the .dirkeep sentinel used for empty-directory preservation. */
 export function isDirkeep(name: string): boolean {

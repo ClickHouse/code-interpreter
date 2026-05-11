@@ -151,7 +151,7 @@ workerSandbox:
     pythonConcurrency: 1
     otherConcurrency: 8
     jobWindow: 1000
-    jobTimeout: 300000      # 5 minutes
+    jobTimeout: 25000       # 25 seconds
 
   # Health check port for the worker
   healthPort: 3113
@@ -160,12 +160,20 @@ workerSandbox:
   sandbox:
     port: 2000
     maxProcessCount: 100
-    runCpuTime: 60000
-    runTimeout: 300000
+    runCpuTime: 15000
+    runTimeout: 15000
+    compileCpuTime: 10000
+    compileTimeout: 10000
     outputMaxSize: 65536
     executeBodyLimit: 50mb
     disableNetworking: true
     maxConcurrentJobs: 8
+    perJobUids: true
+    jobUidBase: 200000
+    jobGidBase: 200000
+    # Defaults to maxConcurrentJobs when unset.
+    jobUidCount: null
+    workspaceReaperMaxAgeSeconds: 3600
 
   # Language runtime packages (mount from host or PVC)
   packages:

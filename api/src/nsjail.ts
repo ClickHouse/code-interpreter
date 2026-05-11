@@ -3,6 +3,7 @@ import * as path from 'path';
 import { nanoid } from 'nanoid';
 import { config } from './config';
 import { logger } from './logger';
+import { SANDBOX_INSIDE_GID, SANDBOX_INSIDE_UID, type SandboxJobIdentity } from './workspace-isolation';
 
 export interface NsJailResult {
   stdout: string;
@@ -99,10 +100,11 @@ interface ExecuteOptions {
   outputMaxSize: number;
   stdin?: string;
   extraPkgdirs?: string[];
+  identity: SandboxJobIdentity;
 }
 
 export async function execute(opts: ExecuteOptions): Promise<NsJailResult> {
-  const { command, envVars, submissionDir, pkgdir, timeout, memoryLimit, outputMaxSize, stdin, extraPkgdirs } = opts;
+  const { command, envVars, submissionDir, pkgdir, timeout, memoryLimit, outputMaxSize, stdin, extraPkgdirs, identity } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
 
@@ -115,6 +117,7 @@ export async function execute(opts: ExecuteOptions): Promise<NsJailResult> {
     envVars,
     command,
     extraPkgdirs,
+    identity,
   });
 
   const startTime = Date.now();
@@ -299,10 +302,11 @@ interface BuildArgsOptions {
   envVars: Record<string, string>;
   command: string[];
   extraPkgdirs?: string[];
+  identity: SandboxJobIdentity;
 }
 
-function buildArgs(opts: BuildArgsOptions): string[] {
-  const { logPath, submissionDir, pkgdir, timeout, memoryLimit, envVars, command, extraPkgdirs } = opts;
+export function buildArgs(opts: BuildArgsOptions): string[] {
+  const { logPath, submissionDir, pkgdir, timeout, memoryLimit, envVars, command, extraPkgdirs, identity } = opts;
 
   const timeoutSecs = Math.max(1, Math.ceil(timeout / 1000));
 
@@ -310,6 +314,8 @@ function buildArgs(opts: BuildArgsOptions): string[] {
     '--config', config.nsjail_config,
     '--log', logPath,
     '--seccomp_string', SECCOMP_POLICY,
+    '--user', `${SANDBOX_INSIDE_UID}:${identity.uid}:1`,
+    '--group', `${SANDBOX_INSIDE_GID}:${identity.gid}:1`,
     '-s', '/usr/bin:/bin',
     '-s', '/usr/lib:/lib',
     '-s', '/usr/lib64:/lib64',

@@ -6,6 +6,8 @@ import * as semver from 'semver';
 import { Job, type TFile } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
+import { SANDBOX_DIR_MODE, SANDBOX_FILE_MODE } from './validation';
+import { SANDBOX_READONLY_FILE_MODE, compatibilityModeForSkippedChown } from './workspace-isolation';
 
 /**
  * Integration tests for `Job.downloadAndWriteFile` against a real HTTP
@@ -58,12 +60,21 @@ function makeJob(files: TFile[] = []): Job {
   });
 }
 
+function currentUid(): number | undefined {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+function expectedWritableMode(mode: number): number {
+  return currentUid() === 0 ? mode : compatibilityModeForSkippedChown(mode);
+}
+
 /* Minimal stand-in for the file-server's `GET /sessions/:sid/objects/:id`.
  * Configurable per test via the `routes` map so individual cases can wire
  * different headers / status codes / bodies. */
 type Route = {
   status: number;
   contentDisposition?: string;
+  headers?: Record<string, string>;
   body?: string;
   onRequest?: (req: Request) => void;
 };
@@ -73,10 +84,12 @@ let serverPort = 0;
 const routes = new Map<string, Route>();
 let originalFileServerUrl: string;
 let originalEgressGatewayUrl: string;
+let originalPerJobUids: boolean;
 
 beforeAll(() => {
   originalFileServerUrl = config.file_server_url;
   originalEgressGatewayUrl = config.egress_gateway_url;
+  originalPerJobUids = config.per_job_uids;
   server = Bun.serve({
     port: 0,
     fetch(req) {
@@ -87,6 +100,9 @@ beforeAll(() => {
       const headers = new Headers();
       if (route.contentDisposition) {
         headers.set('content-disposition', route.contentDisposition);
+      }
+      for (const [key, value] of Object.entries(route.headers ?? {})) {
+        headers.set(key, value);
       }
       return new Response(route.body ?? '', { status: route.status, headers });
     },
@@ -100,11 +116,13 @@ beforeAll(() => {
    * listener. `config` is a plain object, not frozen, so direct mutation
    * works — restored in afterAll. */
   (config as { file_server_url: string }).file_server_url = `http://127.0.0.1:${serverPort}`;
+  (config as { per_job_uids: boolean }).per_job_uids = false;
 });
 
 afterAll(() => {
   (config as { file_server_url: string }).file_server_url = originalFileServerUrl;
   (config as { egress_gateway_url: string }).egress_gateway_url = originalEgressGatewayUrl;
+  (config as { per_job_uids: boolean }).per_job_uids = originalPerJobUids;
   server.stop(true);
 });
 
@@ -118,6 +136,7 @@ beforeEach(async () => {
 afterEach(async () => {
   (config as { egress_gateway_url: string }).egress_gateway_url = originalEgressGatewayUrl;
   (config as { file_server_url: string }).file_server_url = `http://127.0.0.1:${serverPort}`;
+  (config as { per_job_uids: boolean }).per_job_uids = false;
   await fsp.rm(tmpDir, { recursive: true, force: true });
 });
 
@@ -149,6 +168,8 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     const expectedFull = path.join(tmpDir, 'proj', 'notes.txt');
     const contents = await fsp.readFile(expectedFull, 'utf8');
     expect(contents).toBe('hello from a nested artifact\n');
+    expect((await fsp.stat(path.dirname(expectedFull))).mode & 0o777).toBe(expectedWritableMode(SANDBOX_DIR_MODE));
+    expect((await fsp.stat(expectedFull)).mode & 0o777).toBe(expectedWritableMode(SANDBOX_FILE_MODE));
   });
 
   it('uses the egress gateway URL and grant header when configured', async () => {
@@ -190,6 +211,28 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     expect(sawGrantHeader).toBe(true);
     expect(sawInternalHeader).toBe(false);
     expect(await fsp.readFile(path.join(tmpDir, 'gateway.txt'), 'utf8')).toBe('gateway bytes');
+  });
+
+  it('keeps read-only downloaded inputs non-writable to the sandbox owner', async () => {
+    const file: TFile = {
+      id: 'readonly-id',
+      storage_session_id: 'prev-session',
+      name: 'readonly.txt',
+    };
+    routes.set(`/sessions/${encodeURIComponent(file.storage_session_id!)}/objects/${encodeURIComponent(file.id!)}`, {
+      status: 200,
+      contentDisposition: 'attachment; filename="readonly.txt"',
+      headers: { 'x-read-only': 'true' },
+      body: 'readonly bytes',
+    });
+
+    const job = makeJob([file]);
+    asInternals(job).submissionDir = tmpDir;
+
+    const writtenName = await job.downloadAndWriteFile(file);
+
+    expect(writtenName).toBe('readonly.txt');
+    expect((await fsp.stat(path.join(tmpDir, 'readonly.txt'))).mode & 0o777).toBe(SANDBOX_READONLY_FILE_MODE);
   });
 
   it('falls back to the legacy filename= form when filename*= is absent', async () => {

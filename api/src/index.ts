@@ -3,10 +3,10 @@ import { loadPackages } from './runtime';
 import { logger } from './logger';
 import { config } from './config';
 import { validateHardenedSandboxStartup } from './secure-startup';
+import { initializeSandboxWorkspaceIsolation, startWorkspaceReaper } from './workspace-isolation';
 import v2Router from './api/v2';
 
 const app = express();
-validateHardenedSandboxStartup();
 
 app.use(express.urlencoded({ extended: true }));
 /** No global `express.json()` is registered here on purpose. A global parser
@@ -56,18 +56,27 @@ app.use((err: HttpError, _req: express.Request, res: express.Response, _next: ex
   return res.status(status).json({ message: err.message || 'Bad request' });
 });
 
-const [address, port] = config.bind_address.split(':');
+async function main(): Promise<void> {
+  validateHardenedSandboxStartup();
+  await initializeSandboxWorkspaceIsolation();
 
-const server = app.listen(Number(port), address, () => {
-  logger.info({ address: config.bind_address }, 'Sandbox API started');
-});
+  const [address, port] = config.bind_address.split(':');
+  const stopWorkspaceReaper = startWorkspaceReaper();
+  const server = app.listen(Number(port), address, () => {
+    logger.info({ address: config.bind_address }, 'Sandbox API started');
+  });
 
-process.on('SIGTERM', () => {
-  server.close();
-  process.exit(0);
-});
+  const shutdown = (): void => {
+    stopWorkspaceReaper();
+    server.close();
+    process.exit(0);
+  };
 
-process.on('SIGINT', () => {
-  server.close();
-  process.exit(0);
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+main().catch((err) => {
+  logger.error({ err }, 'Sandbox API startup failed');
+  process.exit(1);
 });
