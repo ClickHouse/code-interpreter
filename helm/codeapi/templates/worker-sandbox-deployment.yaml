@@ -21,6 +21,22 @@ Split runtime deployments:
 {{- fail (printf "workerSandbox.sandboxExtraEnv may not set sensitive/control-plane env var %s; sandbox-runner must only receive runtime knobs and the chart-managed manifest public verifier" $name) }}
 {{- end }}
 {{- end }}
+{{- $serviceWorkerNodeSelector := .Values.workerSandbox.serviceWorker.nodeSelector }}
+{{- $serviceWorkerAffinity := .Values.workerSandbox.serviceWorker.affinity }}
+{{- $serviceWorkerTolerations := .Values.workerSandbox.serviceWorker.tolerations }}
+{{- if .Values.workerSandbox.serviceWorker.inheritSharedScheduling }}
+{{- $serviceWorkerNodeSelector = default .Values.nodeSelector $serviceWorkerNodeSelector }}
+{{- $serviceWorkerAffinity = default .Values.affinity $serviceWorkerAffinity }}
+{{- $serviceWorkerTolerations = default .Values.tolerations $serviceWorkerTolerations }}
+{{- end }}
+{{- $sandboxRunnerNodeSelector := .Values.workerSandbox.sandboxRunner.nodeSelector }}
+{{- $sandboxRunnerAffinity := .Values.workerSandbox.sandboxRunner.affinity }}
+{{- $sandboxRunnerTolerations := .Values.workerSandbox.sandboxRunner.tolerations }}
+{{- if .Values.workerSandbox.sandboxRunner.inheritSharedScheduling }}
+{{- $sandboxRunnerNodeSelector = default .Values.nodeSelector $sandboxRunnerNodeSelector }}
+{{- $sandboxRunnerAffinity = default .Values.affinity $sandboxRunnerAffinity }}
+{{- $sandboxRunnerTolerations = default .Values.tolerations $sandboxRunnerTolerations }}
+{{- end }}
 {{- if .Values.workerSandbox.serviceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount
@@ -151,15 +167,15 @@ spec:
             limits:
               {{- toYaml . | nindent 14 }}
             {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with $serviceWorkerNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $serviceWorkerAffinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $serviceWorkerTolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -332,15 +348,15 @@ spec:
             path: /dev/kvm
             type: CharDevice
         {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with $sandboxRunnerNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $sandboxRunnerAffinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $sandboxRunnerTolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

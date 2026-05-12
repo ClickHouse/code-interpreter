@@ -4,6 +4,12 @@ Runs as a Helm pre-install/pre-upgrade hook to populate the packages PVC
 with Python, Node, Bun, and Bash runtimes for the NsJail sandbox.
 */}}
 {{- if and .Values.workerSandbox.enabled .Values.workerSandbox.packages.initJob.enabled }}
+{{- $packageInitNodeSelector := .Values.workerSandbox.sandboxRunner.nodeSelector }}
+{{- $packageInitTolerations := .Values.workerSandbox.sandboxRunner.tolerations }}
+{{- if .Values.workerSandbox.sandboxRunner.inheritSharedScheduling }}
+{{- $packageInitNodeSelector = default .Values.nodeSelector $packageInitNodeSelector }}
+{{- $packageInitTolerations = default .Values.tolerations $packageInitTolerations }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -62,11 +68,11 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
-      {{- with .Values.nodeSelector }}
+      {{- with $packageInitNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $packageInitTolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

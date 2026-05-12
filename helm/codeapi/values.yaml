@@ -143,6 +143,21 @@ workerSandbox:
     automountServiceAccountToken: false
     annotations: {}
 
+  # Optional per-deployment scheduling. Empty values fall back to the chart-wide
+  # nodeSelector/tolerations/affinity below. Use sandboxRunner to place only the
+  # untrusted-code tier on KVM-capable nodes.
+  serviceWorker:
+    inheritSharedScheduling: true
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
+  sandboxRunner:
+    inheritSharedScheduling: true
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
   # Worker configuration
   config:
     # Throughput-mode defaults for launcher.vcpus=2. Bash/Node/Bun and
