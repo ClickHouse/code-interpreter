@@ -1,3 +1,11 @@
+{{- $serviceWorkerReplicas := .Values.workerSandbox.replicaCount }}
+{{- if ne .Values.workerSandbox.serviceWorker.replicaCount nil }}
+{{- $serviceWorkerReplicas = .Values.workerSandbox.serviceWorker.replicaCount }}
+{{- end }}
+{{- $sandboxRunnerReplicas := .Values.workerSandbox.replicaCount }}
+{{- if ne .Values.workerSandbox.sandboxRunner.replicaCount nil }}
+{{- $sandboxRunnerReplicas = .Values.workerSandbox.sandboxRunner.replicaCount }}
+{{- end }}
 🚀 Code Interpreter API has been deployed!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -13,9 +21,11 @@ API Service:
 
 {{- if .Values.workerSandbox.enabled }}
 Service Worker + Sandbox Runner:
-  Replicas: {{ .Values.workerSandbox.replicaCount }}
+  Service Worker Replicas: {{ $serviceWorkerReplicas }}
+  Sandbox Runner Replicas: {{ $sandboxRunnerReplicas }}
   Python Concurrency: {{ .Values.workerSandbox.config.pythonConcurrency }} per pod
-  Total Capacity: {{ mul .Values.workerSandbox.replicaCount .Values.workerSandbox.config.pythonConcurrency }} concurrent Python jobs
+  Total Direct Python Queue Capacity: {{ mul ($serviceWorkerReplicas | int) .Values.workerSandbox.config.pythonConcurrency }} worker slots
+  Total Sandbox Capacity: {{ mul ($sandboxRunnerReplicas | int) (.Values.workerSandbox.sandbox.maxConcurrentJobs | default (mul (.Values.workerSandbox.launcher.vcpus | default 2) 4) | int) }} sandbox jobs
 {{- end }}
 
 {{- if .Values.egressGateway.enabled }}
@@ -60,11 +70,12 @@ Scale API pods (for more HTTP capacity):
   kubectl scale deployment/{{ include "codeapi.fullname" . }}-api --replicas=5
 
 Scale execution pods:
-  kubectl scale deployment/{{ include "codeapi.fullname" . }}-service-worker --replicas=10
   kubectl scale deployment/{{ include "codeapi.fullname" . }}-sandbox-runner --replicas=10
 
 Or upgrade the release:
-  helm upgrade {{ .Release.Name }} ./helm/codeapi --set workerSandbox.replicaCount=10
+  helm upgrade {{ .Release.Name }} ./helm/codeapi \
+    --set workerSandbox.serviceWorker.replicaCount=2 \
+    --set workerSandbox.sandboxRunner.replicaCount=10
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

@@ -18,10 +18,6 @@ api:
 
 workerSandbox:
   replicaCount: 3
-  image:
-    repository: codeapi-worker-sandbox
-    tag: latest
-    pullPolicy: Never
   workerImage:
     repository: codeapi-worker
     tag: latest

@@ -3,7 +3,7 @@
 # This file contains default values. Override them with:
 #   helm install codeapi ./helm/codeapi -f my-values.yaml
 # Or inline:
-#   helm install codeapi ./helm/codeapi --set workerSandbox.replicas=5
+#   helm install codeapi ./helm/codeapi --set workerSandbox.sandboxRunner.replicaCount=5
 
 # =============================================================================
 # GLOBAL SETTINGS
@@ -97,11 +97,6 @@ workerSandbox:
   enabled: true
   replicaCount: 3
 
-  image:
-    repository: codeapi-worker-sandbox
-    tag: latest
-    pullPolicy: IfNotPresent
-
   workerImage:
     repository: codeapi-worker
     tag: latest
@@ -147,16 +142,27 @@ workerSandbox:
   # nodeSelector/tolerations/affinity below. Use sandboxRunner to place only the
   # untrusted-code tier on KVM-capable nodes.
   serviceWorker:
+    # Defaults to workerSandbox.replicaCount when unset.
+    # Keep this as fixed HA capacity; scale sandboxRunner for execution throughput.
+    replicaCount: null
     inheritSharedScheduling: true
     nodeSelector: {}
     tolerations: []
     affinity: {}
 
   sandboxRunner:
+    # Defaults to workerSandbox.replicaCount when unset.
+    replicaCount: null
     inheritSharedScheduling: true
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 20
+      targetCPUUtilizationPercentage: 70
+      targetMemoryUtilizationPercentage: 80
 
   # Worker configuration
   config:
@@ -234,24 +240,6 @@ workerSandbox:
   # SANDBOX_LOG_LEVEL. Secret/token-like names are rejected by template
   # validation; the manifest public verifier is chart-managed.
   sandboxExtraEnv: []
-
-  # Horizontal Pod Autoscaler
-  # NOTE: Custom metrics require KEDA or Prometheus Adapter to be installed.
-  # Without these, HPA will fail to scale based on queue depth.
-  # See: https://keda.sh/docs/latest/scalers/redis-lists/
-  autoscaling:
-    enabled: false
-    minReplicas: 3
-    maxReplicas: 20
-    # Custom metric for queue depth
-    metrics:
-      - type: External
-        external:
-          metric:
-            name: bullmq_python_queue_waiting
-          target:
-            type: AverageValue
-            averageValue: "10"
 
 # =============================================================================
 # FILE SERVER (S3/MinIO integration, stateless)

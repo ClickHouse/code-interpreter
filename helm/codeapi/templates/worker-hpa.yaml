@@ -1,0 +1,30 @@
+{{- if .Values.workerSandbox.enabled }}
+{{- if .Values.workerSandbox.sandboxRunner.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "codeapi.fullname" . }}-sandbox-runner
+  labels:
+    {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "codeapi.fullname" . }}-sandbox-runner
+  minReplicas: {{ .Values.workerSandbox.sandboxRunner.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.workerSandbox.sandboxRunner.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workerSandbox.sandboxRunner.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workerSandbox.sandboxRunner.autoscaling.targetMemoryUtilizationPercentage }}
+{{- end }}
+{{- end }}

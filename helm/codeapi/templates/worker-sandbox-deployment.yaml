@@ -7,6 +7,10 @@ Split runtime deployments:
 {{- fail "workerSandbox.enabled requires egressGateway.enabled=true because sandbox-runner may only egress to the egress gateway" }}
 {{- end }}
 {{- if .Values.workerSandbox.enabled }}
+{{- $legacyAutoscaling := default dict .Values.workerSandbox.autoscaling }}
+{{- if get $legacyAutoscaling "enabled" }}
+{{- fail "workerSandbox.autoscaling.enabled was replaced by workerSandbox.sandboxRunner.autoscaling.enabled; move autoscaling settings under workerSandbox.sandboxRunner.autoscaling" }}
+{{- end }}
 {{- $serviceWorkerServiceAccount := .Values.workerSandbox.serviceAccount.name | default (printf "%s-service-worker" (include "codeapi.fullname" .)) }}
 {{- $sandboxRunnerServiceAccount := .Values.workerSandbox.sandboxServiceAccount.name | default (printf "%s-sandbox-runner" (include "codeapi.fullname" .)) }}
 {{- if not .Values.executionManifest.privateKey }}
@@ -32,6 +36,14 @@ Split runtime deployments:
 {{- $sandboxRunnerNodeSelector := .Values.workerSandbox.sandboxRunner.nodeSelector }}
 {{- $sandboxRunnerAffinity := .Values.workerSandbox.sandboxRunner.affinity }}
 {{- $sandboxRunnerTolerations := .Values.workerSandbox.sandboxRunner.tolerations }}
+{{- $serviceWorkerReplicas := .Values.workerSandbox.replicaCount }}
+{{- if ne .Values.workerSandbox.serviceWorker.replicaCount nil }}
+{{- $serviceWorkerReplicas = .Values.workerSandbox.serviceWorker.replicaCount }}
+{{- end }}
+{{- $sandboxRunnerReplicas := .Values.workerSandbox.replicaCount }}
+{{- if ne .Values.workerSandbox.sandboxRunner.replicaCount nil }}
+{{- $sandboxRunnerReplicas = .Values.workerSandbox.sandboxRunner.replicaCount }}
+{{- end }}
 {{- if .Values.workerSandbox.sandboxRunner.inheritSharedScheduling }}
 {{- $sandboxRunnerNodeSelector = default .Values.nodeSelector $sandboxRunnerNodeSelector }}
 {{- $sandboxRunnerAffinity = default .Values.affinity $sandboxRunnerAffinity }}
@@ -71,9 +83,7 @@ metadata:
   labels:
     {{- include "codeapi.serviceWorker.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.workerSandbox.autoscaling.enabled }}
-  replicas: {{ .Values.workerSandbox.replicaCount }}
-  {{- end }}
+  replicas: {{ $serviceWorkerReplicas }}
   selector:
     matchLabels:
       {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 6 }}
@@ -187,8 +197,8 @@ metadata:
   labels:
     {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.workerSandbox.autoscaling.enabled }}
-  replicas: {{ .Values.workerSandbox.replicaCount }}
+  {{- if not .Values.workerSandbox.sandboxRunner.autoscaling.enabled }}
+  replicas: {{ $sandboxRunnerReplicas }}
   {{- end }}
   selector:
     matchLabels:

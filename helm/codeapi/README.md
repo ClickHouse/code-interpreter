@@ -24,7 +24,8 @@ eval $(minikube docker-env)
 # Build all images
 cd services/codeapi
 docker build -t codeapi-api:latest -f service/Dockerfile.api service/
-docker build -t codeapi-worker-sandbox:latest -f docker/Dockerfile.worker-sandbox .
+docker build -t codeapi-worker:latest -f service/Dockerfile.worker service/
+docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
 docker build -t codeapi-file-server:latest -f service/Dockerfile --target production service/
 docker build -t codeapi-tool-call-server:latest -f service/Dockerfile.tool-call-server --target production service/
 docker build -t codeapi-package-init:latest -f docker/Dockerfile.package-init .
@@ -75,7 +76,7 @@ kubectl run pvc-populator --image=alpine --command -- sleep 3600 \
 kubectl wait --for=condition=ready pod/pvc-populator --timeout=60s
 kubectl cp ./data/pkgs/. pvc-populator:/packages/
 kubectl delete pod pvc-populator
-kubectl rollout restart deployment/codeapi-worker-sandbox
+kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
 
 ### 5. Access the API
@@ -110,8 +111,8 @@ kubectl get pods
 
 # View logs
 kubectl logs deployment/codeapi-api
-kubectl logs deployment/codeapi-worker-sandbox --container worker
-kubectl logs deployment/codeapi-worker-sandbox --container sandbox
+kubectl logs deployment/codeapi-service-worker
+kubectl logs deployment/codeapi-sandbox-runner
 
 # Describe pod (for debugging)
 kubectl describe pod <pod-name>
@@ -119,22 +120,24 @@ kubectl describe pod <pod-name>
 
 ### Scaling
 ```bash
-# Scale worker-sandbox pods
-kubectl scale deployment/codeapi-worker-sandbox --replicas=10
+# Scale the sandbox execution tier
+kubectl scale deployment/codeapi-sandbox-runner --replicas=10
 
 # Or via Helm upgrade
 helm upgrade codeapi ./helm/codeapi -f ./helm/codeapi/values-local.yaml \
-  --set workerSandbox.replicaCount=10
+  --set workerSandbox.sandboxRunner.replicaCount=10
 ```
 
 ### Update After Code Changes
 ```bash
-# Rebuild image (must be in minikube docker env)
+# Rebuild images (must be in minikube docker env)
 eval $(minikube docker-env)
-docker build -t codeapi-worker-sandbox:latest -f docker/Dockerfile.worker-sandbox .
+docker build -t codeapi-worker:latest -f service/Dockerfile.worker service/
+docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
 
-# Restart deployment to pick up new image
-kubectl rollout restart deployment/codeapi-worker-sandbox
+# Restart deployments to pick up new images
+kubectl rollout restart deployment/codeapi-service-worker
+kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
 
 ### Teardown
@@ -169,8 +172,8 @@ curl -X POST http://localhost:3112/v1/exec \
 
 ### Verify Horizontal Scaling
 ```bash
-# Check which worker processed the job
-kubectl logs deployment/codeapi-worker-sandbox --container worker --tail=5
+# Check which service-worker processed the job
+kubectl logs deployment/codeapi-service-worker --tail=5
 
 # Each pod has a unique ID - jobs are distributed across all workers
 ```
@@ -213,10 +216,10 @@ kubectl logs deployment/codeapi-worker-sandbox --container worker --tail=5
 |  +---------------------------------------------------------------+   |
 |  |              PersistentVolume (Packages)                       |   |
 |  |  /pkgs - Python, Node, Bun runtimes                            |   |
-|  |  ReadOnlyMany - shared across all worker-sandbox pods          |   |
+|  |  ReadOnlyMany - shared across all sandbox-runner pods          |   |
 |  +---------------------------------------------------------------+   |
 |                                                                      |
-|  Total capacity: 3 pods x 8 other-queue concurrency = 24 jobs        |
+|  Total sandbox capacity: 3 pods x 8 concurrent jobs = 24 jobs        |
 +----------------------------------------------------------------------+
 ```
 
@@ -248,8 +251,8 @@ kubectl logs job/codeapi-package-init
 # Force a rebuild:
 helm upgrade codeapi . --set workerSandbox.packages.initJob.forceRebuild=true
 
-# Then restart worker-sandbox pods
-kubectl rollout restart deployment/codeapi-worker-sandbox
+# Then restart sandbox-runner pods
+kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
 
 ### Connection refused on port 3112
@@ -290,7 +293,7 @@ Chart v0.2.0 replaces the Piston/isolate sandbox engine with NsJail. This is a b
 
 ### Upgrade steps
 
-1. Rebuild the `codeapi-worker-sandbox` Docker image with the new Dockerfile
+1. Rebuild the `codeapi-sandbox-runner` Docker image with the new Dockerfile
 2. Run `helm upgrade codeapi ./helm/codeapi -f values.yaml` -- the template now emits `SANDBOX_*` env vars automatically
 3. No changes to language packages, Redis, MinIO, or the service layer are required
 
