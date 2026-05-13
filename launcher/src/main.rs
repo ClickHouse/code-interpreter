@@ -23,6 +23,7 @@ mod ffi {
             argv: *const *const c_char,
             envp: *const *const c_char,
         ) -> i32;
+        pub fn krun_set_rlimits(ctx_id: u32, rlimits: *const *const c_char) -> i32;
         pub fn krun_start_enter(ctx_id: u32) -> i32;
     }
 
@@ -354,6 +355,15 @@ fn raise_nofile_limit(target: libc::rlim_t) {
     );
 }
 
+fn guest_nofile_rlimit(limit: libc::rlim_t) -> CString {
+    cstr(&format!(
+        "{}={}:{}",
+        libc::RLIMIT_NOFILE,
+        limit,
+        limit
+    ))
+}
+
 fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
     const ALLOW_EXACT: &[&str] = &[
         "CODEAPI_HARDENED_SANDBOX_MODE",
@@ -471,6 +481,9 @@ fn main() {
     let argv_strs: Vec<CString> = vec![cstr(&exec_path)];
     let argv_ptrs = null_term(&argv_strs);
 
+    let rlimit_strs: Vec<CString> = vec![guest_nofile_rlimit(nofile_target)];
+    let rlimit_ptrs = null_term(&rlimit_strs);
+
     let packages_host = env::var("LAUNCHER_PACKAGES_HOST")
         .unwrap_or_else(|_| "/host-packages".into());
 
@@ -501,6 +514,8 @@ fn main() {
             "set_exec",
             ffi::krun_set_exec(ctx, exec_c.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()),
         );
+        ffi::check("set_rlimits", ffi::krun_set_rlimits(ctx, rlimit_ptrs.as_ptr()));
+        eprintln!("[launcher] Guest RLIMIT_NOFILE target: {nofile_target}");
 
         match seccomp::apply_vmm_filter() {
             Ok(n) => eprintln!("[launcher] VMM seccomp filter applied ({n} syscalls allowed, ioctl restricted to KVM+terminal)"),
@@ -519,7 +534,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{desired_nofile_soft_limit, is_allowed_guest_env_key};
+    use super::{desired_nofile_soft_limit, guest_nofile_rlimit, is_allowed_guest_env_key};
 
     #[test]
     fn guest_env_allowlist_blocks_control_plane_and_secret_vars() {
@@ -582,5 +597,10 @@ mod tests {
     #[test]
     fn nofile_limit_leaves_sufficient_soft_limit_unchanged() {
         assert_eq!(desired_nofile_soft_limit(65_536, 1_048_576, 65_536), None);
+    }
+
+    #[test]
+    fn guest_nofile_rlimit_uses_numeric_resource_format() {
+        assert_eq!(guest_nofile_rlimit(65_536).to_str().unwrap(), "7=65536:65536");
     }
 }
