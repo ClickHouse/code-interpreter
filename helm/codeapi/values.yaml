@@ -112,6 +112,16 @@ workerSandbox:
   # Override to false until the node group has nested virtualisation enabled.
   kvmEnabled: true
 
+  # KVM device group ID for legacy hostPath mode.
+  kvmGid: 108
+
+  # Optional Kubernetes device-plugin path for non-privileged KVM access. The
+  # device plugin should be deployed separately; this chart only requests its
+  # extended resource for sandbox-runner.
+  kvmDevicePlugin:
+    enabled: false
+    resourceName: devices.clickhouse.com/kvm
+
   # MicroVM launcher configuration (only used when kvmEnabled: true)
   launcher:
     vcpus: 2

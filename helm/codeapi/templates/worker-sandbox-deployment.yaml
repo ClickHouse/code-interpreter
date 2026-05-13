@@ -49,6 +49,11 @@ Split runtime deployments:
 {{- $sandboxRunnerAffinity = default .Values.affinity $sandboxRunnerAffinity }}
 {{- $sandboxRunnerTolerations = default .Values.tolerations $sandboxRunnerTolerations }}
 {{- end }}
+{{- $useKvmDevicePlugin := and .Values.workerSandbox.kvmEnabled .Values.workerSandbox.kvmDevicePlugin.enabled }}
+{{- $useKvmHostPath := and .Values.workerSandbox.kvmEnabled (not .Values.workerSandbox.kvmDevicePlugin.enabled) }}
+{{- if and $useKvmDevicePlugin (not .Values.workerSandbox.kvmDevicePlugin.resourceName) }}
+{{- fail "workerSandbox.kvmDevicePlugin.resourceName is required when kvmEnabled and kvmDevicePlugin.enabled are true" }}
+{{- end }}
 {{- if .Values.workerSandbox.serviceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount
@@ -216,9 +221,9 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.workerSandbox.kvmEnabled }}
+      {{- if $useKvmHostPath }}
       securityContext:
-        supplementalGroups: [{{ .Values.workerSandbox.kvmGid | default 108 }}]
+        supplementalGroups: [{{ .Values.workerSandbox.kvmGid }}]
       {{- end }}
       containers:
         - name: sandbox-runner
@@ -288,7 +293,7 @@ spec:
             - name: packages
               mountPath: /host-packages
               readOnly: true
-            {{- if .Values.workerSandbox.kvmEnabled }}
+            {{- if $useKvmHostPath }}
             - name: dev-kvm
               mountPath: /dev/kvm
             {{- end }}
@@ -330,13 +335,16 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 10
           resources:
-            requests:
-              cpu: {{ .Values.workerSandbox.resources.requests.cpu }}
-              memory: {{ .Values.workerSandbox.resources.requests.memory }}
-            {{- with .Values.workerSandbox.resources.limits }}
-            limits:
-              {{- toYaml . | nindent 14 }}
+            {{- $sandboxResources := deepCopy .Values.workerSandbox.resources }}
+            {{- if $useKvmDevicePlugin }}
+            {{- $requests := (get $sandboxResources "requests") | default dict }}
+            {{- $limits := (get $sandboxResources "limits") | default dict }}
+            {{- $_ := set $requests .Values.workerSandbox.kvmDevicePlugin.resourceName "1" }}
+            {{- $_ := set $limits .Values.workerSandbox.kvmDevicePlugin.resourceName "1" }}
+            {{- $_ := set $sandboxResources "requests" $requests }}
+            {{- $_ := set $sandboxResources "limits" $limits }}
             {{- end }}
+            {{- toYaml $sandboxResources | nindent 12 }}
       volumes:
         - name: packages
           {{- if .Values.workerSandbox.packages.hostPath }}
@@ -352,7 +360,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
-        {{- if .Values.workerSandbox.kvmEnabled }}
+        {{- if $useKvmHostPath }}
         - name: dev-kvm
           hostPath:
             path: /dev/kvm
