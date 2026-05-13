@@ -20,6 +20,9 @@ const PATH_NORMALIZATIONS: [RegExp, string][] = [
   /** Codeapi file server */
   [/\/sessions\/[^/]+\/objects\/[^/]+/, '/sessions/#id/objects/#id'],
   [/\/sessions\/[^/]+\/objects\/?$/, '/sessions/#id/objects'],
+  /** Codeapi egress gateway internal grants */
+  [/\/internal\/egress-grants\/[^/]+\/restore-result/, '/internal/egress-grants/#id/restore-result'],
+  [/\/internal\/egress-grants\/[^/]+\/revoke/, '/internal/egress-grants/#id/revoke'],
   /** Codeapi API v1 dynamic segments */
   [/\/v1\/download\/[^/]+\/[^/]+/, '/v1/download/#id/#id'],
   [/\/v1\/files\/[^/]+\/[^/]+/, '/v1/files/#id/#id'],

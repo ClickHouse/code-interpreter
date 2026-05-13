@@ -31,6 +31,7 @@ import {
   revokeEgressLedger,
 } from './egress-ledger';
 import { metricsHandler } from './metrics';
+import { httpMetricsMiddleware } from './middleware/httpMetrics';
 import { isValidId } from './utils';
 import logger from './logger';
 import { parseBoundedContentLength } from './http-limits';
@@ -39,6 +40,7 @@ import { validateEgressGatewayHardenedConfig } from './secure-startup';
 export const app: Express = express();
 app.disable('x-powered-by');
 validateEgressGatewayHardenedConfig();
+app.use(httpMetricsMiddleware);
 
 const SUPPORTED_OUTPUT_EXTENSIONS = new Set([
   '.c', '.cs', '.cpp', '.go', '.java', '.js', '.kt', '.kts', '.lua',

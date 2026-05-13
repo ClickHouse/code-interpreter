@@ -4,10 +4,12 @@ import { logger } from './logger';
 import { config } from './config';
 import { validateHardenedSandboxStartup } from './secure-startup';
 import { initializeSandboxWorkspaceIsolation, startWorkspaceReaper } from './workspace-isolation';
+import { httpMetricsMiddleware, metricsHandler } from './metrics';
 import v2Router from './api/v2';
 
 const app = express();
 
+app.use(httpMetricsMiddleware);
 app.use(express.urlencoded({ extended: true }));
 /** No global `express.json()` is registered here on purpose. A global parser
  * runs *before* any route-level middleware, so its limit is the effective
@@ -24,6 +26,7 @@ app.use(express.urlencoded({ extended: true }));
 loadPackages(config.packages_directory);
 
 logger.info('Registering routes');
+app.get('/metrics', metricsHandler);
 app.use('/api/v2', v2Router);
 
 app.get('/', (_req, res) => {

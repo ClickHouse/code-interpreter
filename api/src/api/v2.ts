@@ -8,6 +8,7 @@ import { Job, ValidationError } from '../job';
 import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError } from '../execution-manifest';
 import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 import { EGRESS_GRANT_HEADER } from '../egress';
+import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 
 const router = express.Router();
 
@@ -188,8 +189,12 @@ router.use((req: Request, res: Response, next: NextFunction) => {
  * analyst workflows may send large scripts or replay payloads, while file
  * bytes should still move through the gateway/file path. */
 router.post('/execute', express.json({ limit: config.execute_body_limit }), async (req: Request, res: Response) => {
+  const started = performance.now();
   let job: Job | undefined;
   let cleanedUp = false;
+  let activeExecution = false;
+  let metricsLanguage = 'unknown';
+  let metricsOutcome: Parameters<typeof recordSandboxExecution>[0]['outcome'] = 'execution_error';
 
   const cleanupHandler = async (): Promise<void> => {
     if (!job || cleanedUp) return;
@@ -197,95 +202,119 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
     await job.cleanup();
   };
 
+  const markActiveExecution = (): void => {
+    if (activeExecution) return;
+    activeExecution = true;
+    activeSandboxExecutions.inc();
+  };
+
   /* Keep cleanup owned by the route `finally`. Request/response close events
    * can fire while NsJail is still running; releasing a per-job UID before
    * the child exits would let another job reuse that UID concurrently. */
 
-  if (config.require_execution_manifest) {
-    try {
-      verifyExecuteRequestManifest({
-        headerValue: tokenFromBodyOrHeader(req.body, 'execution_manifest', req.header(EXECUTION_MANIFEST_HEADER)),
-        publicKey: config.execution_manifest_public_key,
-        secret: config.execution_manifest_secret,
-        body: req.body,
-      });
-    } catch (error) {
-      if (error instanceof ExecutionManifestError) {
-        const status = manifestErrorStatus(error);
-        logger.warn({ reason: error.reason, status }, 'Rejected sandbox request by execution manifest');
-        return res.status(status).json({ message: error.message });
-      }
-      logger.error({ err: error }, 'Execution manifest validation failed unexpectedly');
-      return res.status(500).json({ message: 'Execution manifest validation failed' });
-    }
-  }
-
   try {
-    job = getJob(
-      req.body,
-      tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
-    );
-  } catch (error) {
-    /** Validation paths in `getJob`/`sanitizeEnvVars` may throw either
-     * plain `{ message }` objects (the historical shape used by the
-     * inline validators above) or proper `Error` instances (used by
-     * `sanitizeEnvVars` so callers get a real stack trace and can do
-     * `instanceof Error` checks). `res.json(err)` for an `Error` would
-     * serialize to `{}` because `message` is a non-enumerable property,
-     * dropping the reason on the floor. Normalize both shapes to
-     * `{ message }` so the client always sees why the request was
-     * rejected. */
-    const message = error instanceof Error
-      ? error.message
-      : (error as { message?: unknown })?.message;
-    return res.status(400).json({ message: message || 'Bad request' });
-  }
-
-  try {
-    await job.prime();
-    const result = await job.execute();
-
-    if (result.run === undefined) {
-      result.run = result.compile;
-    }
-
-    if (result.files && result.files.length > 0) {
-      /* Upload returns the set of file IDs that were actually transferred to
-       * the file server. Files we minted IDs for but failed to ship (e.g. the
-       * EFAULT-from-Bun-fetch incident) are pruned from the response so they
-       * never become phantom IDs that the next prime() will hammer with 404
-       * retries before giving up. Inherited refs that were inlined from
-       * autoLoadDirkeep / unchanged inputs have no `path` and are passed
-       * through unchanged — they were never local to upload. */
-      const uploaded = await job.uploadGeneratedFiles()
-        .catch((err) => {
-          logger.error({ job: job!.uuid, err }, 'File upload failed');
-          return new Set<string>();
+    if (config.require_execution_manifest) {
+      try {
+        verifyExecuteRequestManifest({
+          headerValue: tokenFromBodyOrHeader(req.body, 'execution_manifest', req.header(EXECUTION_MANIFEST_HEADER)),
+          publicKey: config.execution_manifest_public_key,
+          secret: config.execution_manifest_secret,
+          body: req.body,
         });
-
-      const generatedIds = new Set(job.getGeneratedFileIds());
-      const before = result.files.length;
-      result.files = result.files.filter(
-        f => !generatedIds.has(f.id) || uploaded.has(f.id),
-      );
-      const dropped = before - result.files.length;
-      if (dropped > 0) {
-        logger.warn(
-          { job: job.uuid, dropped, kept: result.files.length },
-          'Pruned files from response because upload did not reach file_server',
-        );
+      } catch (error) {
+        metricsOutcome = 'manifest_error';
+        if (error instanceof ExecutionManifestError) {
+          const status = manifestErrorStatus(error);
+          logger.warn({ reason: error.reason, status }, 'Rejected sandbox request by execution manifest');
+          return res.status(status).json({ message: error.message });
+        }
+        logger.error({ err: error }, 'Execution manifest validation failed unexpectedly');
+        return res.status(500).json({ message: 'Execution manifest validation failed' });
       }
     }
 
-    return res.status(200).json(result);
-  } catch (error) {
-    if (error instanceof ValidationError) {
-      return res.status(400).json({ message: error.message });
+    try {
+      job = getJob(
+        req.body,
+        tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
+      );
+      metricsLanguage = job.runtime.language;
+      markActiveExecution();
+    } catch (error) {
+      metricsOutcome = 'bad_request';
+      /** Validation paths in `getJob`/`sanitizeEnvVars` may throw either
+       * plain `{ message }` objects (the historical shape used by the
+       * inline validators above) or proper `Error` instances (used by
+       * `sanitizeEnvVars` so callers get a real stack trace and can do
+       * `instanceof Error` checks). `res.json(err)` for an `Error` would
+       * serialize to `{}` because `message` is a non-enumerable property,
+       * dropping the reason on the floor. Normalize both shapes to
+       * `{ message }` so the client always sees why the request was
+       * rejected. */
+      const message = error instanceof Error
+        ? error.message
+        : (error as { message?: unknown })?.message;
+      return res.status(400).json({ message: message || 'Bad request' });
     }
-    logger.error({ job: job?.uuid, err: error }, 'Error executing job');
-    return res.status(500).send();
+
+    try {
+      await job.prime();
+      const result = await job.execute();
+
+      if (result.run === undefined) {
+        result.run = result.compile;
+      }
+
+      if (result.files && result.files.length > 0) {
+        /* Upload returns the set of file IDs that were actually transferred to
+         * the file server. Files we minted IDs for but failed to ship (e.g. the
+         * EFAULT-from-Bun-fetch incident) are pruned from the response so they
+         * never become phantom IDs that the next prime() will hammer with 404
+         * retries before giving up. Inherited refs that were inlined from
+         * autoLoadDirkeep / unchanged inputs have no `path` and are passed
+         * through unchanged — they were never local to upload. */
+        const uploaded = await job.uploadGeneratedFiles()
+          .catch((err) => {
+            logger.error({ job: job!.uuid, err }, 'File upload failed');
+            return new Set<string>();
+          });
+
+        const generatedIds = new Set(job.getGeneratedFileIds());
+        const before = result.files.length;
+        result.files = result.files.filter(
+          f => !generatedIds.has(f.id) || uploaded.has(f.id),
+        );
+        const dropped = before - result.files.length;
+        if (dropped > 0) {
+          logger.warn(
+            { job: job.uuid, dropped, kept: result.files.length },
+            'Pruned files from response because upload did not reach file_server',
+          );
+        }
+      }
+
+      metricsOutcome = 'success';
+      return res.status(200).json(result);
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        metricsOutcome = 'validation_error';
+        return res.status(400).json({ message: error.message });
+      }
+      metricsOutcome = 'execution_error';
+      logger.error({ job: job?.uuid, err: error }, 'Error executing job');
+      return res.status(500).send();
+    } finally {
+      await cleanupHandler();
+    }
   } finally {
-    await cleanupHandler();
+    if (activeExecution) {
+      activeSandboxExecutions.dec();
+    }
+    recordSandboxExecution({
+      language: metricsLanguage,
+      outcome: metricsOutcome,
+      durationSeconds: (performance.now() - started) / 1000,
+    });
   }
 });
 
