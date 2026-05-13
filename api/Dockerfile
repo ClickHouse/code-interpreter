@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone -b master --single-branch https://github.com/google/nsjail.git . \
-    && git checkout dccf911fd2659e7b08ce9507c25b2b38ec2c5800
+    && git checkout 66ad78dc361721512fbf9470488e584364c75489 \
+    && git submodule update --init --recursive
 
 RUN make -j$(nproc)
 
@@ -96,7 +97,7 @@ RUN chmod +x ./entrypoint.sh
 # ============================================================================
 # Stage 3: Build the Rust launcher binary (Fedora for libkrun ABI)
 # ============================================================================
-FROM fedora:41 AS launcher-builder
+FROM fedora:43 AS launcher-builder
 
 RUN dnf install -y \
     rust cargo \
@@ -113,7 +114,7 @@ RUN cargo build --release
 # ============================================================================
 # Stage 4: Final launcher image (Fedora for libkrun runtime)
 # ============================================================================
-FROM fedora:41
+FROM fedora:43
 
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \

@@ -115,6 +115,16 @@ workerSandbox:
   # KVM device group ID for legacy hostPath mode.
   kvmGid: 108
 
+  # Custom seccomp profile (defense-in-depth on top of NsJail's inner Kafel
+  # policy). When enabled, pods reference Localhost: profiles/nsjail.json,
+  # which must be pre-installed on every node at
+  # /var/lib/kubelet/seccomp/profiles/nsjail.json - see seccomp/README.md
+  # for the DaemonSet installer pattern. When disabled, KVM-mode pods use
+  # RuntimeDefault (still safer than no profile) and non-KVM-mode pods use
+  # Unconfined (forced by NsJail's pivot_root requirement).
+  seccomp:
+    enabled: false
+
   # Optional Kubernetes device-plugin path for non-privileged KVM access. The
   # device plugin should be deployed separately; this chart only requests its
   # extended resource for sandbox-runner.

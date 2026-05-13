@@ -300,11 +300,25 @@ spec:
           {{- if .Values.workerSandbox.kvmEnabled }}
           securityContext:
             privileged: false
+            {{- if and .Values.workerSandbox.seccomp .Values.workerSandbox.seccomp.enabled }}
+            seccompProfile:
+              type: Localhost
+              localhostProfile: profiles/nsjail.json
+            {{- else }}
+            seccompProfile:
+              type: RuntimeDefault
+            {{- end }}
           {{- else }}
           securityContext:
             privileged: false
+            {{- if and .Values.workerSandbox.seccomp .Values.workerSandbox.seccomp.enabled }}
+            seccompProfile:
+              type: Localhost
+              localhostProfile: profiles/nsjail.json
+            {{- else }}
             seccompProfile:
               type: Unconfined
+            {{- end }}
             capabilities:
               add:
                 - SYS_ADMIN

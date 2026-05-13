@@ -93,7 +93,7 @@ RUN chmod +x ./entrypoint.sh
 # ============================================================================
 # Stage 2: Build the launcher binary on Fedora (libkrun is packaged there)
 # ============================================================================
-FROM fedora:41 AS launcher-builder
+FROM fedora:43 AS launcher-builder
 
 RUN dnf install -y \
     rust cargo \
@@ -110,7 +110,7 @@ RUN cargo build --release
 # ============================================================================
 # Stage 3: Final launcher image (Fedora-based for libkrun ABI compatibility)
 # ============================================================================
-FROM fedora:41
+FROM fedora:43
 
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \

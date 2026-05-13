@@ -36,6 +36,12 @@ data:
       ],
       "syscalls": [
         {
+          "comment": "Allow socket() for every domain except AF_ALG (domain 38). AF_ALG falls through to the profile's defaultAction (SCMP_ACT_ERRNO, EPERM), blocking CVE-2026-31431 (Copy Fail) at the container layer as defense-in-depth - the inner Kafel policy in api/src/nsjail.ts already blocks AF_ALG for user code under nsjail, so this rule's value is covering host-side processes (libkrun, launcher, supervisor, sandbox API) and the no-KVM fallback path. Single rule because libseccomp/runc reject mixing different actions for the same syscall (EEXIST) even when arg filters partition the input space.",
+          "names": ["socket"],
+          "action": "SCMP_ACT_ALLOW",
+          "args": [{"index": 0, "value": 38, "op": "SCMP_CMP_NE"}]
+        },
+        {
           "comment": "Base syscalls - standard operations",
           "names": [
             "accept", "accept4", "access", "alarm", "bind", "brk", "capget", "capset",
@@ -57,7 +63,7 @@ data:
             "gettimeofday", "getuid", "getuid32", "getxattr",
             "inotify_add_watch", "inotify_init", "inotify_init1", "inotify_rm_watch",
             "io_cancel", "io_destroy", "io_getevents", "io_setup", "io_submit",
-            "io_uring_enter", "io_uring_register", "io_uring_setup", "ioctl", "kill",
+            "ioctl", "kill",
             "landlock_add_rule", "landlock_create_ruleset", "landlock_restrict_self",
             "lchown", "lchown32", "lgetxattr", "link", "linkat", "listen",
             "listxattr", "llistxattr", "lremovexattr", "lseek", "lsetxattr", "lstat", "lstat64",
@@ -87,7 +93,7 @@ data:
             "setregid", "setregid32", "setresgid", "setresgid32", "setresuid", "setresuid32",
             "setreuid", "setreuid32", "setrlimit", "setsid", "setsockopt", "setuid", "setuid32", "setxattr",
             "shmat", "shmctl", "shmdt", "shmget", "shutdown", "sigaltstack", "signalfd", "signalfd4",
-            "socket", "socketpair", "splice", "stat", "stat64", "statfs", "statfs64", "statx",
+            "socketpair", "splice", "stat", "stat64", "statfs", "statfs64", "statx",
             "symlink", "symlinkat", "sync", "sync_file_range", "syncfs", "sysinfo", "tee", "tgkill",
             "time", "timer_create", "timer_delete", "timer_getoverrun", "timer_gettime",
             "timer_gettime64", "timer_settime", "timer_settime64",
