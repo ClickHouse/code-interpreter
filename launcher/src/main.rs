@@ -307,6 +307,53 @@ fn null_term(v: &[CString]) -> Vec<*const libc::c_char> {
     ptrs
 }
 
+fn desired_nofile_soft_limit(
+    current_soft: libc::rlim_t,
+    hard: libc::rlim_t,
+    target: libc::rlim_t,
+) -> Option<libc::rlim_t> {
+    let desired = target.min(hard);
+    if current_soft >= desired {
+        None
+    } else {
+        Some(desired)
+    }
+}
+
+fn raise_nofile_limit(target: libc::rlim_t) {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        eprintln!("[launcher] WARNING: getrlimit(RLIMIT_NOFILE) failed");
+        return;
+    }
+    let limit = unsafe { limit.assume_init() };
+
+    let Some(new_soft) = desired_nofile_soft_limit(limit.rlim_cur, limit.rlim_max, target) else {
+        eprintln!(
+            "[launcher] RLIMIT_NOFILE soft={} hard={} target={}",
+            limit.rlim_cur, limit.rlim_max, target
+        );
+        return;
+    };
+
+    let new_limit = libc::rlimit {
+        rlim_cur: new_soft,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit) } != 0 {
+        eprintln!(
+            "[launcher] WARNING: setrlimit(RLIMIT_NOFILE) failed soft={} hard={} target={}",
+            limit.rlim_cur, limit.rlim_max, target
+        );
+        return;
+    }
+
+    eprintln!(
+        "[launcher] Raised RLIMIT_NOFILE soft limit from {} to {} (hard={} target={})",
+        limit.rlim_cur, new_soft, limit.rlim_max, target
+    );
+}
+
 fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
     const ALLOW_EXACT: &[&str] = &[
         "CODEAPI_HARDENED_SANDBOX_MODE",
@@ -396,7 +443,12 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
+    let nofile_target: libc::rlim_t = env::var("LAUNCHER_NOFILE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65_536);
 
+    raise_nofile_limit(nofile_target);
     eprintln!("[launcher] Booting microVM: vcpus={vcpus} ram={ram_mib}MiB rootfs={rootfs}");
     eprintln!("[launcher] Guest entrypoint: {exec_path}");
 
@@ -467,7 +519,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed_guest_env_key;
+    use super::{desired_nofile_soft_limit, is_allowed_guest_env_key};
 
     #[test]
     fn guest_env_allowlist_blocks_control_plane_and_secret_vars() {
@@ -515,5 +567,20 @@ mod tests {
     fn guest_env_allowlist_preserves_legacy_file_server_url_only_without_egress_gateway() {
         assert!(is_allowed_guest_env_key("FILE_SERVER_URL", false));
         assert!(!is_allowed_guest_env_key("FILE_SERVER_URL", true));
+    }
+
+    #[test]
+    fn nofile_limit_raises_soft_limit_to_target() {
+        assert_eq!(desired_nofile_soft_limit(1024, 1_048_576, 65_536), Some(65_536));
+    }
+
+    #[test]
+    fn nofile_limit_respects_hard_limit() {
+        assert_eq!(desired_nofile_soft_limit(1024, 4096, 65_536), Some(4096));
+    }
+
+    #[test]
+    fn nofile_limit_leaves_sufficient_soft_limit_unchanged() {
+        assert_eq!(desired_nofile_soft_limit(65_536, 1_048_576, 65_536), None);
     }
 }

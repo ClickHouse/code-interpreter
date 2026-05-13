@@ -207,6 +207,7 @@ fi
 
 # NsJail smoke test: verify sandbox can start before accepting traffic.
 echo "Running NsJail smoke test..."
+echo "Guest RLIMIT_NOFILE soft limit: $(ulimit -n 2>/dev/null || echo unknown)"
 SMOKE_DIR=$(mktemp -d)
 SMOKE_PER_JOB_UIDS="${SANDBOX_PER_JOB_UIDS:-true}"
 SMOKE_UID_BASE="${SANDBOX_JOB_UID_BASE:-200000}"
