@@ -200,10 +200,10 @@ EOF
     fi
 fi
 
-# Ensure package directories are readable by sandbox UID
-if [ -d "/pkgs" ]; then
-    chmod -R a+rX /pkgs 2>/dev/null || true
-fi
+# Package permissions are finalized by package-init when the PVC is populated.
+# Avoid recursively chmoding /pkgs here: in KVM mode it is a virtio-fs mount,
+# and walking the full package tree at every runner boot can exhaust VMM file
+# descriptors before the sandbox API even starts.
 
 # NsJail smoke test: verify sandbox can start before accepting traffic.
 echo "Running NsJail smoke test..."
