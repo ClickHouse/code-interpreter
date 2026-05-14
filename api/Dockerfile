@@ -174,6 +174,13 @@ RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-s
 EXPOSE 2000/tcp
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
+FROM sandbox-runner-base AS sandbox-runner-baked
+
+COPY --from=sandbox-build / /sandbox-rootfs/
+COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+
 FROM sandbox-runner-base AS sandbox-runner
 
 COPY --from=sandbox-build / /sandbox-rootfs/
@@ -181,10 +188,3 @@ COPY --from=sandbox-build / /sandbox-rootfs/
 RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
 
 RUN mkdir -p /host-packages
-
-FROM sandbox-runner-base AS sandbox-runner-baked
-
-COPY --from=sandbox-build / /sandbox-rootfs/
-COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
-
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
