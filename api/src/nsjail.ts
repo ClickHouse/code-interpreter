@@ -3,6 +3,8 @@ import * as path from 'path';
 import { nanoid } from 'nanoid';
 import { config } from './config';
 import { logger } from './logger';
+import { defaultNsJailSetupGate, type NsJailSetupGate } from './nsjail-setup-gate';
+import { nsjailSetupGateWatchdogFires } from './metrics';
 import { SANDBOX_INSIDE_GID, SANDBOX_INSIDE_UID, type SandboxJobIdentity } from './workspace-isolation';
 
 export interface NsJailResult {
@@ -103,7 +105,7 @@ interface ExecuteOptions {
   identity: SandboxJobIdentity;
 }
 
-export async function execute(opts: ExecuteOptions): Promise<NsJailResult> {
+export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate = defaultNsJailSetupGate): Promise<NsJailResult> {
   const { command, envVars, submissionDir, pkgdir, timeout, memoryLimit, outputMaxSize, stdin, extraPkgdirs, identity } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
@@ -123,16 +125,38 @@ export async function execute(opts: ExecuteOptions): Promise<NsJailResult> {
   const startTime = Date.now();
   const hasStdin = stdin !== undefined && stdin.length > 0;
 
+  /* NsJail's mount-setup phase races on the host-shared `/tmp/nsjail.0.root`
+   * directory when multiple jails launch concurrently in the same pod (root
+   * runner -> orig_uid=0 in NsJail's per-uid setup dir name). The gate
+   * serializes only spawn() -> "Executing" log marker, then releases so the
+   * inner job runs in parallel with siblings. */
   let proc: ReturnType<typeof Bun.spawn>;
+  let markerSeen = false;
+  let pollError: NodeJS.ErrnoException | undefined;
   try {
-    proc = Bun.spawn([config.nsjail_path, ...nsjailArgs], {
-      stdin: hasStdin ? 'pipe' : 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    ({ value: proc, markerSeen, pollError } = await setupGate.runSetup(logPath, () =>
+      Bun.spawn([config.nsjail_path, ...nsjailArgs], {
+        stdin: hasStdin ? 'pipe' : 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }),
+    ));
   } catch (err) {
     try { fs.unlinkSync(logPath); } catch { /* ignore */ }
     throw new Error(`Failed to spawn nsjail: ${(err as Error).message}`);
+  }
+  if (!markerSeen) {
+    /* The watchdog fired before NsJail logged its post-mount marker. The
+     * child may still finish successfully — but if multiple jobs trip the
+     * watchdog in a row we're back to overlapping setups, so the operator
+     * needs to see this. `pollError`, when present, is the last reason the
+     * log was unreadable (EACCES on a chmod race, EISDIR if the path got
+     * replaced, EIO, ...) which is far more diagnostic than a bare timeout. */
+    logger.warn(
+      { logId, pollError: pollError && { code: pollError.code, message: pollError.message } },
+      'nsjail setup gate watchdog fired before "Executing" marker',
+    );
+    nsjailSetupGateWatchdogFires.inc();
   }
 
   if (hasStdin) {

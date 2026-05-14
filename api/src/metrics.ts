@@ -34,6 +34,15 @@ export const activeSandboxExecutions = new Gauge({
   help: 'Number of sandbox executions currently past request validation',
 });
 
+/* Increments when the NsJail setup gate releases on its watchdog rather than
+ * the "Executing" log marker. A small steady rate is tolerable (slow flushes
+ * happen); a spike means concurrent NsJail launches are again overlapping in
+ * the unsafe mount-setup window and the gate is no longer doing its job. */
+export const nsjailSetupGateWatchdogFires = new Counter({
+  name: 'codeapi_sandbox_nsjail_setup_gate_watchdog_fires_total',
+  help: 'NsJail setup gate watchdog releases (post-mount marker never observed before deadline)',
+});
+
 function routeLabel(req: Request): string {
   if (req.path === '/') return '/';
   if (req.path === '/metrics') return '/metrics';
