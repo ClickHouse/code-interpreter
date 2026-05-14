@@ -206,6 +206,7 @@ workerSandbox:
     compileCpuTime: 10000
     compileTimeout: 10000
     outputMaxSize: 65536
+    maxOpenFiles: 2048
     executeBodyLimit: 50mb
     disableNetworking: true
     maxConcurrentJobs: 8

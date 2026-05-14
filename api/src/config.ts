@@ -55,7 +55,7 @@ export const config = {
   allowed_local_network_port: Number(process.env.SANDBOX_ALLOWED_LOCAL_NETWORK_PORT ?? 0),
   output_max_size: Number(process.env.SANDBOX_OUTPUT_MAX_SIZE ?? 1024),
   max_process_count: Number(process.env.SANDBOX_MAX_PROCESS_COUNT ?? 64),
-  max_open_files: Number(process.env.SANDBOX_MAX_OPEN_FILES ?? 256),
+  max_open_files: Number(process.env.SANDBOX_MAX_OPEN_FILES ?? 2048),
   max_file_size: Number(process.env.SANDBOX_MAX_FILE_SIZE ?? 10000000),
   compile_timeout: Number(process.env.SANDBOX_COMPILE_TIMEOUT ?? 10000),
   run_timeout: Number(process.env.SANDBOX_RUN_TIMEOUT ?? 30000),

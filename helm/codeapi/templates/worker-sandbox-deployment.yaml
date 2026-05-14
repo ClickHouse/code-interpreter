@@ -262,6 +262,8 @@ spec:
               value: {{ (.Values.workerSandbox.sandbox.compileTimeout | default 10000) | quote }}
             - name: SANDBOX_OUTPUT_MAX_SIZE
               value: {{ .Values.workerSandbox.sandbox.outputMaxSize | quote }}
+            - name: SANDBOX_MAX_OPEN_FILES
+              value: {{ .Values.workerSandbox.sandbox.maxOpenFiles | quote }}
             - name: SANDBOX_MAX_CONCURRENT_JOBS
               value: {{ (.Values.workerSandbox.sandbox.maxConcurrentJobs | default (mul (.Values.workerSandbox.launcher.vcpus | default 2) 4)) | quote }}
             - name: SANDBOX_PER_JOB_UIDS
