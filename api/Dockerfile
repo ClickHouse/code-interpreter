@@ -32,6 +32,37 @@ COPY api/src/spec-guard.c /tmp/spec-guard.c
 RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c
 
 # ============================================================================
+# Stage 1b: Build language runtime packages (only consumed by sandbox-runner-baked)
+#
+# Mirrors docker/Dockerfile.package-init but runs at image-build time so the
+# rendered /pkgs tree can be baked into the runner rootfs. Cache key is the
+# package-init script + javascript-packages.txt; unchanged inputs reuse this
+# layer across runner rebuilds.
+# ============================================================================
+FROM buildpack-deps:bookworm AS package-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHON_VERSION=3.14.4
+ENV BUN_VERSION=1.3.13
+
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
+    curl unzip wget ca-certificates \
+    build-essential libssl-dev libffi-dev libsqlite3-dev \
+    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
+    tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
+    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+    libfreetype6-dev
+
+RUN mkdir -p /pkgs
+
+COPY docker/package-init.sh /package-init.sh
+COPY javascript-packages.txt /javascript-packages.txt
+RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
+
+# ============================================================================
 # Stage 2: Build sandbox rootfs
 # ============================================================================
 FROM oven/bun:1.3.13-debian AS sandbox-build
@@ -113,8 +144,15 @@ RUN cargo build --release
 
 # ============================================================================
 # Stage 4: Final launcher image (Fedora for libkrun runtime)
+#
+# Split into:
+#   - sandbox-runner-base : everything except the guest rootfs copy
+#   - sandbox-runner      : default target; copies rootfs without packages
+#                           (packages come from a runtime PVC mount)
+#   - sandbox-runner-baked: copies rootfs AND bakes /pkgs from package-builder
+#                           (no PVC needed; runner can spread across nodes)
 # ============================================================================
-FROM fedora:43
+FROM fedora:43 AS sandbox-runner-base
 
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \
@@ -128,12 +166,6 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 
 COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
 
-COPY --from=sandbox-build / /sandbox-rootfs/
-
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
-
-RUN mkdir -p /host-packages
-
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
 COPY docker/sandbox-entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -141,3 +173,18 @@ RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-s
 
 EXPOSE 2000/tcp
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+FROM sandbox-runner-base AS sandbox-runner
+
+COPY --from=sandbox-build / /sandbox-rootfs/
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+
+RUN mkdir -p /host-packages
+
+FROM sandbox-runner-base AS sandbox-runner-baked
+
+COPY --from=sandbox-build / /sandbox-rootfs/
+COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
