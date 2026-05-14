@@ -32,28 +32,61 @@ const TIME_LIMIT_RE = /time limit/i;
 const OOM_RE = /cgroup.*oom|out of memory|mem_max/i;
 const SIGNAL_RE = /exited with.*signal.*?(\d+)/;
 
+/* New-mount-API syscall numbers are shared between x86_64 and arm64 (Linux
+ * 5.2 onwards). Defining them explicitly avoids relying on the bundled Kafel
+ * symbol table knowing the names — NsJail pins an older Kafel snapshot. */
+const sharedSyscallDefines = [
+  '#define io_uring_setup 425',
+  '#define io_uring_enter 426',
+  '#define io_uring_register 427',
+  '#define clone3 435',
+  '#define open_tree 428',
+  '#define move_mount 429',
+  '#define fsopen 430',
+  '#define fsmount 432',
+  '#define fspick 433',
+];
+
 const syscallDefines = process.arch === 'arm64'
   ? [
-      '#define io_uring_setup 425',
-      '#define io_uring_enter 426',
-      '#define io_uring_register 427',
-      '#define clone3 435',
+      ...sharedSyscallDefines,
       '#define umount2 39',
       '#define seccomp 277',
+      '#define setns 268',
+      '#define syslog 116',
+      '#define settimeofday 170',
+      '#define adjtimex 171',
+      '#define clock_adjtime 266',
+      /* ioperm, iopl, modify_ldt are x86-only; lookup_dcookie was deprecated
+       * upstream and is not present on arm64 in recent kernels. */
     ]
   : [
-      '#define io_uring_setup 425',
-      '#define io_uring_enter 426',
-      '#define io_uring_register 427',
-      '#define clone3 435',
+      ...sharedSyscallDefines,
       '#define umount2 166',
       '#define seccomp 317',
       '#define kexec_file_load 320',
+      '#define setns 308',
+      '#define syslog 103',
+      '#define settimeofday 164',
+      '#define adjtimex 159',
+      '#define clock_adjtime 305',
+      '#define ioperm 173',
+      '#define iopl 172',
+      '#define modify_ldt 154',
+      '#define lookup_dcookie 212',
     ];
 
 const kexecSyscalls = process.arch === 'arm64'
   ? '    kexec_load, bpf, perf_event_open,'
   : '    kexec_load, kexec_file_load, bpf, perf_event_open,';
+
+/* x86-only syscalls that must not appear in the arm64 policy or Kafel will
+ * fail to parse (the symbol/define is absent). lookup_dcookie was deprecated
+ * upstream and removed in recent kernels; keeping it on x86_64 is defense-
+ * in-depth, dropped on arm64 where the syscall slot is unused. */
+const archSpecificLowPrioritySyscalls = process.arch === 'arm64'
+  ? ''
+  : '    ioperm, iopl, modify_ldt, lookup_dcookie,';
 
 const SECCOMP_POLICY = [
   ...syscallDefines,
@@ -63,6 +96,7 @@ const SECCOMP_POLICY = [
   '#define AF_KEY 15',
   '#define AF_RXRPC 33',
   '#define AF_ALG 38',
+  '#define AF_VSOCK 40',
   '#define CLONE_NAMESPACE_FLAGS 0x7e020000',
   '#define KVM_IOCTL_MAGIC 0xAE00',
   'POLICY sandbox {',
@@ -71,11 +105,24 @@ const SECCOMP_POLICY = [
   kexecSyscalls,
   '    add_key, request_key, keyctl,',
   '    mount, umount2, pivot_root,',
+  /* New mount API (Linux 5.2+) — orthogonal to mount(2) and not covered by
+   * the line above. open_tree+move_mount can replicate a bind-mount; fsopen/
+   * fsmount/fspick form the new filesystem-context flow. Block all five. */
+  '    move_mount, open_tree, fsopen, fsmount, fspick,',
   '    swapon, swapoff, reboot,',
   '    init_module, finit_module, delete_module,',
-  '    unshare, seccomp,',
+  /* setns joins an existing namespace via fd. Unshare is already blocked
+   * above; setns closes the other side of that surface. */
+  '    unshare, setns, seccomp,',
   '    process_vm_readv, process_vm_writev,',
   '    acct, quotactl,',
+  /* Defense-in-depth batch (kernel returns EPERM/ENOSYS without caps, but
+   * an explicit KILL surfaces the intent and protects against future kernel
+   * config drift). settimeofday/adjtimex/clock_adjtime: clock manipulation.
+   * syslog: kernel ring buffer. ioperm/iopl/modify_ldt: x86 ring-0-adjacent
+   * surfaces. lookup_dcookie: profiling, deprecated upstream. */
+  '    settimeofday, adjtimex, clock_adjtime, syslog,',
+  archSpecificLowPrioritySyscalls,
   '    ioctl(fd, request) { (request & 0xFF00) == KVM_IOCTL_MAGIC }',
   '  },',
   '  ERRNO(38) {',
@@ -84,11 +131,16 @@ const SECCOMP_POLICY = [
   '  ERRNO(1) {',
   '    io_uring_setup, io_uring_enter, io_uring_register, sched_setaffinity, vmsplice,',
   '    clone(flags) { (flags & CLONE_NAMESPACE_FLAGS) != 0 },',
-  '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG }',
+  /* AF_VSOCK reaches the host hypervisor on KVM-based runners (the runner
+   * launcher uses krun -> libkrun; the guest sees virtio-vsock). Audit
+   * showed a VSOCK socket() succeeded and connect() hung instead of
+   * returning ENETUNREACH — that surface should not be reachable from
+   * sandboxed code. */
+  '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG || domain == AF_VSOCK }',
   '  }',
   '}',
   'USE sandbox DEFAULT ALLOW',
-].join('\n');
+].filter(line => line !== '').join('\n');
 
 export { SIGNALS };
 
