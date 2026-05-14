@@ -9,6 +9,7 @@ import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError } from '../execution-
 import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 import { EGRESS_GRANT_HEADER } from '../egress';
 import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
+import { classifySandboxSafeError } from '../safe-error';
 
 const router = express.Router();
 
@@ -300,9 +301,18 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
         metricsOutcome = 'validation_error';
         return res.status(400).json({ message: error.message });
       }
+      const safeError = classifySandboxSafeError(error);
+      if (safeError) {
+        metricsOutcome = 'execution_error';
+        logger.error({ job: job?.uuid, err: error, safeError: safeError.body.error }, 'Sandbox setup failed');
+        return res.status(safeError.status).json(safeError.body);
+      }
       metricsOutcome = 'execution_error';
       logger.error({ job: job?.uuid, err: error }, 'Error executing job');
-      return res.status(500).send();
+      return res.status(500).json({
+        error: 'sandbox_execution_failed',
+        message: 'Sandbox execution failed',
+      });
     } finally {
       await cleanupHandler();
     }

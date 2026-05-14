@@ -2,7 +2,7 @@ import axios from 'axios';
 import { Worker } from 'bullmq';
 import type { CreateLogInput } from '@librechat/api-keys';
 import type * as t from './types';
-import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails } from './utils';
+import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails, sandboxErrorMessageFromAxios } from './utils';
 import { jobProcessingDuration, jobsCompleted, jobsFailed, activeJobs, workerRunning } from './metrics';
 import { Jobs, Queues } from './enum';
 import { connection } from './queue';
@@ -219,7 +219,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
     } else if (axios.isAxiosError(error)) {
       /** Preserve error message from sandbox */
-      const sandboxError = (error.response?.data?.message as string) || (error.response?.data?.error as string) || error.message;
+      const sandboxError = sandboxErrorMessageFromAxios(error);
       throw new Error(`Error from sandbox: ${sandboxError}`);
     }
     throw error;

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { isValidId, isValidResourceId } from './utils';
+import type { AxiosError } from 'axios';
+import { isValidId, isValidResourceId, publicExecutionFailure, sandboxErrorMessageFromAxios } from './utils';
 
 describe('isValidId (21-char nanoid for sandbox-generated ids)', () => {
   test('accepts a canonical 21-char nanoid', () => {
@@ -96,5 +97,75 @@ describe('isValidResourceId (heterogeneous resource identifiers)', () => {
   test('rejects null bytes and control chars', () => {
     expect(isValidResourceId('foo\0bar')).toBe(false);
     expect(isValidResourceId('foo\x01bar')).toBe(false);
+  });
+});
+
+describe('sandbox error formatting', () => {
+  test('preserves sandbox error code and safe message from axios response data', () => {
+    const err = {
+      message: 'Request failed with status code 503',
+      response: {
+        data: {
+          error: 'permission_denied',
+          message: 'Sandbox setup failed: operation not permitted',
+        },
+      },
+    } as AxiosError;
+
+    expect(sandboxErrorMessageFromAxios(err)).toBe(
+      '[permission_denied] Sandbox setup failed: operation not permitted',
+    );
+  });
+
+  test('maps sandbox setup failures from worker errors to public responses', () => {
+    const err = new Error('Error from sandbox [mount_failed]: Sandbox setup failed: workspace mount failed');
+
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 503,
+      body: {
+        error: 'mount_failed',
+        message: 'Sandbox setup failed: workspace mount failed',
+      },
+    });
+  });
+
+  test('maps sandbox request guard failures to public bad requests', () => {
+    const axiosErr = {
+      message: 'Request failed with status code 400',
+      response: {
+        status: 400,
+        data: {
+          message: 'run_timeout cannot exceed the configured limit of 15000',
+        },
+      },
+    } as AxiosError;
+
+    const workerErr = new Error(`Error from sandbox: ${sandboxErrorMessageFromAxios(axiosErr)}`);
+
+    expect(publicExecutionFailure(workerErr)).toEqual({
+      status: 400,
+      body: {
+        error: 'bad_request',
+        message: 'run_timeout cannot exceed the configured limit of 15000',
+      },
+    });
+  });
+
+  test('maps sanitized sandbox execution failures to bad gateway', () => {
+    const err = new Error('Error from sandbox [sandbox_execution_failed]: Sandbox execution failed');
+
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 502,
+      body: {
+        error: 'sandbox_execution_failed',
+        message: 'Sandbox execution failed',
+      },
+    });
+  });
+
+  test('does not expose arbitrary sandbox errors as public infrastructure failures', () => {
+    const err = new Error('Error from sandbox [unexpected]: very specific internal detail');
+
+    expect(publicExecutionFailure(err)).toBeNull();
   });
 });

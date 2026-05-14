@@ -11,7 +11,7 @@ import { executionLimiter, uploadLimiter, downloadLimiter, fetchLimiter } from '
 import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
-import { sleep, getAxiosErrorDetails } from '../utils';
+import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
@@ -238,6 +238,10 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     return res.status(200).json(result);
   } catch (error) {
     logger.error(`[${INSTANCE_ID}] Session ID: ${session_id} | User ID: ${user_id} | Error during execution:`, error);
+    const publicFailure = publicExecutionFailure(error);
+    if (publicFailure) {
+      return res.status(publicFailure.status).json(publicFailure.body);
+    }
     return res.status(500).json({ error: 'Internal server error' });
   }
 });

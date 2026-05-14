@@ -35,6 +35,8 @@ interface ErrorDetails {
   url?: string;
   method?: string;
   code?: string;
+  responseError?: string;
+  responseMessage?: string;
 }
 
 export function isValidId(id: string = ''): boolean {
@@ -73,14 +75,79 @@ export function isValidResourceId(id: string = ''): boolean {
 export function getAxiosErrorDetails(error: unknown): ErrorDetails | unknown {
   if (axios.isAxiosError(error)) {
     const axiosError = error as AxiosError;
+    const responseData = parseErrorResponseData(axiosError.response?.data);
     return {
       message: axiosError.message,
       status: axiosError.response?.status,
       statusText: axiosError.response?.statusText,
       url: axiosError.config?.url,
       method: axiosError.config?.method?.toUpperCase(),
-      code: axiosError.code
+      code: axiosError.code,
+      responseError: responseData.error,
+      responseMessage: responseData.message,
     };
   }
   return error;
+}
+
+function parseErrorResponseData(data: unknown): { error?: string; message?: string } {
+  if (typeof data !== 'object' || data === null) return {};
+  const raw = data as Record<string, unknown>;
+  return {
+    error: typeof raw.error === 'string' ? raw.error : undefined,
+    message: typeof raw.message === 'string' ? raw.message : undefined,
+  };
+}
+
+export function sandboxErrorMessageFromAxios(error: AxiosError): string {
+  const data = parseErrorResponseData(error.response?.data);
+  const message = data.message || data.error || error.message;
+  const errorCode = data.error || (error.response?.status === 400 && data.message ? 'bad_request' : undefined);
+  return errorCode ? `[${errorCode}] ${message}` : message;
+}
+
+export function publicExecutionFailure(error: unknown): { status: number; body: { error: string; message: string } } | null {
+  const message = error instanceof Error ? error.message : '';
+  const match = message.match(/^Error from sandbox(?:\s+\[([a-z_]+)\])?:\s*(?:\[([a-z_]+)\]\s*)?(.+)$/);
+  if (!match) return null;
+
+  const errorCode = match[1] || match[2] || 'sandbox_execution_failed';
+  const sandboxMessage = match[3] || 'Sandbox execution failed';
+
+  if (errorCode === 'bad_request') {
+    return {
+      status: 400,
+      body: {
+        error: errorCode,
+        message: sandboxMessage,
+      },
+    };
+  }
+
+  if (
+    errorCode === 'sandbox_setup_failed' ||
+    errorCode === 'permission_denied' ||
+    errorCode === 'workspace_missing' ||
+    errorCode === 'mount_failed'
+  ) {
+    return {
+      status: 503,
+      body: {
+        error: errorCode,
+        message: sandboxMessage,
+      },
+    };
+  }
+
+  if (errorCode === 'sandbox_execution_failed') {
+    return {
+      status: 502,
+      body: {
+        error: errorCode,
+        message: sandboxMessage,
+      },
+    };
+  }
+
+  return null;
 }
