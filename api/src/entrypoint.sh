@@ -127,76 +127,13 @@ if [ "$ALLOWED_PORT" -gt 0 ] 2>/dev/null; then
     FORWARD_TARGET="${SANDBOX_FORWARD_TARGET:-}"
     TCS_SOCKET="/tmp/tcs.sock"
     if [ -n "$FORWARD_TARGET" ]; then
-        rm -f "$TCS_SOCKET"
         echo "Starting tool-call socket proxy: $TCS_SOCKET -> $FORWARD_TARGET/tool-call"
-        cat >/tmp/tool-call-socket-proxy.js <<'EOF'
-const fs = require('node:fs');
-const http = require('node:http');
-const https = require('node:https');
-
-const socketPath = process.env.TCS_SOCKET || '/tmp/tcs.sock';
-const rawTarget = process.env.SANDBOX_FORWARD_TARGET || '';
-const target = new URL(rawTarget.includes('://') ? rawTarget : `http://${rawTarget}`);
-const transport = target.protocol === 'https:' ? https : http;
-
-const server = http.createServer((req, res) => {
-  if (req.method !== 'POST' || req.url !== '/tool-call') {
-    req.resume();
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('not found');
-    return;
-  }
-
-  const headers = { ...req.headers, host: target.host };
-  delete headers.connection;
-  delete headers['proxy-connection'];
-
-  const upstream = transport.request({
-    protocol: target.protocol,
-    hostname: target.hostname,
-    port: target.port || undefined,
-    method: 'POST',
-    path: '/tool-call',
-    headers,
-  }, upstreamRes => {
-    res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-    upstreamRes.pipe(res);
-  });
-
-  upstream.on('error', error => {
-    console.error('tool-call socket proxy upstream error', error);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'text/plain' });
-    }
-    res.end('bad gateway');
-  });
-
-  req.pipe(upstream);
-});
-
-function cleanup() {
-  try { fs.unlinkSync(socketPath); } catch {}
-}
-
-process.on('SIGTERM', () => {
-  server.close(() => {
-    cleanup();
-    process.exit(0);
-  });
-});
-process.on('SIGINT', () => {
-  server.close(() => {
-    cleanup();
-    process.exit(0);
-  });
-});
-
-server.listen(socketPath, () => {
-  fs.chmodSync(socketPath, 0o777);
-  console.log(`tool-call socket proxy listening on ${socketPath}`);
-});
-EOF
-        TCS_SOCKET="$TCS_SOCKET" SANDBOX_FORWARD_TARGET="$FORWARD_TARGET" bun /tmp/tool-call-socket-proxy.js &
+        # Run under Node, not Bun: Bun's node:http compat layer never fires
+        # 'connection' events and Bun.serve's idleTimeout does not close
+        # silent unix-socket connections, which silently disables the
+        # proxy's DoS defenses. The .build artifact is produced at image
+        # build time by `bun build --target=node`. See api/Dockerfile.
+        TCS_SOCKET="$TCS_SOCKET" TCS_SOCKET_UID="$SANDBOX_UID" TCS_SOCKET_GID="$SANDBOX_UID" SANDBOX_FORWARD_TARGET="$FORWARD_TARGET" node /sandbox_api/.build/tool-call-socket-proxy.cjs &
     fi
 fi
 

@@ -5,7 +5,7 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
-    "build": "bun build ./src/index.ts --minify --outdir .build --target bun",
+    "build": "bun build ./src/index.ts --minify --outdir .build --target bun && bun build ./src/tool-call-socket-proxy.ts --target=node --format=cjs --outfile=.build/tool-call-socket-proxy.cjs",
     "start": "bun run .build/index.js",
     "test": "bun test"
   },

@@ -97,6 +97,15 @@ COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
 COPY --from=nsjail-builder /usr/local/bin/spec-guard /usr/local/bin/spec-guard
 RUN chmod +x /usr/sbin/nsjail
 
+# The tool-call socket proxy must run under Node, not Bun. Bun's node:http
+# compat layer never fires `'connection'` events and Bun.serve's idleTimeout
+# does not close silent unix-socket connections — so our DoS protections
+# (maxConnections, idleSocketTimeoutMs, accept-time tracking) silently no-op
+# under Bun and a `for i in range(N): socket.connect` storm pins FDs in the
+# proxy until the OS limit. Pulling just the Node binary from a slim image
+# is ~30 MB and avoids inheriting npm/node_modules from a full apt install.
+COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
+
 WORKDIR /sandbox_api
 
 COPY api/package.json ./
