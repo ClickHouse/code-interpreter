@@ -153,14 +153,34 @@ function rawConnect(socketPath: string): Promise<net.Socket> {
   });
 }
 
-function postToolCall(socketPath: string, body: string): Promise<{ status: number; body: string }> {
+/* The proxy's PTC-presence filter rejects /tool-call requests that lack
+ * the SDK-supplied headers (canonical 404 — see proxy source for why).
+ * Tests that want to exercise the forwarding path supply matching shape
+ * here. Cryptographic validation is the upstream's job; presence is the
+ * proxy's. */
+const PTC_HEADERS = {
+  'X-Execution-ID': 'test-exec-id',
+  'X-Tool-Call-ID': 'test-call-001',
+  'X-Callback-Token': 'test-callback-token',
+} as const;
+
+function postToolCall(
+  socketPath: string,
+  body: string,
+  extraHeaders: Record<string, string | number> = {},
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
         socketPath,
         method: 'POST',
         path: '/tool-call',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          ...PTC_HEADERS,
+          ...extraHeaders,
+        },
       },
       res => {
         const chunks: Buffer[] = [];
@@ -317,6 +337,8 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
           headers: {
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(body),
+            /* PTC presence required to forward (proxy filter). */
+            ...PTC_HEADERS,
             /* Hop-by-hop headers we expect the proxy to strip: */
             'Connection': 'keep-alive, Upgrade-Insecure-Requests',
             'Keep-Alive': 'timeout=300, max=1000',
@@ -381,6 +403,11 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
         'Content-Type: application/json\r\n' +
         'Content-Length: 100\r\n' +
         'Connection: close\r\n' +
+        /* PTC headers required so the proxy forwards (presence-only check;
+         * lets us reach the bodyUploadDeadline path the test exercises). */
+        'X-Execution-ID: test-exec-id\r\n' +
+        'X-Tool-Call-ID: test-call-001\r\n' +
+        'X-Callback-Token: test-callback-token\r\n' +
         '\r\n',
       );
       /* Drip 1 byte every 800ms. After 5s we've sent ~6 bytes — far short
@@ -447,7 +474,13 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
           socketPath: proxy.socketPath,
           method: 'POST',
           path: '/tool-call',
-          headers: { 'Content-Length': Buffer.byteLength(big), 'Connection': 'close' },
+          headers: {
+            'Content-Length': Buffer.byteLength(big),
+            'Connection': 'close',
+            /* PTC presence so the proxy actually attempts to forward,
+             * letting the maxBodyBytes / Content-Length precheck fire. */
+            ...PTC_HEADERS,
+          },
         }, res => {
           const chunks: Buffer[] = [];
           res.on('data', c => chunks.push(c));
@@ -465,6 +498,93 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
        * same: NO bytes of the oversize body reach the upstream. */
       expect([413, 0]).toContain(reply.status);
       expect(upstream.calls()).toBe(0);
+    } finally {
+      await proxy.stop();
+      await upstream.close();
+    }
+  });
+
+  test('PTC presence filter: duplicate empty header lines do not bypass the gate', async () => {
+    /* Codex caught this: Node joins duplicate request headers with
+     * `, ` (per RFC 7230 §3.2.2). A naive `!headers[name]` check on
+     * `X-Execution-ID:` sent twice with empty values produces the
+     * truthy string `", "`, slips past the gate, and lets the
+     * attacker reach the upstream — whose structured auth-error
+     * response defeats the route-opacity goal. The proxy must
+     * normalise (strip commas + whitespace) before checking. */
+    const upstream = await startUpstream();
+    const proxy = await spawnProxy({ upstreamUrl: upstream.url });
+    try {
+      const sock = await rawConnect(proxy.socketPath);
+      /* Each required PTC header sent TWICE with empty values. Without
+       * the fix, Node's join produces `, ` for each name and the
+       * proxy forwards. With the fix, the values normalise to '' and
+       * the proxy returns its canonical 404. */
+      sock.write(
+        'POST /tool-call HTTP/1.1\r\n' +
+        'Host: x\r\n' +
+        'Content-Length: 0\r\n' +
+        'Connection: close\r\n' +
+        'X-Execution-ID:\r\n' +
+        'X-Execution-ID:\r\n' +
+        'X-Tool-Call-ID:\r\n' +
+        'X-Tool-Call-ID:\r\n' +
+        'X-Callback-Token:\r\n' +
+        'X-Callback-Token:\r\n' +
+        '\r\n',
+      );
+      const reply = await new Promise<string>(resolve => {
+        const chunks: Buffer[] = [];
+        sock.on('data', c => chunks.push(c));
+        sock.on('close', () => resolve(Buffer.concat(chunks).toString()));
+        setTimeout(() => resolve(Buffer.concat(chunks).toString()), 3000);
+      });
+      /* Critical: upstream MUST NOT have been called. Status MUST be
+       * 404. Body MUST be the canonical "not found". */
+      expect(reply).toContain('404');
+      expect(reply).toContain('not found');
+      expect(reply).not.toMatch(/X-Request-ID|ETag/i);
+      expect(upstream.calls()).toBe(0);
+    } finally {
+      await proxy.stop();
+      await upstream.close();
+    }
+  });
+
+  test('PTC presence filter: missing headers get canonical 404, never reach upstream', async () => {
+    /* The proxy filters on PTC-header presence before forwarding so a
+     * sandbox attacker probing /tool-call without SDK headers cannot
+     * fingerprint the route via the upstream's structured "missing PTC
+     * headers" response. The `bogus_headers` case proves cryptographic
+     * validation is still upstream's job — bogus values DO forward and
+     * upstream's structured error is preserved (so the SDK can parse it). */
+    const upstream = await startUpstream();
+    const proxy = await spawnProxy({ upstreamUrl: upstream.url });
+    try {
+      // No PTC headers → proxy 404, upstream NOT called
+      const noHeaders = await new Promise<{ status: number; body: string; ct?: string }>(resolve => {
+        const r = http.request({ socketPath: proxy.socketPath, method: 'POST', path: '/tool-call' }, res => {
+          const chunks: Buffer[] = [];
+          res.on('data', c => chunks.push(c));
+          res.on('end', () => resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString(),
+            ct: res.headers['content-type'] as string | undefined,
+          }));
+        });
+        r.on('error', err => resolve({ status: 0, body: err.message }));
+        r.end();
+      });
+      expect(noHeaders.status).toBe(404);
+      expect(noHeaders.body).toBe('not found');
+      expect(noHeaders.ct).toContain('text/plain');
+      const callsAfterNoHeaders = upstream.calls();
+      expect(callsAfterNoHeaders).toBe(0);
+
+      // With PTC headers (any values) → proxy forwards
+      const withHeaders = await postToolCall(proxy.socketPath, '{"x":1}');
+      expect(withHeaders.status).toBe(200);
+      expect(upstream.calls()).toBe(1);
     } finally {
       await proxy.stop();
       await upstream.close();
@@ -493,8 +613,13 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
       /* Second request tries to hit /admin (a path the proxy's filter
        * MUST reject). If pipelining could bypass the filter, we'd see
        * /admin in receivedPaths. */
+      /* PTC headers on the first request so it actually forwards; the
+       * second request deliberately omits them AND targets /admin to
+       * verify both the path filter AND the presence filter hold even
+       * across pipelined dispatch. */
       const pipelined =
-        'POST /tool-call HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n{"x":1}' +
+        'POST /tool-call HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n' +
+        'X-Execution-ID: t\r\nX-Tool-Call-ID: t\r\nX-Callback-Token: t\r\n\r\n{"x":1}' +
         'POST /admin HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n{"y":2}';
       sock.write(pipelined);
       await new Promise<void>(r => sock.once('close', () => r()));

@@ -85,6 +85,23 @@ function buildForwardedHeaders(
   return out;
 }
 
+/* True only when the header has at least one non-empty, non-whitespace
+ * character. Naive `!headers[name]` is bypassable: Node joins duplicate
+ * request headers with `, ` (per RFC 7230 §3.2.2), so two empty
+ * `X-Foo:` lines arrive as the truthy string `", "`. An attacker who
+ * sends each PTC header twice with empty values would slip past the
+ * presence filter and reach the upstream — defeating the route-opacity
+ * goal. Stripping commas + whitespace before the empty check closes
+ * that gap. */
+function hasPtcHeaderValue(value: string | string[] | undefined): boolean {
+  if (value == null) return false;
+  const joined = Array.isArray(value) ? value.join(',') : value;
+  /* Strip every comma (Node's separator for joined duplicates) and every
+   * whitespace character. If anything is left, the header carries real
+   * content. */
+  return joined.replace(/[,\s]/g, '') !== '';
+}
+
 /* Request smuggling defense (CVE class). When a request carries BOTH
  * Transfer-Encoding and Content-Length, an upstream may pick the
  * different one than the proxy did, letting an attacker prepend bytes
@@ -159,6 +176,43 @@ export async function startToolCallSocketProxy(
     });
 
     if (req.method !== 'POST' || req.url !== '/tool-call') {
+      req.resume();
+      res.writeHead(404, { 'Content-Type': 'text/plain', Connection: 'close' });
+      res.end('not found');
+      return;
+    }
+
+    /* PTC-header presence filter at the proxy boundary. Three reasons:
+     *
+     * (1) Route opacity. If a sandbox attacker probes /tool-call without
+     *     the SDK-supplied PTC headers, the upstream's 404 leaks Express's
+     *     framing (ETag/X-Request-ID/charset/content-length) which is
+     *     visibly different from the proxy's own 404 for unknown paths.
+     *     Filtering at the proxy means missing-header probes never reach
+     *     the upstream and the response is byte-identical to /any/unknown.
+     *
+     * (2) Cheap rejection. Don't burn an active-request slot or open an
+     *     upstream connection for a request that's going to be rejected.
+     *
+     * (3) Preserves legitimate 404s. The previous shape blanket-masked
+     *     ALL upstream 404 responses, which broke "Session not found" and
+     *     other structured upstream errors that the SDK's preamble parses
+     *     as JSON (json.loads("not found") raises). With the filter
+     *     here, only missing-header probes are masked; a genuine 404 with
+     *     a JSON body for an authenticated request still reaches the
+     *     SDK intact.
+     *
+     * The proxy only checks PRESENCE — actual cryptographic validation
+     * happens at the upstream. An attacker supplying garbage values for
+     * these headers gets forwarded and the upstream rejects with its
+     * structured response, but they've already revealed sandbox-side
+     * activity by sending non-empty headers, so route opacity isn't the
+     * goal there. */
+    if (
+      !hasPtcHeaderValue(req.headers['x-execution-id'])
+      || !hasPtcHeaderValue(req.headers['x-tool-call-id'])
+      || !hasPtcHeaderValue(req.headers['x-callback-token'])
+    ) {
       req.resume();
       res.writeHead(404, { 'Content-Type': 'text/plain', Connection: 'close' });
       res.end('not found');
@@ -295,9 +349,9 @@ export async function startToolCallSocketProxy(
           upstreamRes.resume();
           return;
         }
-        /* Also strip hop-by-hop on the response path. Upstream's
-         * Connection / Keep-Alive / Upgrade headers describe the proxy
-         * <-> upstream link, not what we should tell the sandbox client. */
+        /* Strip hop-by-hop on the response path. Upstream's Connection /
+         * Keep-Alive / Upgrade headers describe the proxy <-> upstream
+         * link, not what we should tell the sandbox client. */
         const respHeaders: http.OutgoingHttpHeaders = {};
         for (const [k, v] of Object.entries(upstreamRes.headers)) {
           if (HOP_BY_HOP_HEADERS.has(k.toLowerCase())) continue;

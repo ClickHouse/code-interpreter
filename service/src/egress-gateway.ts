@@ -693,7 +693,23 @@ app.post('/tool-call', async (req, res) => {
     const callId = req.header('x-tool-call-id') ?? '';
     const opaqueCallbackToken = req.header('x-callback-token') ?? '';
     if (!executionId || !callId || !opaqueCallbackToken) {
-      return res.status(400).json({ error: 'Missing required PTC headers' });
+      /* Generic 404 so a sandbox attacker probing paths cannot tell that
+       * `/tool-call` is the live route by reading the error body. The
+       * body and headers must MATCH the tool-call socket proxy's own 404
+       * for unknown paths (see api/src/tool-call-socket-proxy.ts) byte-
+       * for-byte — case included — otherwise the sandbox can still
+       * fingerprint the real route by comparing response shapes. */
+      logger.warn(
+        {
+          executionIdPresent: !!executionId,
+          callIdPresent: !!callId,
+          callbackTokenPresent: !!opaqueCallbackToken,
+          remoteAddress: req.socket.remoteAddress,
+        },
+        '/tool-call rejected: missing PTC headers',
+      );
+      res.setHeader('Connection', 'close');
+      return res.status(404).type('text/plain').send('not found');
     }
     const parsedLength = parseBoundedContentLength(
       req.header('content-length'),

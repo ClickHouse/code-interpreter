@@ -6,6 +6,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { startToolCallSocketProxy, type ToolCallSocketProxyHandle } from './tool-call-socket-proxy';
 
+/* PTC-presence headers required by the proxy's filter so legitimate
+ * /tool-call requests forward instead of getting the canonical 404. The
+ * proxy only checks PRESENCE; cryptographic validation happens upstream. */
+const PTC_HEADERS = {
+  'X-Execution-ID': 'test-exec-id',
+  'X-Tool-Call-ID': 'test-call-001',
+  'X-Callback-Token': 'test-callback-token',
+} as const;
+
 const handles: ToolCallSocketProxyHandle[] = [];
 const tempDirs: string[] = [];
 
@@ -83,6 +92,7 @@ describe('tool-call socket proxy', () => {
         headers: {
           'Content-Type': 'application/json',
           Connection: 'keep-alive',
+          ...PTC_HEADERS,
         },
       }, res => {
         const chunks: Buffer[] = [];
@@ -196,7 +206,7 @@ describe('tool-call socket proxy', () => {
     handles.push(proxy);
 
     const first = new Promise<number>((resolve, reject) => {
-      const req = http.request({ socketPath, method: 'POST', path: '/tool-call' }, res => {
+      const req = http.request({ socketPath, method: 'POST', path: '/tool-call', headers: PTC_HEADERS }, res => {
         res.on('end', () => resolve(res.statusCode ?? 0));
         res.resume();
       });
@@ -209,7 +219,7 @@ describe('tool-call socket proxy', () => {
     }
 
     const second = await new Promise<{ status: number; body: string; retryAfter: unknown }>((resolve, reject) => {
-      const req = http.request({ socketPath, method: 'POST', path: '/tool-call' }, res => {
+      const req = http.request({ socketPath, method: 'POST', path: '/tool-call', headers: PTC_HEADERS }, res => {
         const chunks: Buffer[] = [];
         res.on('data', chunk => chunks.push(Buffer.from(chunk)));
         res.on('end', () => resolve({
@@ -271,6 +281,9 @@ describe('tool-call socket proxy', () => {
       'Content-Type: application/json',
       `Content-Length: ${Buffer.byteLength(body)}`,
       'Connection: close',
+      'X-Execution-ID: t',
+      'X-Tool-Call-ID: t',
+      'X-Callback-Token: t',
       '',
       body,
     ].join('\r\n'));
@@ -311,7 +324,7 @@ describe('tool-call socket proxy', () => {
     handles.push(proxy);
 
     const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
-      const req = http.request({ socketPath, method: 'POST', path: '/tool-call' }, res => {
+      const req = http.request({ socketPath, method: 'POST', path: '/tool-call', headers: PTC_HEADERS }, res => {
         const chunks: Buffer[] = [];
         res.on('data', chunk => chunks.push(Buffer.from(chunk)));
         res.on('end', () => resolve({
