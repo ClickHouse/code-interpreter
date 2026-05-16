@@ -84,7 +84,6 @@ RUN apt-install \
     locales \
     procps \
     iptables \
-    socat \
     poppler-utils \
     fonts-dejavu \
     fonts-liberation \

@@ -45,6 +45,11 @@ const sharedSyscallDefines = [
   '#define fsopen 430',
   '#define fsmount 432',
   '#define fspick 433',
+  /* pidfd_* are Linux 5.1+/5.3+ — newer than Kafel's bundled symbol
+   * table on the pinned NsJail snapshot, so define numerically. Same
+   * number on x86_64 and arm64. */
+  '#define pidfd_send_signal 424',
+  '#define pidfd_open 434',
 ];
 
 const syscallDefines = process.arch === 'arm64'
@@ -131,6 +136,28 @@ const SECCOMP_POLICY = [
   '  ERRNO(1) {',
   '    io_uring_setup, io_uring_enter, io_uring_register, sched_setaffinity, vmsplice,',
   '    clone(flags) { (flags & CLONE_NAMESPACE_FLAGS) != 0 },',
+  /* Block signals to PID 1 of the sandbox PID namespace (the NsJail
+   * monitor). With clone_newpid the user can't reach other tenants — but
+   * killing their own ns's PID 1 still races NsJail's cleanup ordering and
+   * the supervisor shouldn't be reachable from inside the sandbox. Also
+   * blocks process-group (pid==0) and "everything signalable" (pid==-1)
+   * forms which would catch the monitor in their fan-out. ERRNO(1) (EPERM)
+   * matches the kernel's standard "you may not signal init" behavior so
+   * runtimes that probe with kill(pid, 0) get a familiar error instead
+   * of a SIGSYS-killed process. */
+  '    kill(pid) { pid == 0 || pid == 1 || pid == 0xFFFFFFFF },',
+  '    tkill(tid) { tid == 1 },',
+  '    tgkill(tgid, tid) { tgid == 1 || tid == 1 },',
+  '    rt_sigqueueinfo(pid) { pid == 0 || pid == 1 || pid == 0xFFFFFFFF },',
+  '    rt_tgsigqueueinfo(tgid, tid) { tgid == 1 || tid == 1 },',
+  /* pidfd_open(pid==1) would hand out a pidfd to the monitor; block at
+   * acquisition. pidfd_send_signal targets a pidfd (not a numeric pid)
+   * so we can't filter by destination — but a pidfd to PID 1 can also be
+   * obtained via openat("/proc/1", O_RDONLY) since Linux 5.4, so refuse
+   * the syscall outright. Neither call is used by Python/Node/Bun
+   * runtimes the sandbox supports. */
+  '    pidfd_open(pid) { pid == 1 },',
+  '    pidfd_send_signal,',
   /* AF_VSOCK reaches the host hypervisor on KVM-based runners (the runner
    * launcher uses krun -> libkrun; the guest sees virtio-vsock). Audit
    * showed a VSOCK socket() succeeded and connect() hung instead of
@@ -143,6 +170,45 @@ const SECCOMP_POLICY = [
 ].filter(line => line !== '').join('\n');
 
 export { SIGNALS };
+
+/* Base sandbox.cfg cached at module load. Per-job runs append a dynamic
+ * /mnt/data mount block (see renderJobConfigOverlay) so the bind can carry
+ * noexec/nosuid/nodev — flags NsJail's CLI -B form does not accept. */
+let cachedBaseConfig: string | null = null;
+function readBaseConfig(): string {
+  if (cachedBaseConfig === null) {
+    cachedBaseConfig = fs.readFileSync(config.nsjail_config, 'utf8');
+  }
+  return cachedBaseConfig;
+}
+
+/* Render a `mount {}` block that binds `submissionDir` at /mnt/data with
+ * noexec/nosuid/nodev. The destination is fixed; the source path is the
+ * per-job workspace. Path comes from createSandboxWorkspace and lives
+ * under a known prefix (no user-controlled bytes), but we still escape
+ * embedded backslashes and double-quotes defensively in case future
+ * callers pass arbitrary paths in. The cfg syntax is C-like so only those
+ * two characters need escaping inside a string literal. */
+export function renderJobConfigOverlay(submissionDir: string): string {
+  const escaped = submissionDir.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return [
+    '',
+    '# Per-job submission workspace bind. Dynamic because the source path',
+    '# rotates every execution. noexec/nosuid/nodev block the audit pattern',
+    '# of `chmod +x /mnt/data/x.sh && /mnt/data/x.sh` — neither user code',
+    '# nor any helper can run a binary from the writable scratch dir.',
+    'mount {',
+    `    src: "${escaped}"`,
+    '    dst: "/mnt/data"',
+    '    is_bind: true',
+    '    rw: true',
+    '    noexec: true',
+    '    nosuid: true',
+    '    nodev: true',
+    '}',
+    '',
+  ].join('\n');
+}
 
 interface ExecuteOptions {
   command: string[];
@@ -161,10 +227,13 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
   const { command, envVars, submissionDir, pkgdir, timeout, memoryLimit, outputMaxSize, stdin, extraPkgdirs, identity } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
+  const cfgPath = `/tmp/nsjail-${logId}.cfg`;
+
+  fs.writeFileSync(cfgPath, readBaseConfig() + renderJobConfigOverlay(submissionDir), { mode: 0o600 });
 
   const nsjailArgs = buildArgs({
     logPath,
-    submissionDir,
+    cfgPath,
     pkgdir,
     timeout,
     memoryLimit,
@@ -195,6 +264,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     ));
   } catch (err) {
     try { fs.unlinkSync(logPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(cfgPath); } catch { /* ignore */ }
     throw new Error(`Failed to spawn nsjail: ${(err as Error).message}`);
   }
   if (!markerSeen) {
@@ -341,6 +411,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     }
   } catch { /* log file may not exist */ } finally {
     try { fs.unlinkSync(logPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(cfgPath); } catch { /* ignore */ }
   }
 
   let code: number | null = exitCode;
@@ -371,7 +442,11 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
 
 interface BuildArgsOptions {
   logPath: string;
-  submissionDir: string;
+  /* Path to the rendered per-job NsJail config (base sandbox.cfg + the
+   * dynamic /mnt/data mount block from renderJobConfigOverlay). Optional
+   * for tests that don't materialize a per-job file; defaults to the base
+   * config, in which case /mnt/data won't be mounted. */
+  cfgPath?: string;
   pkgdir: string;
   timeout: number;
   memoryLimit: number;
@@ -382,12 +457,12 @@ interface BuildArgsOptions {
 }
 
 export function buildArgs(opts: BuildArgsOptions): string[] {
-  const { logPath, submissionDir, pkgdir, timeout, memoryLimit, envVars, command, extraPkgdirs, identity } = opts;
+  const { logPath, cfgPath, pkgdir, timeout, memoryLimit, envVars, command, extraPkgdirs, identity } = opts;
 
   const timeoutSecs = Math.max(1, Math.ceil(timeout / 1000));
 
   const args: string[] = [
-    '--config', config.nsjail_config,
+    '--config', cfgPath ?? config.nsjail_config,
     '--log', logPath,
     '--seccomp_string', SECCOMP_POLICY,
     '--user', `${SANDBOX_INSIDE_UID}:${identity.uid}:1`,
@@ -395,7 +470,6 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     '-s', '/usr/bin:/bin',
     '-s', '/usr/lib:/lib',
     '-s', '/usr/lib64:/lib64',
-    '-B', `${submissionDir}:/mnt/data`,
     '-R', `${pkgdir}:${pkgdir}`,
   ];
 
@@ -444,9 +518,12 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     args.push('-E', `${key}=${value}`);
   }
 
-  if (config.allowed_local_network_port > 0) {
-    args.push('-E', 'TOOL_CALL_SOCKET=/tmp/tcs.sock');
-  }
+  /* TOOL_CALL_SOCKET is intentionally NOT exported: the path is fixed at
+   * /tmp/tcs.sock and the runtime preamble references it as a literal.
+   * Skipping the env entry shrinks the surface user code can introspect
+   * (`os.environ`) and keeps the socket discoverable only by code that
+   * already knows where to look. The /tmp/tcs.sock bind-mount above is
+   * what actually makes the path connectable. */
 
   args.push('--');
   args.push('/usr/local/bin/spec-guard', ...command);

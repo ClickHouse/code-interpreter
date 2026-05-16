@@ -294,7 +294,9 @@ _EXECUTION_ID = "${executionId}"
 _TOOL_CALL_COUNTER = 0
 _TOOL_CALL_LOCK = asyncio.Lock()
 
-_TOOL_CALL_SOCKET = os.environ.get("TOOL_CALL_SOCKET", "")
+# The proxy bind-mounts this fixed path into every sandbox; the env var
+# version was dropped to keep the path off os.environ introspection.
+_TOOL_CALL_SOCKET = "/tmp/tcs.sock"
 
 class _UnixHTTPConnection(_http_client.HTTPConnection):
     """HTTPConnection that tunnels through a Unix domain socket"""
@@ -321,8 +323,30 @@ def _tcp_request(method, url, body=None, headers=None, timeout=300):
     with request.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read()
 
+def _probe_tool_call_socket():
+    # One-shot probe: is the path a live AF_UNIX listener? A real
+    # connect() succeeds against the proxy; a regular file or stale
+    # node returns ENOTSOCK / ECONNREFUSED. Done at preamble import
+    # time, *before* user code runs, so a malicious user cannot spoof
+    # /tmp/tcs.sock to flip the gate (a previous os.path.exists check
+    # was user-spoofable in legacy/no-proxy mode). Each NsJail
+    # invocation gets a fresh /tmp tmpfs so the probe result cannot
+    # bleed across jobs.
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(_TOOL_CALL_SOCKET)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+_USE_TOOL_CALL_SOCKET = _probe_tool_call_socket()
+
 def _do_request(method, path, body=None, headers=None, timeout=300):
-    if _TOOL_CALL_SOCKET:
+    # Cached at import time (see _probe_tool_call_socket). User code
+    # cannot influence this decision because it has not yet executed.
+    if _USE_TOOL_CALL_SOCKET:
         return _unix_request(method, path, body, headers, timeout)
     url = _CALLBACK_URL + path
     return _tcp_request(method, url, body, headers, timeout)

@@ -90,7 +90,10 @@ def fd_storm_then_report() -> None:
     that leak into the NEXT job's process."""
     code = (
         "import os, socket, json\n"
-        "s = os.environ.get('TOOL_CALL_SOCKET', '')\n"
+        # The runner bind-mounts the proxy socket at this fixed path; the
+        # TOOL_CALL_SOCKET env var was dropped to keep the path off
+        # `os.environ`, so the test references the literal path instead.
+        "s = '/tmp/tcs.sock'\n"
         "leaked = []\n"
         "errors = []\n"
         # Append every socket to a list so CPython's refcount keeps the FD
@@ -210,7 +213,8 @@ def ptc_route_opacity_check() -> bool:
     but the upstream's Express-added headers leaked through the proxy."""
     code = (
         "import os, socket, json\n"
-        "s = os.environ['TOOL_CALL_SOCKET']\n"
+        # Same fixed-path reasoning as fd_storm_then_report().
+        "s = '/tmp/tcs.sock'\n"
         "responses = {}\n"
         "for path in ['/tool-call', '/randomroute']:\n"
         "    sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"

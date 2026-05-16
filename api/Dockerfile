@@ -76,8 +76,6 @@ RUN apt-get update && \
     locales \
     procps \
     iptables \
-    socat \
-    curl \
     jq \
     poppler-utils \
     fonts-dejavu \

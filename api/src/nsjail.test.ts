@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildArgs } from './nsjail';
+import { buildArgs, renderJobConfigOverlay } from './nsjail';
 
 function valueAfter(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -9,7 +9,6 @@ function valueAfter(args: string[], flag: string): string | undefined {
 function seccompPolicy(): string {
   const args = buildArgs({
     logPath: '/tmp/nsjail-test.log',
-    submissionDir: '/tmp/sandbox/ws_test',
     pkgdir: '/pkgs/python/3.14.4',
     timeout: 1000,
     memoryLimit: -1,
@@ -26,7 +25,6 @@ describe('NsJail args', () => {
   test('passes dynamic per-job UID/GID mappings', () => {
     const args = buildArgs({
       logPath: '/tmp/nsjail-test.log',
-      submissionDir: '/tmp/sandbox/ws_test',
       pkgdir: '/pkgs/python/3.14.4',
       timeout: 1000,
       memoryLimit: -1,
@@ -42,8 +40,91 @@ describe('NsJail args', () => {
 
     expect(valueAfter(args, '--user')).toBe('65534:200002:1');
     expect(valueAfter(args, '--group')).toBe('65534:300002:1');
-    expect(args).toContain('-B');
-    expect(args).toContain('/tmp/sandbox/ws_test:/mnt/data');
+  });
+
+  test('does not bind /mnt/data via -B (the per-job cfg overlay handles it with noexec)', () => {
+    /* Regression guard: the dynamic /mnt/data bind used to be `-B
+     * <submissionDir>:/mnt/data` on the CLI, which NsJail accepts but has
+     * no syntax for noexec/nosuid/nodev. Moving the mount into the cfg
+     * overlay (renderJobConfigOverlay) is what unlocks those flags. If
+     * a future edit reintroduces a CLI -B for /mnt/data the cfg overlay
+     * would race or duplicate with the inline form, so explicitly assert
+     * neither -B nor -R points at /mnt/data. */
+    const args = buildArgs({
+      logPath: '/tmp/nsjail-test.log',
+      pkgdir: '/pkgs/python/3.14.4',
+      timeout: 1000,
+      memoryLimit: -1,
+      envVars: {},
+      command: ['/bin/bash', '/pkgs/python/3.14.4/run', 'main.py'],
+      identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+    });
+    for (let i = 0; i < args.length - 1; i++) {
+      if ((args[i] === '-B' || args[i] === '-R') && args[i + 1].endsWith(':/mnt/data')) {
+        throw new Error(`unexpected CLI mount for /mnt/data: ${args[i]} ${args[i + 1]}`);
+      }
+    }
+  });
+
+  test('uses caller-supplied cfg path when provided (per-job cfg overlay path)', () => {
+    const args = buildArgs({
+      logPath: '/tmp/nsjail-test.log',
+      cfgPath: '/tmp/nsjail-job-xyz.cfg',
+      pkgdir: '/pkgs/python/3.14.4',
+      timeout: 1000,
+      memoryLimit: -1,
+      envVars: {},
+      command: ['/bin/bash', '/pkgs/python/3.14.4/run', 'main.py'],
+      identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+    });
+    expect(valueAfter(args, '--config')).toBe('/tmp/nsjail-job-xyz.cfg');
+  });
+
+  test('does not export TOOL_CALL_SOCKET into the jail (preamble references the literal path)', () => {
+    const args = buildArgs({
+      logPath: '/tmp/nsjail-test.log',
+      pkgdir: '/pkgs/python/3.14.4',
+      timeout: 1000,
+      memoryLimit: -1,
+      envVars: {},
+      command: ['/bin/bash', '/pkgs/python/3.14.4/run', 'main.py'],
+      identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+    });
+    /* Pair-wise scan of -E flags: every other slot is an envar key=value. */
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '-E' && args[i + 1].startsWith('TOOL_CALL_SOCKET=')) {
+        throw new Error(`unexpected TOOL_CALL_SOCKET envar: ${args[i + 1]}`);
+      }
+    }
+  });
+});
+
+describe('renderJobConfigOverlay', () => {
+  test('binds submissionDir at /mnt/data with noexec/nosuid/nodev set', () => {
+    const overlay = renderJobConfigOverlay('/tmp/sandbox/ws_abc');
+    /* Property-style assertions on the rendered Kafel/protobuf cfg. We
+     * keep them line-anchored so a stray `noexec: false` elsewhere can't
+     * accidentally satisfy the test. */
+    expect(overlay).toMatch(/^\s*src: "\/tmp\/sandbox\/ws_abc"$/m);
+    expect(overlay).toMatch(/^\s*dst: "\/mnt\/data"$/m);
+    expect(overlay).toMatch(/^\s*is_bind: true$/m);
+    expect(overlay).toMatch(/^\s*rw: true$/m);
+    expect(overlay).toMatch(/^\s*noexec: true$/m);
+    expect(overlay).toMatch(/^\s*nosuid: true$/m);
+    expect(overlay).toMatch(/^\s*nodev: true$/m);
+  });
+
+  test('escapes double quotes and backslashes so a quirky path cannot break the cfg parser', () => {
+    /* Production paths come from createSandboxWorkspace and contain no
+     * meta-chars, but defense in depth: a future caller that passes an
+     * arbitrary path must not be able to inject extra cfg fields by
+     * embedding `" rw: false }` etc. */
+    const overlay = renderJobConfigOverlay('/tmp/sandbox/ws"injected\\path');
+    expect(overlay).toContain('src: "/tmp/sandbox/ws\\"injected\\\\path"');
+    /* The injected `"` must NOT terminate the string mid-stream — assert
+     * we still have exactly one src line. */
+    const srcLines = overlay.split('\n').filter(l => l.includes('src:'));
+    expect(srcLines.length).toBe(1);
   });
 });
 
@@ -134,5 +215,58 @@ describe('NsJail seccomp policy', () => {
      * line and rejects it. */
     const policy = seccompPolicy();
     expect(policy.split('\n').every(line => line.length > 0)).toBe(true);
+  });
+
+  test('returns EPERM (not SIGSYS) for kill/tkill/tgkill targeting PID 1 of the sandbox PID ns', () => {
+    /* PID 1 inside the sandbox PID namespace is the NsJail monitor.
+     * `clone_newpid: true` already prevents reaching other tenants — this
+     * rule is principled defense for the in-ns supervisor. ERRNO(1)
+     * (EPERM) matches the kernel's own response to unprivileged init
+     * signaling so probes like `os.kill(1, 0)` get the expected error
+     * shape instead of dying with SIGSYS. */
+    const policy = seccompPolicy();
+    const errnoBlock = policy.split('ERRNO(1)')[1] ?? '';
+    expect(errnoBlock).toMatch(/\bkill\(pid\)\s*\{[^}]*pid\s*==\s*1[^}]*\}/);
+    expect(errnoBlock).toMatch(/\btkill\(tid\)\s*\{[^}]*tid\s*==\s*1[^}]*\}/);
+    expect(errnoBlock).toMatch(/\btgkill\(tgid,\s*tid\)\s*\{[^}]*\}/);
+  });
+
+  test('also blocks kill(0) (process group) and kill(-1) (everything signalable)', () => {
+    /* Both forms fan out within the caller's PID namespace and would
+     * land on PID 1 (the monitor) along with siblings. The seccomp
+     * comparison is unsigned 32-bit so -1 is encoded as 0xFFFFFFFF. */
+    const policy = seccompPolicy();
+    const killRule = policy.split('\n').find(l => l.match(/\bkill\(pid\)/));
+    expect(killRule).toBeDefined();
+    expect(killRule).toContain('pid == 0');
+    expect(killRule).toContain('pid == 0xFFFFFFFF');
+  });
+
+  test('blocks pidfd_send_signal entirely and pidfd_open(pid==1)', () => {
+    /* pidfd_send_signal accepts a pidfd, not a pid — we cannot filter
+     * the destination at the syscall layer, and a pidfd to PID 1 can be
+     * obtained via openat("/proc/1", O_RDONLY) (Linux 5.4+) bypassing
+     * pidfd_open. So block the send entirely and also block the obvious
+     * pidfd_open(pid==1) acquisition path. */
+    const policy = seccompPolicy();
+    const errnoBlock = policy.split('ERRNO(1)')[1] ?? '';
+    expect(errnoBlock).toMatch(/\bpidfd_send_signal\b[,\s]/);
+    expect(errnoBlock).toMatch(/\bpidfd_open\(pid\)\s*\{[^}]*pid\s*==\s*1[^}]*\}/);
+  });
+
+  test('blocks the rt_sigqueueinfo / rt_tgsigqueueinfo equivalents of kill targeting PID 1', () => {
+    /* `kill` is the obvious entry point but the kernel exposes two more
+     * signal-delivery syscalls that take a numeric pid/tid. Without these
+     * the seccomp filter would only catch the most-common attack form. */
+    const policy = seccompPolicy();
+    const errnoBlock = policy.split('ERRNO(1)')[1] ?? '';
+    expect(errnoBlock).toMatch(/\brt_sigqueueinfo\(pid\)\s*\{[^}]*pid\s*==\s*1[^}]*\}/);
+    expect(errnoBlock).toMatch(/\brt_tgsigqueueinfo\(tgid,\s*tid\)\s*\{[^}]*\}/);
+  });
+
+  test('defines explicit syscall numbers for pidfd_* (avoids Kafel symbol drift)', () => {
+    const policy = seccompPolicy();
+    expect(policy).toContain('#define pidfd_send_signal 424');
+    expect(policy).toContain('#define pidfd_open 434');
   });
 });

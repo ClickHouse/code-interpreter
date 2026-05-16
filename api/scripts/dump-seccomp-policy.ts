@@ -6,7 +6,6 @@ import { buildArgs } from '../src/nsjail';
 
 const args = buildArgs({
   logPath: '/tmp/nsjail-test.log',
-  submissionDir: '/tmp/sandbox/ws_test',
   pkgdir: '/pkgs/python/3.14.4',
   timeout: 1000,
   memoryLimit: -1,
