@@ -61,8 +61,18 @@ export interface NsJailSetupGate {
    * NsJail child has finished its mount-setup phase (either the log marker
    * appears or the watchdog fires). Returns whatever `spawn` returned. Any
    * exception thrown by `spawn` releases the gate before propagating.
+   *
+   * `abortSignal` (optional) is checked between log-poll iterations and
+   * releases the gate immediately when aborted — used by callers that
+   * detect the child died asynchronously (e.g. node:child_process spawn
+   * emitting ENOENT/EACCES on its 'error' event). Without this, every
+   * failed spawn pays the full watchdogMs (default 1500ms) while
+   * holding the serialized gate, amplifying latency for every queued
+   * job behind it. When aborted, the result reports markerSeen=false
+   * — the caller is expected to immediately surface the spawn error
+   * and skip the "watchdog fired" warning path.
    */
-  runSetup<T>(logPath: string, spawn: () => T): Promise<NsJailSetupGateResult<T>>;
+  runSetup<T>(logPath: string, spawn: () => T, abortSignal?: AbortSignal): Promise<NsJailSetupGateResult<T>>;
   /** For metrics/tests: how many callers are currently waiting on the gate. */
   pending(): number;
 }
@@ -86,13 +96,18 @@ export function createNsJailSetupGate(options: NsJailSetupGateOptions = {}): NsJ
   let tail: Promise<void> = Promise.resolve();
   let waiters = 0;
 
-  async function pollForMarker(logPath: string): Promise<{
+  async function pollForMarker(logPath: string, abortSignal?: AbortSignal): Promise<{
     markerSeen: boolean;
     lastError?: NodeJS.ErrnoException;
   }> {
     const start = now();
     let lastError: NodeJS.ErrnoException | undefined;
     for (;;) {
+      /* Caller signaled the child died (e.g. node:child_process emitted
+       * 'error' or 'close' before NsJail could log its marker). Release
+       * immediately so the queued setup-gate chain doesn't pay the full
+       * watchdogMs for every misconfigured / fork-pressure spawn. */
+      if (abortSignal?.aborted) return { markerSeen: false, lastError };
       try {
         const content = await readFile(logPath);
         if (content.includes(cfg.marker)) return { markerSeen: true };
@@ -124,6 +139,7 @@ export function createNsJailSetupGate(options: NsJailSetupGateOptions = {}): NsJ
   async function runSetup<T>(
     logPath: string,
     spawn: () => T,
+    abortSignal?: AbortSignal,
   ): Promise<NsJailSetupGateResult<T>> {
     waiters++;
     const previous = tail;
@@ -150,7 +166,7 @@ export function createNsJailSetupGate(options: NsJailSetupGateOptions = {}): NsJ
       throw err;
     }
 
-    const result = await pollForMarker(logPath);
+    const result = await pollForMarker(logPath, abortSignal);
     releaseSelf();
     return { value, markerSeen: result.markerSeen, pollError: result.lastError };
   }

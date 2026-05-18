@@ -109,6 +109,59 @@ describe('createNsJailSetupGate', () => {
     expect(elapsed).toBeLessThan(500);
   });
 
+  test('abortSignal releases the gate immediately so a failed spawn does not stall the queue', async () => {
+    /* Codex P1 follow-up on PR #1651: without abort, every async spawn
+     * failure (ENOENT/EACCES) pays the full watchdogMs while holding the
+     * serialized gate, amplifying latency for every queued job behind it.
+     * Verifies the gate honors AbortSignal: it should return well before
+     * watchdog when the signal fires (simulating child 'error'/'close'). */
+    const gate = createNsJailSetupGate({ pollIntervalMs: 5, watchdogMs: 500 });
+    const logPath = await tmpFile();
+    const controller = new AbortController();
+
+    /* Abort shortly after spawn, simulating an ENOENT 'error' event firing
+     * from a missing nsjail binary. */
+    setTimeout(() => controller.abort(), 20);
+
+    const start = Date.now();
+    const { markerSeen, pollError } = await gate.runSetup(logPath, () => 'aborted', controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(markerSeen).toBe(false);
+    expect(pollError).toBeUndefined();
+    /* Should release within ~one poll interval of the abort, not at the
+     * 500ms watchdog. Generous upper bound to absorb scheduler jitter. */
+    expect(elapsed).toBeLessThan(150);
+  });
+
+  test('queue does not stall when one job aborts mid-poll — next job runs immediately', async () => {
+    /* The end-to-end "no latency amplification" assertion. Two jobs
+     * back-to-back: the first aborts (simulating a failed spawn), the
+     * second must start within milliseconds of the abort — not after the
+     * watchdog fires. */
+    const gate = createNsJailSetupGate({ pollIntervalMs: 5, watchdogMs: 1000 });
+    const logPath1 = await tmpFile();
+    const logPath2 = await tmpFile();
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 20);
+    /* Make the second job's marker appear instantly so it's ready to
+     * release the moment its turn at the gate starts. */
+    fs.writeFileSync(logPath2, '[I][2026-05-14] Executing "/bin/bash" for \'[NONE]\'\n');
+
+    const start = Date.now();
+    const [r1, r2] = await Promise.all([
+      gate.runSetup(logPath1, () => 'first', ctrl.signal),
+      gate.runSetup(logPath2, () => 'second'),
+    ]);
+    const elapsed = Date.now() - start;
+
+    expect(r1.markerSeen).toBe(false);
+    expect(r2.markerSeen).toBe(true);
+    /* Without the abort, this would take ~1000ms (first job hits watchdog
+     * before releasing for the second). With abort: well under 100ms. */
+    expect(elapsed).toBeLessThan(200);
+  });
+
   test('does not match the literal "Executing" without the leading space prefix', async () => {
     /* NsJail's INFO-level line always renders as `[I][<ts>] Executing ...`
      * — the gate keys on ` Executing ` (with leading space) so user code
