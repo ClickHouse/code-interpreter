@@ -76,6 +76,7 @@ RUN apt-get update && \
     locales \
     procps \
     iptables \
+    bc \
     jq \
     poppler-utils \
     fonts-dejavu \
@@ -88,6 +89,17 @@ RUN apt-get update && \
     && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+# Restore the standard Debian `awk` -> `mawk` symlink. mawk is Priority:
+# required so its binary is in /usr/bin already, but slim base images skip
+# the mawk postinst's `update-alternatives --install /usr/bin/awk awk
+# /usr/bin/mawk 5` step that normally creates the user-facing `awk`
+# command. Without this, bare `awk ...` in user shell scripts fails with
+# `command not found` even though mawk itself is present. Identical
+# security surface to the existing pure-text utilities (sed, tr,
+# coreutils) — mawk has no system() / getline-from-command extensions
+# in its minimal build.
+RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk
 
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 

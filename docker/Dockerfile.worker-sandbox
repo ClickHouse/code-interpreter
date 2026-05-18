@@ -84,6 +84,8 @@ RUN apt-install \
     locales \
     procps \
     iptables \
+    bc \
+    jq \
     poppler-utils \
     fonts-dejavu \
     fonts-liberation \
@@ -94,6 +96,13 @@ RUN apt-install \
     && libffi=$(find /usr/lib -name 'libffi.so.8' -print -quit) \
     && { [ -n "$libffi" ] || { echo "libffi.so.8 not found" >&2; exit 1; }; } \
     && ln -sf "$libffi" "${libffi%.so.8}.so.6"
+
+# Restore the standard Debian `awk` -> `mawk` symlink. See api/Dockerfile
+# for the full rationale; in short, mawk's binary ships in slim base
+# images (Priority: required) but its postinst's update-alternatives
+# step is skipped, so bare `awk` doesn't resolve. Identical security
+# surface to sed/tr/coreutils.
+RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk
 
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
