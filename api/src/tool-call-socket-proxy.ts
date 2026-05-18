@@ -13,6 +13,17 @@ export interface ToolCallSocketProxyOptions {
   activeRequestTimeoutMs?: number;
   maxBodyBytes?: number;
   listenBacklog?: number;
+  /** Token-bucket capacity for the connection-rate limiter. The bucket
+   * starts full and refills at `connectionRateRefillPerSec`. Burst of
+   * legitimate concurrent tool calls (up to maxActiveRequests=16 by
+   * default) easily fits; a 500-connect()-in-50ms flood drains the
+   * bucket and subsequent connections are dropped at the application
+   * layer instead of allocating kernel unix_sock slab entries. */
+  connectionRateBurst?: number;
+  /** Sustained connection-acceptance rate in connections/second after the
+   * burst bucket is drained. The SDK opens one connection per tool call;
+   * even an aggressive agent rarely exceeds a few /sec. */
+  connectionRateRefillPerSec?: number;
   socketUid?: number;
   socketGid?: number;
   socketMode?: number;
@@ -25,6 +36,11 @@ export interface ToolCallSocketProxyHandle {
   activeConnections: () => number;
   activeRequests: () => number;
   activeUpstreams: () => number;
+  /** For tests: current available tokens in the connection-rate bucket. */
+  connectionRateTokens: () => number;
+  /** For tests + observability: cumulative count of connections dropped
+   * by the connection-rate limiter since proxy start. */
+  connectionRateDropped: () => number;
 }
 
 const DEFAULT_MAX_CONNECTIONS = 64;
@@ -38,6 +54,54 @@ const MAX_DEFAULT_CONNECTIONS = 256;
 const MAX_DEFAULT_ACTIVE_REQUESTS = 64;
 const ACTIVE_REQUEST_TIMEOUT_GRACE_MS = 5_000;
 const MAX_DEFAULT_ACTIVE_REQUEST_TIMEOUT_MS = 60_000;
+const DEFAULT_CONNECTION_RATE_BURST = 64;
+const DEFAULT_CONNECTION_RATE_REFILL_PER_SEC = 20;
+const MAX_DEFAULT_CONNECTION_RATE_BURST = 256;
+const MAX_DEFAULT_CONNECTION_RATE_REFILL_PER_SEC = 200;
+
+/** Monotonic-ish token bucket. Tokens refill continuously at a configured
+ * rate up to a burst cap. `tryConsume()` returns false instead of waiting
+ * when empty — callers drop the connection synchronously, which is the
+ * right behavior for a SOCK_STREAM accept handler (queuing in JS would
+ * still hold the kernel socket struct alive, defeating the point). */
+export interface TokenBucket {
+  tryConsume(): boolean;
+  tokens(): number;
+}
+
+export function createTokenBucket(opts: {
+  burst: number;
+  refillPerSec: number;
+  now?: () => number;
+}): TokenBucket {
+  const now = opts.now ?? Date.now;
+  const refillPerMs = opts.refillPerSec / 1000;
+  let tokens = opts.burst;
+  let last = now();
+
+  function refill(): void {
+    const t = now();
+    const elapsed = t - last;
+    if (elapsed <= 0) return;
+    tokens = Math.min(opts.burst, tokens + elapsed * refillPerMs);
+    last = t;
+  }
+
+  return {
+    tryConsume(): boolean {
+      refill();
+      if (tokens >= 1) {
+        tokens -= 1;
+        return true;
+      }
+      return false;
+    },
+    tokens(): number {
+      refill();
+      return tokens;
+    },
+  };
+}
 
 function normalizeTarget(rawTarget: string): URL {
   if (!rawTarget) {
@@ -142,6 +206,36 @@ function defaultActiveRequestTimeoutMs(): number {
   );
 }
 
+/* Rate-limit defaults scale with SANDBOX_MAX_CONCURRENT_JOBS in the same
+ * shape as defaultMaxConnections / defaultMaxActiveRequests above. A
+ * deployment with maxConcurrentJobs=64 is sized to run ~64 tool calls
+ * in parallel; capping the connection-acceptance rate at the fixed 20/sec
+ * baseline would throttle legitimate sustained traffic from that
+ * workload — connections that would have been 429'd by maxActiveRequests
+ * instead get destroyed at the rate limiter, which is the wrong shape
+ * (clients see ECONNRESET instead of a structured Retry-After response). */
+export function defaultConnectionRateBurst(): number {
+  const maxConcurrentJobs = parsePositiveInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS);
+  if (maxConcurrentJobs == null) return DEFAULT_CONNECTION_RATE_BURST;
+  return Math.min(
+    Math.max(maxConcurrentJobs * 4, DEFAULT_CONNECTION_RATE_BURST),
+    MAX_DEFAULT_CONNECTION_RATE_BURST,
+  );
+}
+
+export function defaultConnectionRateRefillPerSec(): number {
+  const maxConcurrentJobs = parsePositiveInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS);
+  if (maxConcurrentJobs == null) return DEFAULT_CONNECTION_RATE_REFILL_PER_SEC;
+  /* 2x maxConcurrentJobs gives headroom over the steady-state rate
+   * (~1 connection per active job per second for typical tool-call
+   * workloads). Floor at 20/sec so small deployments don't get a
+   * tighter limit than the fixed baseline. */
+  return Math.min(
+    Math.max(maxConcurrentJobs * 2, DEFAULT_CONNECTION_RATE_REFILL_PER_SEC),
+    MAX_DEFAULT_CONNECTION_RATE_REFILL_PER_SEC,
+  );
+}
+
 export async function startToolCallSocketProxy(
   opts: ToolCallSocketProxyOptions,
 ): Promise<ToolCallSocketProxyHandle> {
@@ -156,6 +250,8 @@ export async function startToolCallSocketProxy(
   const activeRequestTimeoutMs = opts.activeRequestTimeoutMs ?? defaultActiveRequestTimeoutMs();
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const listenBacklog = opts.listenBacklog ?? DEFAULT_LISTEN_BACKLOG;
+  const connectionRateBurst = opts.connectionRateBurst ?? defaultConnectionRateBurst();
+  const connectionRateRefillPerSec = opts.connectionRateRefillPerSec ?? defaultConnectionRateRefillPerSec();
   // The socket is intentionally connectable by sandbox jobs even when
   // SANDBOX_PER_JOB_UIDS maps each job to a distinct outside UID. Abuse is
   // bounded by the proxy's connection caps/timeouts, not by inode ownership.
@@ -164,6 +260,23 @@ export async function startToolCallSocketProxy(
   const activeSockets = new Set<net.Socket>();
   let activeRequests = 0;
   let activeUpstreams = 0;
+
+  /* Connection-rate limiter — counters the audit pattern of 500 AF_UNIX
+   * connect()s in <50 ms. Without this, even though the proxy itself
+   * stays bounded (maxConnections destroys excess accepts), each accept
+   * still allocates a unix_sock + dentry + skb queue in the in-VM
+   * kernel slab. On a memory-tight microVM, 500+ allocations in a
+   * single tick pressures the slab allocator hard enough that
+   * subsequent legitimate openat() / mmap() calls (e.g. ld.so loading
+   * shared libraries) sporadically fail with EMFILE — even though the
+   * fd table itself is at <1% utilization. Capping the *rate* of
+   * accepts at the application layer bounds how fast new slab entries
+   * can be created, giving the kernel time to reclaim. */
+  const connectionRateLimiter = createTokenBucket({
+    burst: connectionRateBurst,
+    refillPerSec: connectionRateRefillPerSec,
+  });
+  let connectionRateDroppedCount = 0;
 
   const server = http.createServer((req, res) => {
     const socket = req.socket;
@@ -399,6 +512,20 @@ export async function startToolCallSocketProxy(
   server.timeout = activeRequestTimeoutMs;
 
   server.on('connection', socket => {
+    /* Rate-limit BEFORE the concurrency check. The concurrency check
+     * (`activeSockets.size`) tells us how many connections are alive
+     * RIGHT NOW; the rate limiter tells us how fast new ones are being
+     * created. The audit's flood passes the concurrency check trivially
+     * (most connections accepted, processed, and destroyed faster than
+     * the count grows) but creates thousands of socket structs in the
+     * process. Rate-limiting at connect-time is what bounds the kernel
+     * slab pressure that surfaces as EMFILE in subsequent loader open()
+     * calls — see createTokenBucket comment for the full mechanism. */
+    if (!connectionRateLimiter.tryConsume()) {
+      connectionRateDroppedCount += 1;
+      destroySocket(socket);
+      return;
+    }
     if (activeSockets.size >= maxConnections) {
       log.warn('tool-call socket proxy connection limit reached; dropping connection');
       destroySocket(socket);
@@ -464,6 +591,8 @@ export async function startToolCallSocketProxy(
     activeConnections: () => activeSockets.size,
     activeRequests: () => activeRequests,
     activeUpstreams: () => activeUpstreams,
+    connectionRateTokens: () => connectionRateLimiter.tokens(),
+    connectionRateDropped: () => connectionRateDroppedCount,
   };
 }
 
@@ -472,6 +601,13 @@ if (require.main === module) {
   const rawTarget = process.env.SANDBOX_FORWARD_TARGET || '';
   const socketUid = process.env.TCS_SOCKET_UID ? Number(process.env.TCS_SOCKET_UID) : undefined;
   const socketGid = process.env.TCS_SOCKET_GID ? Number(process.env.TCS_SOCKET_GID) : undefined;
+  /* Operator overrides for the connection-rate limiter — see
+   * createTokenBucket comment for the kernel-slab-pressure motivation.
+   * Defaults (burst=64, refill=20/sec) are sized for the SDK's tool-call
+   * pattern (one connection per call) plus generous headroom; raise only
+   * if a legitimate workload trips the dropped-connection counter. */
+  const rateBurst = parsePositiveInt(process.env.TCS_CONNECTION_RATE_BURST);
+  const rateRefillPerSec = parsePositiveInt(process.env.TCS_CONNECTION_RATE_REFILL_PER_SEC);
   let handle: ToolCallSocketProxyHandle | undefined;
   let shuttingDown = false;
 
@@ -492,7 +628,11 @@ if (require.main === module) {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  startToolCallSocketProxy({ socketPath, rawTarget, socketUid, socketGid })
+  startToolCallSocketProxy({
+    socketPath, rawTarget, socketUid, socketGid,
+    connectionRateBurst: rateBurst,
+    connectionRateRefillPerSec: rateRefillPerSec,
+  })
     .then(started => {
       handle = started;
     })

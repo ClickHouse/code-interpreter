@@ -730,4 +730,98 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
 
     await new Promise<void>(r => blocker.close(() => r()));
   });
+
+  test('CONNECT-FLOOD DoS: connection-rate limiter drops fast-burst accepts that would pressure kernel slab', async () => {
+    /* This is the SPECIFIC audit scenario PR #1648 follow-up was opened
+     * for: 500 AF_UNIX connect()s in <50 ms. Without the rate limiter,
+     * every accept allocates kernel unix_sock + dentry + skb queue slab
+     * entries; the proxy's existing maxConnections only bounds the
+     * application-level activeSockets set, not the allocation rate.
+     * Observation from the audit: in-VM kernel slab pressure surfaces
+     * as EMFILE in subsequent loader open() calls even though the fd
+     * table itself sits at 0.1% utilization.
+     *
+     * Test verifies the wire-level effect: with burst=8, refill=0 (frozen
+     * for determinism), only the first 8 of 100 concurrent /tool-call
+     * requests reach the upstream. The remaining 92 hit the rate limiter
+     * and are destroyed before the HTTP request layer sees them — they
+     * surface as either ECONNRESET / 'socket hang up' or EPIPE on the
+     * client side. */
+    const upstream = await startUpstream();
+    const proxy = await spawnProxy({
+      upstreamUrl: upstream.url,
+      env: {
+        /* burst=8 — much smaller than maxConnections so the RATE limit
+         * bites first. refill=1/sec is effectively frozen over the
+         * test's ~100ms window. */
+        TCS_CONNECTION_RATE_BURST: '8',
+        TCS_CONNECTION_RATE_REFILL_PER_SEC: '1',
+      },
+    });
+
+    try {
+      const results = await Promise.allSettled(
+        Array.from({ length: 100 }, () =>
+          postToolCall(proxy.socketPath, '{"x":1}'),
+        ),
+      );
+
+      const ok = results.filter(r => r.status === 'fulfilled' && r.value.status === 200).length;
+      const dropped = results.length - ok;
+
+      /* Burst=8 with a near-frozen refill — somewhere in [8, 12] should
+       * succeed (burst + occasional refill during test window). The
+       * key assertion is that the count is bounded WELL below 100. */
+      expect(ok).toBeGreaterThanOrEqual(1);
+      expect(ok).toBeLessThanOrEqual(20);
+      expect(dropped).toBeGreaterThanOrEqual(80);
+      /* And critically: upstream sees only the rate-limit-allowed ones,
+       * NOT 100. This bounds kernel slab pressure: the proxy never
+       * creates the in-VM unix_sock entries for the dropped batch. */
+      expect(upstream.calls()).toBeLessThanOrEqual(ok);
+    } finally {
+      await proxy.stop();
+      await upstream.close();
+    }
+  });
+
+  test('CONNECT-FLOOD recovery: bucket refills so legitimate traffic resumes after a flood', async () => {
+    /* Follow-up to the test above: confirm the limiter doesn't permanently
+     * starve a connection. After draining the burst bucket, wait long
+     * enough for the refill to top it back up, then verify a new
+     * /tool-call succeeds. This guards against a bug where dropped
+     * connections might leak the rate-limit credit (e.g. if the bucket
+     * was decremented BEFORE the maxConnections check and never
+     * compensated when both gates were hit by the same connection). */
+    const upstream = await startUpstream();
+    const proxy = await spawnProxy({
+      upstreamUrl: upstream.url,
+      env: {
+        TCS_CONNECTION_RATE_BURST: '4',
+        /* 20/sec refill — burst recovers in ~250ms. */
+        TCS_CONNECTION_RATE_REFILL_PER_SEC: '20',
+      },
+    });
+
+    try {
+      /* Drain the burst with a parallel flood. */
+      const drain = await Promise.allSettled(
+        Array.from({ length: 30 }, () => postToolCall(proxy.socketPath, '{"x":1}')),
+      );
+      const okDuringDrain = drain.filter(r => r.status === 'fulfilled' && r.value.status === 200).length;
+      expect(okDuringDrain).toBeGreaterThanOrEqual(1);
+      expect(okDuringDrain).toBeLessThanOrEqual(15);
+
+      /* Wait for the bucket to refill past 1 token (50ms refills 1 token
+       * at 20/sec; 500ms gives us plenty of margin). */
+      await new Promise(r => setTimeout(r, 500));
+
+      /* A single legitimate request after the wait must succeed. */
+      const post = await postToolCall(proxy.socketPath, '{"x":2}');
+      expect(post.status).toBe(200);
+    } finally {
+      await proxy.stop();
+      await upstream.close();
+    }
+  });
 });

@@ -4,7 +4,13 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { startToolCallSocketProxy, type ToolCallSocketProxyHandle } from './tool-call-socket-proxy';
+import {
+  createTokenBucket,
+  defaultConnectionRateBurst,
+  defaultConnectionRateRefillPerSec,
+  startToolCallSocketProxy,
+  type ToolCallSocketProxyHandle,
+} from './tool-call-socket-proxy';
 
 /* PTC-presence headers required by the proxy's filter so legitimate
  * /tool-call requests forward instead of getting the canonical 404. The
@@ -340,5 +346,103 @@ describe('tool-call socket proxy', () => {
     expect(response.body).toBe('request body too large');
     expect(upstreamCalls).toBe(0);
     await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  /* Integration tests for the connection-rate limiter live in
+   * tool-call-socket-proxy-runtime.test.ts. Bun's node:http compat layer
+   * does not fire `'connection'` events, so the in-process proxy here
+   * never invokes the rate-limiter code path under `bun test` — the
+   * checks would pass vacuously. The runtime tests spawn the proxy as a
+   * real Node subprocess, matching the production runtime. The pure
+   * createTokenBucket logic is fully unit-tested below and runs fine
+   * under either runtime. */
+});
+
+describe('createTokenBucket', () => {
+  test('starts full at burst capacity', () => {
+    const b = createTokenBucket({ burst: 10, refillPerSec: 1 });
+    expect(b.tokens()).toBeCloseTo(10);
+  });
+
+  test('returns true until the bucket is drained, then false', () => {
+    const b = createTokenBucket({ burst: 3, refillPerSec: 0, now: () => 0 });
+    expect(b.tryConsume()).toBe(true);
+    expect(b.tryConsume()).toBe(true);
+    expect(b.tryConsume()).toBe(true);
+    expect(b.tryConsume()).toBe(false);
+    expect(b.tryConsume()).toBe(false);
+  });
+
+  test('refills at refillPerSec without exceeding the burst cap', () => {
+    let t = 1000;
+    const b = createTokenBucket({ burst: 10, refillPerSec: 100, now: () => t });
+    /* Drain. */
+    for (let i = 0; i < 10; i++) expect(b.tryConsume()).toBe(true);
+    expect(b.tryConsume()).toBe(false);
+    /* Advance 50ms — 100/sec * 0.050 = 5 tokens. */
+    t += 50;
+    for (let i = 0; i < 5; i++) expect(b.tryConsume()).toBe(true);
+    expect(b.tryConsume()).toBe(false);
+    /* Advance way more than burst's worth — capacity caps at 10, not
+     * unbounded growth. */
+    t += 10_000;
+    expect(b.tokens()).toBeCloseTo(10);
+  });
+
+  test('refillPerSec=0 freezes the bucket once drained (test-determinism guarantee)', () => {
+    const b = createTokenBucket({ burst: 2, refillPerSec: 0, now: () => 0 });
+    expect(b.tryConsume()).toBe(true);
+    expect(b.tryConsume()).toBe(true);
+    /* No matter how much time we'd advance with a real clock, refill of
+     * 0/sec adds zero tokens. */
+    expect(b.tryConsume()).toBe(false);
+    expect(b.tokens()).toBe(0);
+  });
+});
+
+describe('connection-rate defaults scale with SANDBOX_MAX_CONCURRENT_JOBS', () => {
+  /* Codex P2 follow-up on PR #1652: the previous fixed 20-accept/sec
+   * refill would throttle legitimate sustained traffic on deployments
+   * where maxConcurrentJobs is scaled up (e.g. 64), because the proxy's
+   * other defaults (maxConnections, maxActiveRequests) already scale
+   * from SANDBOX_MAX_CONCURRENT_JOBS but the rate limiter did not. */
+  const originalEnv = process.env.SANDBOX_MAX_CONCURRENT_JOBS;
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.SANDBOX_MAX_CONCURRENT_JOBS;
+    } else {
+      process.env.SANDBOX_MAX_CONCURRENT_JOBS = originalEnv;
+    }
+  });
+
+  test('unset env keeps the fixed 64/20 defaults', () => {
+    delete process.env.SANDBOX_MAX_CONCURRENT_JOBS;
+    expect(defaultConnectionRateBurst()).toBe(64);
+    expect(defaultConnectionRateRefillPerSec()).toBe(20);
+  });
+
+  test('small concurrency floors at the baseline (never tighter than the fixed defaults)', () => {
+    process.env.SANDBOX_MAX_CONCURRENT_JOBS = '8';
+    /* 8 * 4 = 32, but floor at 64 baseline. */
+    expect(defaultConnectionRateBurst()).toBe(64);
+    /* 8 * 2 = 16, but floor at 20 baseline. */
+    expect(defaultConnectionRateRefillPerSec()).toBe(20);
+  });
+
+  test('mid concurrency scales burst proportionally', () => {
+    process.env.SANDBOX_MAX_CONCURRENT_JOBS = '32';
+    /* 32 * 4 = 128 (above 64 floor, below 256 ceiling). */
+    expect(defaultConnectionRateBurst()).toBe(128);
+    /* 32 * 2 = 64 (above 20 floor, below 200 ceiling). */
+    expect(defaultConnectionRateRefillPerSec()).toBe(64);
+  });
+
+  test('high concurrency caps at the ceiling — bounded resource use even with extreme config', () => {
+    process.env.SANDBOX_MAX_CONCURRENT_JOBS = '256';
+    /* 256 * 4 = 1024, capped at 256 ceiling. */
+    expect(defaultConnectionRateBurst()).toBe(256);
+    /* 256 * 2 = 512, capped at 200 ceiling. */
+    expect(defaultConnectionRateRefillPerSec()).toBe(200);
   });
 });
