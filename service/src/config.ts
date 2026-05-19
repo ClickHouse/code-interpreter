@@ -97,8 +97,8 @@ export const env = {
   KEY_CACHE_TTL: Number(process.env.KEY_CACHE_TTL) || 120, // 2 minutes
   USER_CACHE_TTL: Number(process.env.USER_CACHE_TTL) || 120, // 2 minutes
   // Execution Rate Limits
-  EXEC_LIMIT_WINDOW: Number(process.env.RATE_LIMIT_WINDOW) || 60 * 1000, // 1 minute
-  EXEC_MAX_REQUESTS: Number(process.env.MAX_REQUESTS) || 60, // requests per minute
+  EXEC_LIMIT_WINDOW: Number(process.env.RATE_LIMIT_WINDOW) || 30 * 1000, // 30 seconds
+  EXEC_MAX_REQUESTS: Number(process.env.MAX_REQUESTS) || 20, // execution requests per window
   // Upload Rate Limits
   UPLOAD_LIMIT_WINDOW: Number(process.env.UPLOAD_LIMIT_WINDOW) || 5 * 60 * 1000, // 5 minutes
   UPLOAD_MAX_REQUESTS: Number(process.env.UPLOAD_MAX_REQUESTS) || 30, // 30 uploads per 5 minutes
