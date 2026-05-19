@@ -3,6 +3,7 @@ import type { AuthenticatedRequest } from '../types';
 import { SessionKeyResolutionError } from '../session-key';
 import { CodeApiJwtAuthError } from '../auth/librechat-jwt';
 import { AuthProviderConfigError } from '../auth/provider';
+import { hasSyntheticAccessToken } from '../auth/synthetic';
 import logger from '../logger';
 
 function serializeError(error: unknown): unknown {
@@ -71,6 +72,7 @@ export function buildRequestNotFoundLogMeta(req: Request): Record<string, unknow
     authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'legacy-api-key',
     hasBearerToken: Boolean(req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()),
     hasApiKey: Boolean(req.header('X-API-Key')),
+    hasSyntheticToken: hasSyntheticAccessToken(req),
   };
 }
 

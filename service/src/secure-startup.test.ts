@@ -57,6 +57,22 @@ describe('hardened CodeAPI startup config', () => {
     expect(() => validateWorkerHardenedConfig()).toThrow('CODEAPI_EXECUTION_MANIFEST_SECRET');
   });
 
+  test('keeps synthetic auth token out of worker and egress processes', () => {
+    env.HARDENED_SANDBOX_MODE = true;
+    env.EGRESS_GATEWAY_URL = 'http://egress-gateway:3190';
+    env.EXECUTION_MANIFEST_PRIVATE_KEY = 'private-key';
+    env.EGRESS_GRANT_SECRET = 'strong-egress-grant-secret-32-bytes';
+    env.EGRESS_LEDGER_REQUIRED = true;
+    env.EGRESS_GATEWAY_FILE_SERVER_URL = 'http://file-server:3000';
+    env.EGRESS_GATEWAY_TOOL_CALL_SERVER_URL = 'http://tool-call-server:3033';
+    process.env.REDIS_HOST = 'redis';
+    process.env.CODEAPI_INTERNAL_SERVICE_TOKEN = 'internal-token';
+    process.env.CODEAPI_SYNTHETIC_ACCESS_TOKEN = 'synthetic-token-must-stay-on-api';
+
+    expect(() => validateWorkerHardenedConfig()).toThrow('CODEAPI_SYNTHETIC_ACCESS_TOKEN');
+    expect(() => validateEgressGatewayHardenedConfig()).toThrow('CODEAPI_SYNTHETIC_ACCESS_TOKEN');
+  });
+
   test('requires gateway URL, internal auth, and worker manifest private key', () => {
     env.HARDENED_SANDBOX_MODE = true;
     env.EGRESS_GATEWAY_URL = '';

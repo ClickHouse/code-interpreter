@@ -97,6 +97,7 @@ describe('buildRequestNotFoundLogMeta', () => {
       userAgent: 'unit-test',
       hasBearerToken: false,
       hasApiKey: false,
+      hasSyntheticToken: false,
     });
   });
 });

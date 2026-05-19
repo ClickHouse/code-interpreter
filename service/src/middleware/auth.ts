@@ -10,6 +10,11 @@ import { resolveSessionKey, parseUploadSessionKeyInput, SessionKeyResolutionErro
 import { LibreChatJwtAuthProvider, CodeApiJwtAuthError } from '../auth/librechat-jwt';
 import { applyPrincipal, type CodeApiPrincipal } from '../auth/principal';
 import { AuthProviderConfigError, getAuthProviderMode } from '../auth/provider';
+import {
+  authenticateSyntheticRequest,
+  CODEAPI_SYNTHETIC_AUTH_HEADER,
+  hasSyntheticAccessToken,
+} from '../auth/synthetic';
 import logger from '../logger';
 
 /**
@@ -55,6 +60,7 @@ function authLogMeta(req: AuthenticatedRequest, extra: Record<string, unknown> =
     authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'legacy-api-key',
     hasBearerToken: Boolean(req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()),
     hasApiKey: Boolean(req.header('X-API-Key')),
+    hasSyntheticToken: hasSyntheticAccessToken(req),
     principalSource: req.codeApiPrincipal?.principalSource,
     userId: req.codeApiAuthContext?.userId,
     tenantId: req.codeApiAuthContext?.tenantId,
@@ -184,12 +190,32 @@ export const apiKeyAuth = async (
   }
   const apiKeyString = req.header('X-API-Key') ?? '';
   const bearerToken = req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  if (apiKeyString && bearerToken) {
+  const syntheticToken = req.header(CODEAPI_SYNTHETIC_AUTH_HEADER)?.trim();
+  const authHeaderCount = [apiKeyString, bearerToken, syntheticToken].filter(Boolean).length;
+  if (authHeaderCount > 1) {
     logger.warn('Rejecting ambiguous CodeAPI auth headers', authLogMeta(req));
     return res.status(400).json({ error: 'Ambiguous authentication headers' });
   }
 
   try {
+    const syntheticAuthResult = authenticateSyntheticRequest(req);
+    if (syntheticAuthResult !== null) {
+      if (!syntheticAuthResult.ok) {
+        const logMeta = authLogMeta(req, { mode: 'synthetic', reason: syntheticAuthResult.reason });
+        if (syntheticAuthResult.status >= 500) {
+          logger.error('Rejecting synthetic CodeAPI request', logMeta);
+        } else {
+          logger.warn('Rejecting synthetic CodeAPI request', logMeta);
+        }
+        return res.status(syntheticAuthResult.status).json({ error: syntheticAuthResult.error });
+      }
+
+      applyPrincipal(req, syntheticAuthResult.principal);
+      logger.debug('CodeAPI synthetic request authenticated', authLogMeta(req, { mode: 'synthetic' }));
+      next();
+      return;
+    }
+
     const mode = getAuthProviderMode();
     let principal: CodeApiPrincipal | null = null;
 

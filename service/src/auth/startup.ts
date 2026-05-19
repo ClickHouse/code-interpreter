@@ -2,6 +2,7 @@ import { env } from '../config';
 import logger from '../logger';
 import { validateLibreChatJwtVerifierConfig } from './librechat-jwt';
 import { AuthProviderConfigError, getAuthProviderMode } from './provider';
+import { validateSyntheticAccessTokenConfig } from './synthetic';
 import type { CodeApiAuthProviderMode } from './provider';
 
 type StartupAuthOptions = {
@@ -58,6 +59,8 @@ export async function validateStartupAuthConfig(
 ): Promise<void> {
   const mode = options.mode ?? getAuthProviderMode();
   const isLocalMode = options.isLocalMode ?? env.LOCAL_MODE;
+
+  validateSyntheticAccessTokenConfig();
 
   if (isLocalMode) {
     logger.info('LOCAL MODE - Authentication bypassed');

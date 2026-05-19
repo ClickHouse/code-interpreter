@@ -42,6 +42,7 @@ export function validateWorkerHardenedConfig(): void {
   if (!env.HARDENED_SANDBOX_MODE) return;
   rejectValue('CODEAPI_EGRESS_GRANT_SECRET', process.env.CODEAPI_EGRESS_GRANT_SECRET);
   rejectValue('CODEAPI_EXECUTION_MANIFEST_SECRET', process.env.CODEAPI_EXECUTION_MANIFEST_SECRET);
+  rejectValue('CODEAPI_SYNTHETIC_ACCESS_TOKEN', process.env.CODEAPI_SYNTHETIC_ACCESS_TOKEN);
   requireValue('EGRESS_GATEWAY_URL', env.EGRESS_GATEWAY_URL);
   requireValue(INTERNAL_SERVICE_TOKEN_ENV, process.env[INTERNAL_SERVICE_TOKEN_ENV]);
   requireValue('CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY', env.EXECUTION_MANIFEST_PRIVATE_KEY);
@@ -49,6 +50,7 @@ export function validateWorkerHardenedConfig(): void {
 
 export function validateEgressGatewayHardenedConfig(): void {
   if (!env.HARDENED_SANDBOX_MODE) return;
+  rejectValue('CODEAPI_SYNTHETIC_ACCESS_TOKEN', process.env.CODEAPI_SYNTHETIC_ACCESS_TOKEN);
   requireStrongSecret('CODEAPI_EGRESS_GRANT_SECRET', env.EGRESS_GRANT_SECRET);
   requireValue(INTERNAL_SERVICE_TOKEN_ENV, process.env[INTERNAL_SERVICE_TOKEN_ENV]);
   requireValue('EGRESS_GATEWAY_FILE_SERVER_URL', env.EGRESS_GATEWAY_FILE_SERVER_URL);
