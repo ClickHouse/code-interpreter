@@ -247,6 +247,83 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
   const startTime = Date.now();
   const hasStdin = stdin !== undefined && stdin.length > 0;
 
+  let stdout = '';
+  let stderr = '';
+  let output = '';
+  let killed = false;
+  let killMessage: string | null = null;
+  let killStatus: string | null = null;
+
+  function drainStream(
+    child: ChildProcessWithoutNullStreams,
+    stream: NodeJS.ReadableStream,
+    target: 'stdout' | 'stderr',
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const decoder = new TextDecoder();
+      stream.on('data', (data: Buffer | string) => {
+        const buf = typeof data === 'string' ? Buffer.from(data) : data;
+        const chunk = decoder.decode(buf, { stream: true });
+
+        if (target === 'stdout') {
+          if (stdout.length + chunk.length > outputMaxSize) {
+            const remaining = outputMaxSize - stdout.length;
+            if (remaining > 0) {
+              stdout += chunk.slice(0, remaining);
+              output += chunk.slice(0, remaining);
+            }
+            if (!killed) {
+              killMessage = 'stdout length exceeded';
+              killStatus = 'OL';
+              killed = true;
+              child.kill('SIGKILL');
+            }
+            return;
+          }
+          stdout += chunk;
+          output += chunk;
+        } else {
+          if (stderr.length + chunk.length > outputMaxSize) {
+            const remaining = outputMaxSize - stderr.length;
+            if (remaining > 0) {
+              stderr += chunk.slice(0, remaining);
+              output += chunk.slice(0, remaining);
+            }
+            if (!killed) {
+              killMessage = 'stderr length exceeded';
+              killStatus = 'EL';
+              killed = true;
+              child.kill('SIGKILL');
+            }
+            return;
+          }
+          stderr += chunk;
+          output += chunk;
+        }
+      });
+      /* Defensive: if the stream is already closed at attach time, late
+       * listeners may not see the events. */
+      const s = stream as NodeJS.ReadableStream & { destroyed?: boolean; readableEnded?: boolean };
+      if (s.destroyed === true || s.readableEnded === true) {
+        resolve();
+        return;
+      }
+      /* Resolve on 'end' OR 'close'. Normal exits emit both; a spawn
+       * failure (ENOENT/EACCES — the binary never started) emits only
+       * 'close' under Bun's node:child_process compat — 'end' never
+       * fires because no producer ever opened the write side. */
+      let resolved = false;
+      const done = (): void => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+      stream.on('end', done);
+      stream.on('close', done);
+      stream.on('error', reject);
+    });
+  }
+
   /* NsJail's mount-setup phase races on the host-shared `/tmp/nsjail.0.root`
    * directory when multiple jails launch concurrently in the same pod (root
    * runner -> orig_uid=0 in NsJail's per-uid setup dir name). The gate
@@ -262,6 +339,8 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
    * gap narrows. Pipe FD lifecycle is equivalent — both methods steady
    * at baseline FD count across 2000+ spawns, sequential and concurrent. */
   let proc: ChildProcessWithoutNullStreams;
+  let stdoutDrain: Promise<void> | undefined;
+  let stderrDrain: Promise<void> | undefined;
   let markerSeen = false;
   let pollError: NodeJS.ErrnoException | undefined;
   /* Async spawn-failure state. ChildProcess emits 'error' (not throws)
@@ -306,6 +385,20 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
        * Aborting on close too guarantees the gate releases regardless
        * of which event sequence the runtime picks. */
       child.on('close', () => childDiedSignal.abort());
+      stdoutDrain = drainStream(child, child.stdout, 'stdout');
+      stderrDrain = drainStream(child, child.stderr, 'stderr');
+      void stdoutDrain.catch(() => {});
+      void stderrDrain.catch(() => {});
+      /* Attach a stdin 'error' handler before the setup gate can wait. If
+       * nsjail exits before the caller writes stdin, the stream may emit
+       * EPIPE while the gate is still polling. */
+      child.stdin.on('error', err => {
+        const errno = err as NodeJS.ErrnoException;
+        logger.warn(
+          { logId, err: { code: errno.code, message: errno.message } },
+          'nsjail stdin pipe error (child likely exited mid-write)',
+        );
+      });
       return child;
     }, childDiedSignal.signal));
   } catch (err) {
@@ -338,22 +431,6 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     nsjailSetupGateWatchdogFires.inc();
   }
 
-  /* Attach a stdin 'error' handler BEFORE any write. If nsjail exits or
-   * closes its stdin before/during our write, the kernel sends EPIPE on
-   * the write end; without a listener that becomes an uncaughtException
-   * that crashes the runner. The child 'error' listener above does NOT
-   * catch stdin pipe errors — those are emitted on the writable stream
-   * itself, not the ChildProcess. We just log; the child has either
-   * already died (drainStream will resolve via 'close') or will exit
-   * imminently. */
-  proc.stdin.on('error', err => {
-    const errno = err as NodeJS.ErrnoException;
-    logger.warn(
-      { logId, err: { code: errno.code, message: errno.message } },
-      'nsjail stdin pipe error (child likely exited mid-write)',
-    );
-  });
-
   if (hasStdin) {
     proc.stdin.write(stdin!);
     proc.stdin.end();
@@ -364,89 +441,9 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     proc.stdin.end();
   }
 
-  let stdout = '';
-  let stderr = '';
-  let output = '';
-  let killed = false;
-  let killMessage: string | null = null;
-  let killStatus: string | null = null;
-
-  function drainStream(
-    stream: NodeJS.ReadableStream,
-    target: 'stdout' | 'stderr',
-  ): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const decoder = new TextDecoder();
-      stream.on('data', (data: Buffer | string) => {
-        const buf = typeof data === 'string' ? Buffer.from(data) : data;
-        const chunk = decoder.decode(buf, { stream: true });
-
-        if (target === 'stdout') {
-          if (stdout.length + chunk.length > outputMaxSize) {
-            const remaining = outputMaxSize - stdout.length;
-            if (remaining > 0) {
-              stdout += chunk.slice(0, remaining);
-              output += chunk.slice(0, remaining);
-            }
-            if (!killed) {
-              killMessage = 'stdout length exceeded';
-              killStatus = 'OL';
-              killed = true;
-              proc.kill('SIGKILL');
-            }
-            return;
-          }
-          stdout += chunk;
-          output += chunk;
-        } else {
-          if (stderr.length + chunk.length > outputMaxSize) {
-            const remaining = outputMaxSize - stderr.length;
-            if (remaining > 0) {
-              stderr += chunk.slice(0, remaining);
-              output += chunk.slice(0, remaining);
-            }
-            if (!killed) {
-              killMessage = 'stderr length exceeded';
-              killStatus = 'EL';
-              killed = true;
-              proc.kill('SIGKILL');
-            }
-            return;
-          }
-          stderr += chunk;
-          output += chunk;
-        }
-      });
-      /* Defensive: if the stream is already closed at attach time, late
-       * listeners may not see the events. This happens when the child
-       * died before drainStream got called — even with the abort signal
-       * shortening the setup-gate wait, a sufficiently-slow first poll
-       * iteration could let the gate return AFTER the close event has
-       * already fired. Resolve synchronously based on current state. */
-      const s = stream as NodeJS.ReadableStream & { destroyed?: boolean; readableEnded?: boolean };
-      if (s.destroyed === true || s.readableEnded === true) {
-        resolve();
-        return;
-      }
-      /* Resolve on 'end' OR 'close'. Normal exits emit both; a spawn
-       * failure (ENOENT/EACCES — the binary never started) emits only
-       * 'close' under Bun's node:child_process compat — 'end' never
-       * fires because no producer ever opened the write side. */
-      let resolved = false;
-      const done = (): void => {
-        if (resolved) return;
-        resolved = true;
-        resolve();
-      };
-      stream.on('end', done);
-      stream.on('close', done);
-      stream.on('error', reject);
-    });
-  }
-
   await Promise.all([
-    drainStream(proc.stdout, 'stdout'),
-    drainStream(proc.stderr, 'stderr'),
+    stdoutDrain ?? drainStream(proc, proc.stdout, 'stdout'),
+    stderrDrain ?? drainStream(proc, proc.stderr, 'stderr'),
   ]);
 
   if (spawnError) {

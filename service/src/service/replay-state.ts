@@ -137,6 +137,17 @@ export interface ExecutionState {
    * as cache hits and skip real tool calls. Populated in `runAndRespond`
    * right before emitting a `tool_call_required` response. */
   emittedCallIds?: string[];
+  /** Replay-only: metadata for emitted tool calls, keyed by `id` at use sites.
+   * Stored so continuation commits can persist the original tool name and a
+   * compact input signature beside the result. Bash replay uses that metadata
+   * to safely resolve background tool calls whose completion order can differ
+   * between runs. */
+  emittedToolCalls?: Array<{
+    id: string;
+    name: string;
+    input_hash?: string;
+    call_site?: string;
+  }>;
   /** Target language for PTC. Defaults to 'python'. Bash is replay-only. */
   language?: 'python' | 'bash';
   /** Blocking-only legacy fields. New blocking results live in
@@ -153,6 +164,9 @@ export interface HistoryEntry {
   is_error?: boolean;
   error_message?: string;
   received_at: number;
+  tool_name?: string;
+  input_hash?: string;
+  call_site?: string;
 }
 
 /** Describes how an incoming `tool_results` batch would interact with the
@@ -511,7 +525,15 @@ function canonicalEntryBody(
  */
 export async function computeToolHistoryDelta(
   execution_id: string,
-  results: Array<{ call_id: string; result: unknown; is_error?: boolean; error_message?: string }>,
+  results: Array<{
+    call_id: string;
+    result: unknown;
+    is_error?: boolean;
+    error_message?: string;
+    tool_name?: string;
+    input_hash?: string;
+    call_site?: string;
+  }>,
 ): Promise<ToolHistoryDelta | { error: string; status?: number }> {
   const serializedByCallId = new Map<string, string>();
   if (results.length === 0) {
@@ -546,6 +568,9 @@ export async function computeToolHistoryDelta(
       is_error: r.is_error ?? false,
       error_message: r.error_message,
       received_at: now,
+      tool_name: r.tool_name,
+      input_hash: r.input_hash,
+      call_site: r.call_site,
     };
     const serialized = JSON.stringify(entry);
     const newBytes = Buffer.byteLength(serialized, 'utf8');
@@ -862,6 +887,9 @@ export interface ValidatedContinuationResult {
   result: unknown;
   is_error?: boolean;
   error_message?: string;
+  tool_name?: string;
+  input_hash?: string;
+  call_site?: string;
 }
 
 /** Validate the raw `tool_results` array a continuation request submitted:

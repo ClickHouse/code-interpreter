@@ -131,6 +131,15 @@ execute_tool() {
             local result=$(echo "$expression" | bc -l 2>/dev/null || echo "0")
             echo "{\"result\": $result}"
             ;;
+        "list_databases_mcp_ClickHouse")
+            local service_id=$(echo "$tool_input" | jq -r '.serviceId // "unknown"')
+            echo "{\"serviceId\":\"$service_id\",\"databases\":[\"default\",\"system\"]}"
+            ;;
+        "list_tables_mcp_ClickHouse")
+            local service_id=$(echo "$tool_input" | jq -r '.serviceId // "unknown"')
+            local database=$(echo "$tool_input" | jq -r '.database // "default"')
+            echo "{\"serviceId\":\"$service_id\",\"database\":\"$database\",\"tables\":[\"events\",\"metrics\"]}"
+            ;;
         *)
             log_warn "Unknown tool: $tool_name, returning mock response" >&2
             echo "{\"mock\": true, \"tool\": \"$tool_name\"}"
@@ -246,10 +255,13 @@ run_test() {
     elif [[ "$status" == "error" ]]; then
         log_error "Execution failed!"
         echo "$response" | jq '.error, .stderr'
+        return 1
     elif [[ $iteration -ge $MAX_ITERATIONS ]]; then
         log_error "Max iterations reached!"
+        return 1
     else
         log_warn "Unknown status: $status"
+        return 1
     fi
     
     echo "============================================================================="
@@ -685,6 +697,99 @@ echo "NY: $ny"'
     run_test "$code" "$tools" "Bash: Multiple tool calls" "bash"
 }
 
+# Test: Bash PTC - parallel bare tool calls emit one batch
+test_bash_parallel() {
+    echo ""
+    echo "============================================================================="
+    log_info "Starting: Bash - Parallel Tool Calls"
+    echo "============================================================================="
+
+    local service_id="45886e06-932b-4cff-bb49-3f7281d80717"
+    local code='list_databases_mcp_ClickHouse '"'"'{"serviceId":"45886e06-932b-4cff-bb49-3f7281d80717"}'"'"' &
+list_tables_mcp_ClickHouse '"'"'{"serviceId":"45886e06-932b-4cff-bb49-3f7281d80717","database":"default"}'"'"' &
+wait
+echo "parallel done"'
+    local tools='[
+        {
+            "name": "list_databases_mcp_ClickHouse",
+            "description": "List databases for a ClickHouse service.",
+            "parameters": {
+                "type": "object",
+                "properties": {"serviceId": {"type": "string"}},
+                "required": ["serviceId"]
+            }
+        },
+        {
+            "name": "list_tables_mcp_ClickHouse",
+            "description": "List tables for a ClickHouse service database.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "serviceId": {"type": "string"},
+                    "database": {"type": "string"}
+                },
+                "required": ["serviceId", "database"]
+            }
+        }
+    ]'
+
+    local response
+    response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: $API_KEY" \
+        -d "{\"code\": $(echo "$code" | jq -Rs .), \"tools\": $tools, \"language\": \"bash\"}")
+    echo "$response" | jq '.' 2>/dev/null || echo "$response"
+
+    local status
+    status=$(echo "$response" | jq -r '.status // "unknown"')
+    local continuation_token
+    continuation_token=$(echo "$response" | jq -r '.continuation_token // empty')
+    local tool_call_count
+    tool_call_count=$(echo "$response" | jq '.tool_calls | length')
+
+    if [ "$status" != "tool_call_required" ] || [ "$tool_call_count" -ne 2 ] || [ -z "$continuation_token" ]; then
+        log_error "Expected one tool_call_required batch with 2 calls, got status=$status count=$tool_call_count"
+        return 1
+    fi
+    if ! echo "$response" | jq -e '
+        ([.tool_calls[].name] | index("list_databases_mcp_ClickHouse") != null)
+        and ([.tool_calls[].name] | index("list_tables_mcp_ClickHouse") != null)
+    ' >/dev/null; then
+        log_error "Expected both ClickHouse MCP tool names in the first batch"
+        return 1
+    fi
+    if ! echo "$response" | jq -e --arg service_id "$service_id" '
+        [.tool_calls[].input.serviceId] | all(. == $service_id)
+    ' >/dev/null; then
+        log_error "Expected both tool inputs to preserve serviceId"
+        return 1
+    fi
+
+    local tool_results
+    tool_results=$(process_tool_calls "$(echo "$response" | jq '.tool_calls')")
+    log_info "Tool results: $(echo "$tool_results" | jq -c '.')"
+
+    response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: $API_KEY" \
+        -d "{\"continuation_token\": \"$continuation_token\", \"tool_results\": $tool_results}")
+    echo "$response" | jq '.' 2>/dev/null || echo "$response"
+
+    status=$(echo "$response" | jq -r '.status // "unknown"')
+    local stdout
+    stdout=$(echo "$response" | jq -r '.stdout // ""')
+    if [ "$status" = "completed" ] &&
+        echo "$stdout" | grep -q '"databases"' &&
+        echo "$stdout" | grep -q '"tables"' &&
+        echo "$stdout" | grep -q 'parallel done'; then
+        log_success "Bash parallel tool calls completed from a single pending batch"
+    else
+        log_error "Expected completed response with database/table outputs. Got status=$status stdout='$stdout'"
+        return 1
+    fi
+    echo "============================================================================="
+}
+
 # Test: Bash PTC - tool returns error -> non-zero exit with stderr
 test_bash_error_tool() {
     echo ""
@@ -803,6 +908,9 @@ case "${1:-all}" in
     bash_multi)
         test_bash_multi
         ;;
+    bash_parallel)
+        test_bash_parallel
+        ;;
     bash_error_tool)
         test_bash_error_tool
         ;;
@@ -810,6 +918,7 @@ case "${1:-all}" in
         test_bash_echo
         test_bash_one_call
         test_bash_multi
+        test_bash_parallel
         test_bash_error_tool
         ;;
     all)
@@ -825,10 +934,11 @@ case "${1:-all}" in
         test_bash_echo
         test_bash_one_call
         test_bash_multi
+        test_bash_parallel
         test_bash_error_tool
         ;;
     *)
-        echo "Usage: $0 [simple|multiple|loop|calculator|chained|async|matplotlib|no_calls|error_tool|expired_token|bash_echo|bash_one_call|bash_multi|bash_error_tool|bash|all]"
+        echo "Usage: $0 [simple|multiple|loop|calculator|chained|async|matplotlib|no_calls|error_tool|expired_token|bash_echo|bash_one_call|bash_multi|bash_parallel|bash_error_tool|bash|all]"
         echo ""
         echo "Tests:"
         echo "  simple         - Single tool call (get_weather)"
@@ -844,6 +954,7 @@ case "${1:-all}" in
         echo "  bash_echo      - Bash script that issues zero tool calls"
         echo "  bash_one_call  - Bash with a single tool call"
         echo "  bash_multi     - Bash with multiple sequential tool calls, replayed"
+        echo "  bash_parallel  - Bash with two backgrounded tool calls joined by wait"
         echo "  bash_error_tool - Bash tool returns an error, verifies non-zero exit + stderr"
         echo "  bash           - Run all bash-related tests"
         echo "  all            - Run Python and bash tests"

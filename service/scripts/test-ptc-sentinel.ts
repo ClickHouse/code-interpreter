@@ -12,6 +12,7 @@ import {
   extractPendingFromStdout,
 } from '../src/preamble';
 import { isReservedPtcFilename, PTC_HISTORY_FILENAME } from '../src/ptc-constants';
+import { hashRawToolInputJson } from '../src/tool-input-signature';
 
 let passed = 0;
 let failed = 0;
@@ -43,12 +44,18 @@ console.log('extractPendingFromStdout:');
 {
   const user = 'computing...\n';
   const block = sentinelBlock({
-    pending: [{ call_id: 'call_001', tool_name: 'lookup', input: { q: 'foo' } }],
+    pending: [{
+      call_id: 'call_001',
+      tool_name: 'lookup',
+      input: { q: 'foo' },
+      input_hash: 'a'.repeat(64),
+    }],
   });
   const r = extractPendingFromStdout(user + block);
   assert(r.pending !== null && r.pending.length === 1, 'single call parsed');
   assert(r.pending?.[0].call_id === 'call_001', 'call_id extracted');
   assert(r.pending?.[0].tool_name === 'lookup', 'tool_name extracted');
+  assert(r.pending?.[0].input_hash === 'a'.repeat(64), 'input_hash extracted');
   assert(
     JSON.stringify(r.pending?.[0].input) === JSON.stringify({ q: 'foo' }),
     'input extracted',
@@ -69,6 +76,16 @@ console.log('extractPendingFromStdout:');
   assert(
     r.stdout === user,
     'blank lines and trailing whitespace preserved exactly when stripping sentinel',
+  );
+}
+
+{
+  const rawInput = '{"x":1000000000000000000000}';
+  const block = `\n${PTC_SENTINEL_START}\n{"pending":[{"call_id":"call_010","tool_name":"big","input":${rawInput}}]}\n${PTC_SENTINEL_END}\n`;
+  const r = extractPendingFromStdout(block);
+  assert(
+    r.pending?.[0].input_hash === hashRawToolInputJson(rawInput),
+    'legacy missing input_hash gets raw JSON input hash',
   );
 }
 

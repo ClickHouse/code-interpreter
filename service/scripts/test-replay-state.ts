@@ -54,6 +54,7 @@ import {
   resetRedisForTests,
   historyKey,
 } from '../src/service/replay-state';
+import { hashToolInput } from '../src/tool-input-signature';
 
 let passed = 0;
 let failed = 0;
@@ -93,6 +94,7 @@ function makeState(overrides: Partial<ExecutionState> = {}): ExecutionState {
     callCount: overrides.callCount ?? 0,
     historyBytes: overrides.historyBytes ?? 0,
     emittedCallIds: overrides.emittedCallIds,
+    emittedToolCalls: overrides.emittedToolCalls,
     userCode: overrides.userCode,
     tools: overrides.tools,
     files: overrides.files,
@@ -242,7 +244,13 @@ await withRedis(async () => {
 await withRedis(async () => {
   const id = 'exec_delta_new';
   const d = await computeToolHistoryDelta(id, [
-    { call_id: 'call_001', result: { x: 1 } },
+    {
+      call_id: 'call_001',
+      result: { x: 1 },
+      tool_name: 'get_weather',
+      input_hash: hashToolInput({ city: 'Paris' }),
+      call_site: '101',
+    },
     { call_id: 'call_002', result: { y: 2 }, is_error: false },
   ]);
   if ('error' in d) {
@@ -252,6 +260,15 @@ await withRedis(async () => {
   assert(d.newCallIds.length === 2, 'two new call_ids reported');
   assert(d.bytesDelta > 0, 'positive bytesDelta for new entries');
   assert(d.serializedByCallId.size === 2, 'serialized payloads computed for new entries');
+  const entry = JSON.parse(d.serializedByCallId.get('call_001') ?? '{}') as {
+    tool_name?: string;
+    input_hash?: string;
+    call_site?: string;
+  };
+  assert(entry.tool_name === 'get_weather', 'tool metadata: name persisted in history entry');
+  assert(entry.input_hash === hashToolInput({ city: 'Paris' }), 'tool metadata: input hash persisted in history entry');
+  assert(!('input' in entry), 'tool metadata: raw input is not persisted in history entry');
+  assert(entry.call_site === '101', 'tool metadata: call_site persisted in history entry');
 });
 
 await withRedis(async () => {

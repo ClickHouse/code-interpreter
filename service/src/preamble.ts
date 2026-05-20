@@ -11,6 +11,7 @@ import {
   buildScopedSentinel,
   isReservedPtcFilename,
 } from './ptc-constants';
+import { pendingInputHashesFromRawPayload } from './tool-input-signature';
 
 // Load async matplotlib template for programmatic tool calling
 const templateCodeAsync = fs.readFileSync(path.join(__dirname, 'matplotlib-async.py'), 'utf8');
@@ -554,7 +555,13 @@ async def _execute_tool_internal_async(tool_name: str, tool_input: Dict[str, Any
  */
 export interface ExtractPendingResult {
   stdout: string;
-  pending: Array<{ call_id: string; tool_name: string; input: Record<string, unknown> }> | null;
+  pending: Array<{
+    call_id: string;
+    tool_name: string;
+    input: Record<string, unknown>;
+    input_hash?: string;
+    call_site?: string;
+  }> | null;
 }
 
 /**
@@ -622,18 +629,39 @@ export function extractPendingFromStdout(
   const pendingField = parsed?.pending;
   if (!Array.isArray(pendingField)) return { stdout, pending: null };
 
-  const pending = pendingField
-    .filter((c): c is { call_id: string; tool_name: string; input: Record<string, unknown> } =>
+  const rawInputHashes = pendingInputHashesFromRawPayload(rawPayload);
+  type PendingWithIndex = {
+    c: { call_id: string; tool_name: string; input: unknown };
+    index: number;
+  };
+  const isPendingWithIndex = (entry: { c: unknown; index: number }): entry is PendingWithIndex => {
+    const { c } = entry;
+    return (
       c != null &&
       typeof c === 'object' &&
       typeof (c as { call_id?: unknown }).call_id === 'string' &&
-      typeof (c as { tool_name?: unknown }).tool_name === 'string',
-    )
-    .map(c => ({
-      call_id: c.call_id,
-      tool_name: c.tool_name,
-      input: (c.input && typeof c.input === 'object' ? c.input : {}) as Record<string, unknown>,
-    }));
+      typeof (c as { tool_name?: unknown }).tool_name === 'string'
+    );
+  };
+  const pending = pendingField
+    .map((c, index) => ({ c, index }))
+    .filter(isPendingWithIndex)
+    .map(({ c, index }) => {
+      const callSite = (c as { call_site?: unknown }).call_site;
+      const inputHash = (c as { input_hash?: unknown }).input_hash;
+      const rawInputHash = rawInputHashes[index];
+      return {
+        call_id: c.call_id,
+        tool_name: c.tool_name,
+        input: (c.input && typeof c.input === 'object' ? c.input : {}) as Record<string, unknown>,
+        ...(typeof inputHash === 'string'
+          ? { input_hash: inputHash }
+          : typeof rawInputHash === 'string'
+            ? { input_hash: rawInputHash }
+            : {}),
+        ...(typeof callSite === 'string' ? { call_site: callSite } : {}),
+      };
+    });
 
   /** Strip only the sentinel block and leave every other byte of user
    * stdout untouched. Both the Python and bash preambles defensively

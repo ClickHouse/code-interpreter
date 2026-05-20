@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { buildArgs, renderJobConfigOverlay } from './nsjail';
+import * as fsp from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import { config } from './config';
+import { buildArgs, execute, renderJobConfigOverlay } from './nsjail';
 
 function valueAfter(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -95,6 +99,61 @@ describe('NsJail args', () => {
       if (args[i] === '-E' && args[i + 1].startsWith('TOOL_CALL_SOCKET=')) {
         throw new Error(`unexpected TOOL_CALL_SOCKET envar: ${args[i + 1]}`);
       }
+    }
+  });
+});
+
+describe('execute', () => {
+  test('captures stdout from a child that exits before the setup gate returns', async () => {
+    const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'nsjail-fast-child-'));
+    const fakeNsJail = path.join(tmp, 'fake-nsjail.sh');
+    const cfg = path.join(tmp, 'sandbox.cfg');
+    const submissionDir = path.join(tmp, 'submission');
+    await fsp.mkdir(submissionDir);
+    await fsp.writeFile(cfg, '');
+    await fsp.writeFile(
+      fakeNsJail,
+      `#!/bin/sh
+log_path=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--log" ]; then
+    shift
+    log_path="$1"
+  fi
+  shift || break
+done
+if [ -n "$log_path" ]; then
+  printf '[I][test] Executing "/bin/bash" for fast child\\n' > "$log_path"
+fi
+printf 'fast child stdout\\n'
+exit 0
+`,
+      { mode: 0o755 },
+    );
+
+    const originalNsJailPath = config.nsjail_path;
+    const originalNsJailConfig = config.nsjail_config;
+    config.nsjail_path = fakeNsJail;
+    config.nsjail_config = cfg;
+    try {
+      const result = await execute({
+        command: ['/bin/bash', '/pkgs/bash/5.2.0/run', 'main.sh'],
+        envVars: {},
+        submissionDir,
+        pkgdir: '/pkgs/bash/5.2.0',
+        timeout: 1000,
+        memoryLimit: -1,
+        outputMaxSize: 1024,
+        identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe('fast child stdout\n');
+      expect(result.output).toBe('fast child stdout\n');
+    } finally {
+      config.nsjail_path = originalNsJailPath;
+      config.nsjail_config = originalNsJailConfig;
+      await fsp.rm(tmp, { recursive: true, force: true });
     }
   });
 });

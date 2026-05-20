@@ -661,7 +661,20 @@ async function handleReplayContinuation(
      * could either trip `MAX_REPLAY_CALLS` and reap a still-valid
      * execution, or slip a larger mutated result past the aggregate
      * history cap. */
-    const deltaOrError = await computeToolHistoryDelta(state.execution_id, validatedResults);
+    const emittedById = new Map(
+      (state.emittedToolCalls ?? []).map(call => [call.id, call]),
+    );
+    const enrichedResults = validatedResults.map(result => {
+      const emitted = emittedById.get(result.call_id);
+      if (emitted == null) return result;
+      return {
+        ...result,
+        tool_name: emitted.name,
+        input_hash: emitted.input_hash,
+        call_site: emitted.call_site,
+      };
+    });
+    const deltaOrError = await computeToolHistoryDelta(state.execution_id, enrichedResults);
     if ('error' in deltaOrError) {
       res.status(deltaOrError.status ?? 400).json({ error: deltaOrError.error });
       return;
@@ -672,7 +685,7 @@ async function handleReplayContinuation(
      * exhaustively unit-testable in `test-replay-state.ts`. */
     const pre = checkContinuationPreconditions({
       state,
-      results: validatedResults,
+      results: enrichedResults,
       userId,
       apiKeyId,
       tenantId: req.codeApiAuthContext?.tenantId,
@@ -868,8 +881,20 @@ async function runAndRespond(
      * otherwise be served as a cache hit on the next sandbox run,
      * silently skipping the real tool call the user code makes. */
     const alreadyIssued = new Set(state.emittedCallIds ?? []);
-    for (const p of pending) alreadyIssued.add(p.call_id);
+    const emittedToolCalls = new Map(
+      (state.emittedToolCalls ?? []).map(call => [call.id, call]),
+    );
+    for (const p of pending) {
+      alreadyIssued.add(p.call_id);
+      emittedToolCalls.set(p.call_id, {
+        id: p.call_id,
+        name: p.tool_name,
+        input_hash: p.input_hash,
+        call_site: p.call_site,
+      });
+    }
     state.emittedCallIds = Array.from(alreadyIssued);
+    state.emittedToolCalls = Array.from(emittedToolCalls.values());
     /** Refresh both exec_state and tool_history TTLs before handing a
      * continuation token back to the client. The sandbox run we just
      * awaited can take several minutes for heavy user code; without this,
