@@ -33,7 +33,7 @@ export function buildReplayExecutionState(
     orgId: authContext?.orgId,
     serviceId: authContext?.serviceId,
     chcUserId: authContext?.chcUserId,
-    principalSource: authContext?.principalSource ?? 'legacy_api_key',
+    principalSource: authContext?.principalSource ?? 'librechat_jwt',
     authContextHash: authContext?.authContextHash,
     apiKeyId: params.apiKeyId,
     startTime: now,

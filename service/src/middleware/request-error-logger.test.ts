@@ -96,7 +96,7 @@ describe('buildRequestNotFoundLogMeta', () => {
       requestId: 'req_123',
       userAgent: 'unit-test',
       hasBearerToken: false,
-      hasApiKey: false,
+      hasApiKeyHeader: false,
       hasSyntheticToken: false,
     });
   });

@@ -131,20 +131,20 @@ describe('keyGenerator', () => {
     expect(keyGenerator(req)).toBe('tenant-1:user:user-1');
   });
 
-  test('keys legacy API-key principals by user instead of credential', () => {
+  test('keys credential-bearing principals by user instead of credential', () => {
     const req = {
       codeApiPrincipal: {
         userId: 'user-1',
-        tenantId: 'legacy',
-        principalSource: 'legacy_api_key',
+        tenantId: 'tenant-1',
+        principalSource: 'librechat_jwt',
         credentialId: 'key-1',
       },
     } as unknown as Request;
 
-    expect(keyGenerator(req)).toBe('legacy:user:user-1');
+    expect(keyGenerator(req)).toBe('tenant-1:user:user-1');
   });
 
-  test('shares a limiter bucket across auth modes for the same tenant user', () => {
+  test('shares a limiter bucket across principal sources for the same tenant user', () => {
     const libreChatReq = {
       codeApiPrincipal: {
         userId: 'user-1',
@@ -156,7 +156,7 @@ describe('keyGenerator', () => {
       codeApiPrincipal: {
         userId: 'user-1',
         tenantId: 'tenant-1',
-        principalSource: 'legacy_api_key',
+        principalSource: 'openid_reuse',
         credentialId: 'key-1',
       },
     } as unknown as Request;
@@ -200,7 +200,7 @@ describe('execution rate limiting', () => {
     })).status).toBe(200);
     expect((await postExec(url, {
       'x-user-id': 'user-a',
-      'x-principal-source': 'legacy_api_key',
+      'x-principal-source': 'openid_reuse',
       'x-credential-id': 'key-1',
     })).status).toBe(429);
   });

@@ -1,6 +1,5 @@
 import axios from 'axios';
 import { Worker } from 'bullmq';
-import type { CreateLogInput } from '@librechat/api-keys';
 import type * as t from './types';
 import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails, sandboxErrorMessageFromAxios } from './utils';
 import { jobProcessingDuration, jobsCompleted, jobsFailed, activeJobs, workerRunning } from './metrics';
@@ -16,74 +15,14 @@ import logger from './logger';
 const { INSTANCE_ID } = env;
 const WORKER_ID = `${INSTANCE_ID}-${process.pid}`;
 
-type Log = Omit<CreateLogInput, 'userId' | 'input'>;
-type SandboxLogResponse = Log & {
+type SandboxLogResponse = t.ExecuteResponse & {
   session_id: string;
   files?: t.FileRefs;
-  run?: CreateLogInput['run'];
+  run?: t.ExecuteResponse['run'];
 };
-type ApiKeysModule = typeof import('@librechat/api-keys');
-
-let apiKeysModulePromise: Promise<ApiKeysModule> | null = null;
-
-function getApiKeysModule(): Promise<ApiKeysModule> {
-  apiKeysModulePromise ??= import('@librechat/api-keys');
-  return apiKeysModulePromise;
-}
-
-async function incrementAndCacheUser(userId: string, apiKeyString: string): Promise<void> {
-  const { incrementUserApiUsage } = await getApiKeysModule();
-  const user = await incrementUserApiUsage(userId, apiKeyString);
-  await connection.set(
-    `user:${userId}`,
-    JSON.stringify(user),
-    'EX',
-    env.USER_CACHE_TTL
-  );
-}
-
-async function incrementAndCacheApiKey(apiKeyId: string, apiKeyString: string): Promise<void> {
-  const { incrementApiKeyUsage } = await getApiKeysModule();
-  const apiKey = await incrementApiKeyUsage(apiKeyId, apiKeyString);
-  await connection.set(
-    `apiKey:${apiKeyString}`,
-    JSON.stringify(apiKey),
-    'EX',
-    env.KEY_CACHE_TTL
-  );
-}
-
-const { LOCAL_MODE: isLocalMode } = env;
 
 function isAbortError(error: unknown): boolean {
   return axios.isAxiosError(error) && (error.name === 'AbortError' || error.code === 'ERR_CANCELED');
-}
-
-async function completeJob(job: t.ExecuteJob): Promise<void> {
-  if (isLocalMode) {
-    logger.debug('Skipping usage increment in local mode');
-    return;
-  }
-
-  const { userId, apiKeyString, apiKeyId, principalSource } = job.data;
-  if (principalSource !== undefined && principalSource !== 'legacy_api_key') {
-    logger.debug('Skipping legacy API-key usage increment for non-API-key principal', {
-      principalSource,
-      userId,
-    });
-    return;
-  }
-  if (!apiKeyString || !apiKeyId) {
-    logger.debug('Skipping legacy API-key usage increment without API-key credentials', {
-      principalSource,
-      userId,
-    });
-    return;
-  }
-  const promises: Array<Promise<void>> = [];
-  promises.push(incrementAndCacheUser(userId, apiKeyString).catch(err => {logger.error('Error incrementing user usage', err);}));
-  promises.push(incrementAndCacheApiKey(apiKeyId, apiKeyString).catch(err => {logger.error('Error incrementing API key usage', err);}));
-  await Promise.all(promises);
 }
 
 async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
@@ -154,27 +93,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     logger.info('Sandbox response', summarizeSandboxResponse(responseData));
 
     const { files } = responseData;
-    try {
-      if (
-        env.LOGGING_ENABLED === true &&
-        (job.data.principalSource === undefined || job.data.principalSource === 'legacy_api_key')
-      ) {
-        const { createLog } = await getApiKeysModule();
-        createLog({
-          userId: job.data.userId,
-          ...responseData,
-          input: code,
-        }).catch((err: unknown) => logger.error('Error creating log', err));
-      } else if (env.LOGGING_ENABLED === true) {
-        logger.debug('Skipping legacy API-key log creation for non-API-key principal', {
-          principalSource: job.data.principalSource,
-          userId: job.data.userId,
-        });
-      }
-    } catch (err) {
-      logger.error('Error creating log', err);
-    }
-    const run = responseData.run as CreateLogInput['run'] | undefined;
+    const run = responseData.run;
     const stdout = applySystemReplacements(run?.stdout ?? '');
     const stderr = filterSystemLogs(run?.stderr ?? '', isPyPlot);
 
@@ -267,13 +186,11 @@ workerRunning.set({ worker_type: 'other' }, 1);
 pyWorker.on('completed', job => {
   logger.info(`[${WORKER_ID}] Python job completed ${job.id}`);
   jobsCompleted.inc({ language: 'python' });
-  completeJob(job).catch(err => logger.error('Error completing job', err));
 });
 
 otherWorker.on('completed', job => {
   logger.info(`[${WORKER_ID}] Other job completed ${job.id}`);
   jobsCompleted.inc({ language: 'other' });
-  completeJob(job).catch(err => logger.error('Error completing job', err));
 });
 
 pyWorker.on('failed', (job, err) => {

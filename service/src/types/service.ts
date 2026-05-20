@@ -1,5 +1,4 @@
 import type { Job } from 'bullmq';
-import type { IApiKey } from '@librechat/api-keys';
 import type { Request } from 'express';
 import type { ExecutionManifestClaims } from '../execution-manifest';
 import type { CodeApiPrincipal } from '../auth/principal';
@@ -214,7 +213,6 @@ export type JobData = {
   code: string;
   userId: string;
   apiKeyId: string;
-  apiKeyString: string;
   principalSource?: string;
   payload: PayloadBody;
   isPyPlot?: boolean;
@@ -245,7 +243,6 @@ export interface CodeApiAuthContext {
 }
 
 export interface AuthenticatedRequest extends Request {
-  apiKey?: IApiKey;
   sessionKey?: string;
   planId?: string;
   codeApiAuthContext?: CodeApiAuthContext;

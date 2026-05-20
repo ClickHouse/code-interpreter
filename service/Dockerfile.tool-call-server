@@ -1,27 +1,22 @@
 # Tool Call Server Dockerfile
-FROM oven/bun:1.3.13 AS base
+FROM oven/bun:1.3.14 AS base
 WORKDIR /app
 
-# Install dependencies and build workspace lib
+# Install dependencies
 FROM base AS install
 RUN mkdir -p /temp/dev
 COPY package.json bun.lock /temp/dev/
-COPY lib /temp/dev/lib
-RUN cd /temp/dev/lib/api-keys && bun install --ignore-scripts && bun run build
 RUN cd /temp/dev && bun install --frozen-lockfile
 
 RUN mkdir -p /temp/prod
 COPY package.json bun.lock /temp/prod/
-COPY lib /temp/prod/lib
-RUN cd /temp/prod/lib/api-keys && bun install --ignore-scripts && bun run build
 RUN cd /temp/prod && bun install --frozen-lockfile --production
 
 # Production stage
-FROM oven/bun:1.3.13 AS production
+FROM oven/bun:1.3.14 AS production
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=install /temp/prod/node_modules ./node_modules
-COPY --from=install /temp/prod/lib ./lib
 COPY src ./src
 EXPOSE 3033
 CMD ["bun", "run", "src/tool-call-server.ts"]
@@ -30,7 +25,6 @@ CMD ["bun", "run", "src/tool-call-server.ts"]
 FROM base AS development
 ENV NODE_ENV=development
 COPY --from=install /temp/dev/node_modules node_modules
-COPY --from=install /temp/dev/lib ./lib
 COPY src ./src
 EXPOSE 3033 9230
 CMD ["bun", "run", "--watch", "src/tool-call-server.ts"]

@@ -299,7 +299,7 @@ describe('LibreChat JWT auth provider', () => {
     expectJwtReason(signJwt(baseClaims({ auth_context_hash: undefined })), 'malformed_claims');
     expectJwtReason(signJwt(baseClaims({ principal_source: undefined })), 'malformed_claims');
     expectJwtReason(
-      signJwt(baseClaims({ principal_source: 'legacy_api_key' })),
+      signJwt(baseClaims({ principal_source: 'api_key' })),
       'malformed_claims',
     );
     expectJwtReason(

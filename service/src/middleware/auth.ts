@@ -1,14 +1,12 @@
-// src/middleware/auth.ts
-import type { ServiceUser, IApiKey, UserErrors, KeyErrors } from '@librechat/api-keys';
-import type { Request, Response, NextFunction } from 'express';
+import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest } from '../types';
-import type { AuthProvider } from '../auth/provider';
 import { connection } from '../queue';
 import { isValidId } from '../utils';
 import { env } from '../config';
 import { resolveSessionKey, parseUploadSessionKeyInput, SessionKeyResolutionError } from '../session-key';
 import { LibreChatJwtAuthProvider, CodeApiJwtAuthError } from '../auth/librechat-jwt';
 import { applyPrincipal, type CodeApiPrincipal } from '../auth/principal';
+import { applyLocalPrincipal } from '../auth/local';
 import { AuthProviderConfigError, getAuthProviderMode } from '../auth/provider';
 import {
   authenticateSyntheticRequest,
@@ -48,18 +46,15 @@ const logSessionKeyResolutionError = (
 };
 
 const jwtProvider = new LibreChatJwtAuthProvider();
-type ApiKeysModule = typeof import('@librechat/api-keys');
-
-let apiKeysModulePromise: Promise<ApiKeysModule> | null = null;
 
 function authLogMeta(req: AuthenticatedRequest, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     method: req.method,
     path: req.originalUrl || req.path,
     ip: req.ip,
-    authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'legacy-api-key',
+    authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'librechat-jwt',
     hasBearerToken: Boolean(req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()),
-    hasApiKey: Boolean(req.header('X-API-Key')),
+    hasApiKeyHeader: Boolean(req.header('X-API-Key')),
     hasSyntheticToken: hasSyntheticAccessToken(req),
     principalSource: req.codeApiPrincipal?.principalSource,
     userId: req.codeApiAuthContext?.userId,
@@ -69,129 +64,22 @@ function authLogMeta(req: AuthenticatedRequest, extra: Record<string, unknown> =
   };
 }
 
-function getApiKeysModule(): Promise<ApiKeysModule> {
-  apiKeysModulePromise ??= import('@librechat/api-keys');
-  return apiKeysModulePromise;
-}
-
-class LegacyApiKeyAuthProvider implements AuthProvider {
-  async verify(req: Request): Promise<CodeApiPrincipal | null> {
-    const authReq = req as AuthenticatedRequest;
-    const apiKeyString = authReq.header('X-API-Key') ?? '';
-    if (!apiKeyString) {
-      return null;
-    }
-
-    const apiKey = await processApiKey(apiKeyString);
-    if (!apiKey) {
-      const { ErrorMessages } = await getApiKeysModule();
-      throw new Error(ErrorMessages.INVALID_API_KEY);
-    }
-    const userId = apiKey.userId.toString();
-    if (!userId) {
-      const { ErrorMessages } = await getApiKeysModule();
-      throw new Error(ErrorMessages.INVALID_API_KEY);
-    }
-
-    const accessUserId = await connection.get('access-user');
-    if (accessUserId != null && accessUserId && accessUserId !== userId) {
-      throw new Error('Unauthorized User');
-    }
-
-    await checkUser(authReq, userId);
-    if (!checkKeyLimit(apiKey)) {
-      throw new Error('API key usage limit exceeded');
-    }
-
-    authReq.apiKey = apiKey;
-    return {
-      userId,
-      tenantId: authReq.codeApiAuthContext?.tenantId ?? 'legacy',
-      principalSource: 'legacy_api_key',
-      credentialId: apiKey._id?.toString(),
-    };
-  }
-}
-
-const legacyProvider = new LegacyApiKeyAuthProvider();
-
-const checkUser = async (req: AuthenticatedRequest, userId: string): Promise<void> => {
-  const cachedUser = await connection.get(`user:${userId}`) ?? '';
-  const apiKeyString = req.header('X-API-Key') ?? '';
-  if (!cachedUser) {
-    const { validateAndGetUser } = await getApiKeysModule();
-    const user = await validateAndGetUser(userId, apiKeyString);
-    await connection.set(
-      `user:${userId}`,
-      JSON.stringify(user),
-      'EX',
-      env.USER_CACHE_TTL
-    );
-    return;
-  }
-  const user: ServiceUser | null | undefined = JSON.parse(cachedUser);
-  if (user === null || user === undefined) {
-    throw new Error('User not found');
-  }
-  const { validateUser } = await getApiKeysModule();
-  const updatedUser = await validateUser(user);
-  await connection.set(
-    `user:${userId}`,
-    JSON.stringify(updatedUser),
-    'EX',
-    env.USER_CACHE_TTL
-  );
-  req.planId = updatedUser.subscription?.planId;
-  return;
-};
-
-const checkKeyLimit = (key: IApiKey): boolean => {
-  const limit = key.limit ?? 0;
-  if (!limit || limit <= 0) {
-    return true;
-  }
-  const usage = key.usage ?? 0;
-  return usage < limit;
-};
-
-const processApiKey = async (apiKeyString: string): Promise<IApiKey | null | undefined> => {
-  const cachedKey = await connection.get(`apiKey:${apiKeyString}`) ?? '';
-  if (!cachedKey) {
-    const { validateApiKey } = await getApiKeysModule();
-    const validatedKey = await validateApiKey(apiKeyString);
-    const apiKey: IApiKey = {
-      ...validatedKey,
-      _id: validatedKey._id.toString(),
-      userId: validatedKey.userId.toString(),
-    };
-
-    await connection.set(
-      `apiKey:${apiKeyString}`,
-      JSON.stringify(apiKey),
-      'EX',
-      env.KEY_CACHE_TTL
-    );
-
-    return apiKey;
-  }
-
-  return JSON.parse(cachedKey);
-};
-
 export const apiKeyAuth = async (
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
 ): Promise<void | Response> => {
-  const path = req.path.substring(1);
-  if (path === 'enterprise/user/id') {
+  if (env.LOCAL_MODE === true) {
+    applyLocalPrincipal(req);
+    logger.debug('CodeAPI local request authenticated', authLogMeta(req, { mode: 'local' }));
     next();
     return;
   }
-  const apiKeyString = req.header('X-API-Key') ?? '';
+
+  const legacyApiKeyHeader = req.header('X-API-Key') ?? '';
   const bearerToken = req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const syntheticToken = req.header(CODEAPI_SYNTHETIC_AUTH_HEADER)?.trim();
-  const authHeaderCount = [apiKeyString, bearerToken, syntheticToken].filter(Boolean).length;
+  const authHeaderCount = [legacyApiKeyHeader, bearerToken, syntheticToken].filter(Boolean).length;
   if (authHeaderCount > 1) {
     logger.warn('Rejecting ambiguous CodeAPI auth headers', authLogMeta(req));
     return res.status(400).json({ error: 'Ambiguous authentication headers' });
@@ -219,6 +107,11 @@ export const apiKeyAuth = async (
     const mode = getAuthProviderMode();
     let principal: CodeApiPrincipal | null = null;
 
+    if (legacyApiKeyHeader) {
+      logger.warn('Rejecting legacy CodeAPI API key header', authLogMeta(req, { mode }));
+      return res.status(401).json({ error: 'Bearer token is required' });
+    }
+
     if (mode === 'none') {
       if (env.LOCAL_MODE !== true && process.env.CODEAPI_ALLOW_AUTH_PROVIDER_NONE !== 'true') {
         logger.error(
@@ -233,30 +126,15 @@ export const apiKeyAuth = async (
         req.header('User-Id') || (req.body as { user_id?: string })?.user_id || 'anonymous';
       principal = {
         userId,
-        tenantId: 'legacy',
+        tenantId: 'local',
         principalSource: 'none',
       };
-    } else if (mode === 'librechat-jwt') {
+    } else {
       if (!bearerToken) {
         logger.warn('Rejecting CodeAPI request without bearer token', authLogMeta(req, { mode }));
         return res.status(401).json({ error: 'Bearer token is required' });
       }
       principal = await jwtProvider.verify(req);
-    } else if (mode === 'both') {
-      if (bearerToken) {
-        principal = await jwtProvider.verify(req);
-      } else if (apiKeyString) {
-        principal = await legacyProvider.verify(req);
-      } else {
-        logger.warn('Rejecting CodeAPI request without auth headers', authLogMeta(req, { mode }));
-        return res.status(401).json({ error: 'Authentication is required' });
-      }
-    } else {
-      if (!apiKeyString) {
-        logger.warn('Rejecting CodeAPI request without API key', authLogMeta(req, { mode }));
-        return res.status(401).json({ error: 'API key is required' });
-      }
-      principal = await legacyProvider.verify(req);
     }
 
     if (!principal) {
@@ -288,14 +166,8 @@ export const apiKeyAuth = async (
       );
       return res.status(500).json({ error: 'CodeAPI auth provider is misconfigured' });
     }
-    if ((error as Error | undefined)?.message === 'API key usage limit exceeded') {
-      return res.status(429).json({ error: 'API key usage limit exceeded' });
-    }
-    const message = ((error as Error | undefined)?.message ?? '') as UserErrors | KeyErrors;
-    const { ErrorMessages } = await getApiKeysModule();
-    const errorMessage = ErrorMessages[message] || ErrorMessages.INVALID_API_KEY;
-    logger.error(`API key validation error request from ${req.ip}:`, authLogMeta(req, { error }));
-    return res.status(401).json({ error: errorMessage });
+    logger.error(`CodeAPI authentication error request from ${req.ip}:`, authLogMeta(req, { error }));
+    return res.status(401).json({ error: 'Authentication is required' });
   }
 };
 

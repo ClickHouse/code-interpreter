@@ -35,7 +35,7 @@ RUN make -j$(nproc)
 COPY api/src/spec-guard.c /tmp/spec-guard.c
 RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c
 
-FROM oven/bun:1.3.13-debian AS sandbox-build
+FROM oven/bun:1.3.14-debian AS sandbox-build
 
 ENV DEBIAN_FRONTEND=noninteractive
 

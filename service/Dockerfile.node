@@ -1,5 +1,5 @@
 # Base stage for shared steps
-FROM node:20.19.0-slim AS base
+FROM node:26.1.0-slim AS base
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
@@ -11,7 +11,7 @@ COPY src/tsconfig.json ./src/
 RUN npx tsc -p src/tsconfig.json
 
 # Production stage
-FROM node:20.19.0-slim AS production
+FROM node:26.1.0-slim AS production
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package*.json ./

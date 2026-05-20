@@ -8,7 +8,7 @@ export type CodeApiPrincipal = {
   orgId?: string;
   serviceId?: string;
   chcUserId?: string;
-  principalSource: 'librechat_jwt' | 'openid_reuse' | 'legacy_api_key' | 'none' | string;
+  principalSource: 'librechat_jwt' | 'openid_reuse' | 'none' | string;
   authContextHash?: string;
   credentialId?: string;
   planId?: string;
@@ -44,9 +44,8 @@ export function getPrincipal(req: t.AuthenticatedRequest): CodeApiPrincipal | un
     orgId: ctx.orgId,
     serviceId: ctx.serviceId,
     chcUserId: ctx.chcUserId,
-    principalSource: ctx.principalSource ?? 'legacy_api_key',
+    principalSource: ctx.principalSource ?? 'librechat_jwt',
     authContextHash: ctx.authContextHash,
-    credentialId: req.apiKey?._id?.toString(),
   };
 }
 
@@ -63,9 +62,5 @@ export function getPrincipalOrReject(
 }
 
 export function getCredentialId(req: t.AuthenticatedRequest): string {
-  return getPrincipal(req)?.credentialId ?? req.apiKey?._id?.toString() ?? '';
-}
-
-export function getLegacyApiKeyString(req: t.AuthenticatedRequest): string {
-  return req.header('X-API-Key') ?? '';
+  return getPrincipal(req)?.credentialId ?? '';
 }

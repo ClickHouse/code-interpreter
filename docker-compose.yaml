@@ -32,8 +32,6 @@ services:
             - EXECUTION_MANIFEST_MAX_OUTPUT_FILES=${EXECUTION_MANIFEST_MAX_OUTPUT_FILES:-}
             - EXECUTION_MANIFEST_MAX_REQUESTS=${EXECUTION_MANIFEST_MAX_REQUESTS:-}
             - CODEAPI_HTTP_JSON_LIMIT=${CODEAPI_HTTP_JSON_LIMIT:-50mb}
-            - MONGODB_URI
-            - SANDBOX_ACCESS_TOKEN
             - SERVICE_PORT=3112
             - SANDBOX_ENDPOINT=http://sandbox-runner:2000/api/v2
             - EGRESS_GATEWAY_URL=http://egress_gateway:3190

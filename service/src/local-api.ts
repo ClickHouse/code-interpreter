@@ -2,25 +2,20 @@
  * Local Development API
  *
  * This is a simplified API for local testing that:
- * - Does NOT require SANDBOX_ACCESS_TOKEN or MONGODB_URI
- * - Does NOT validate API keys against remote services
+ * - Does NOT require production JWT configuration
  * - Uses a mock user for all requests
  *
  * NOT FOR PRODUCTION USE
  */
 import express, { json, Router } from 'express';
-import type { Response, NextFunction } from 'express';
-import type { AuthenticatedRequest } from './types';
-import type { IApiKey } from '@librechat/api-keys';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
 import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-error-logger';
-import { applyPrincipal } from './auth/principal';
-import { pyQueue, otherQueue, webhookQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
+import { localAuth } from './auth/local';
+import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
 import { setStartupComplete } from './lifecycle';
 // Workers are imported to ensure they're started with the process
 import './workers';
-import { webhookWorker } from './webhook/worker';
 import { env } from './config';
 import logger from './logger';
 
@@ -42,37 +37,6 @@ app.get('/v1/health', async (_, res) => {
     res.sendStatus(503);
   }
 });
-
-// Mock auth middleware - always passes with a test user
-const localAuth = async (
-  req: AuthenticatedRequest,
-  _res: Response,
-  next: NextFunction
-): Promise<void> => {
-  // Set mock user data for local testing
-  const mockApiKey: IApiKey = {
-    _id: 'local-test-key',
-    userId: 'local-test-user',
-    name: 'Local Test Key',
-    secret: 'local-secret',
-    usage: 0,
-    lastUsedAt: new Date(),
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  };
-  req.apiKey = mockApiKey;
-  req.planId = 'local-plan';
-  /* Mirror the populate that `apiKeyAuth` does for prod auth. Without
-   * this, sessionKey resolvers that read `codeApiAuthContext.userId`
-   * 500 with "authContext.userId is missing" under local mode. */
-  applyPrincipal(req, {
-    userId: mockApiKey.userId.toString(),
-    tenantId: 'legacy',
-    principalSource: 'legacy_api_key',
-    credentialId: mockApiKey._id.toString(),
-  });
-  next();
-};
 
 v1.use(localAuth);
 v1.use(serviceRouter);
@@ -97,8 +61,7 @@ async function localStartup(): Promise<void> {
     // Resume queues (in case they were paused)
     await Promise.all([
       pyQueue.resume(),
-      otherQueue.resume(),
-      webhookQueue.resume()
+      otherQueue.resume()
     ]);
 
     setStartupComplete();
@@ -116,8 +79,7 @@ async function localShutdown(): Promise<void> {
       pyQueue.close(),
       otherQueue.close(),
       pyQueueEvents.close(),
-      otherQueueEvents.close(),
-      webhookWorker.close()
+      otherQueueEvents.close()
     ]);
     logger.info('Local shutdown complete');
     process.exit(0);

@@ -32,7 +32,7 @@ export default function () {
 
   const headers = {
     'Content-Type': 'application/json',
-    'X-API-Key':'pk_NMClsFxmKKOuoVi7TGU7Rkh4IGbR3.7088e8b9'
+    'Authorization': `Bearer ${__ENV.CODEAPI_BEARER_TOKEN ?? ''}`
   };
 
   const response = http.post(url, JSON.stringify(randomizedPayload), { headers });

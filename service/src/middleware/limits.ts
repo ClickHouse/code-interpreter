@@ -99,12 +99,6 @@ export const keyGenerator = (req: Request): string => {
     const tenantId = keySegment(authReq.codeApiAuthContext.tenantId, 'legacy');
     return `${tenantId}:user:${keySegment(authReq.codeApiAuthContext.userId)}`;
   }
-  if (authReq.apiKey?.userId) {
-    return `legacy:user:${keySegment(authReq.apiKey.userId.toString())}`;
-  }
-  if (authReq.apiKey?._id) {
-    return `legacy:credential:${keySegment(authReq.apiKey._id.toString())}`;
-  }
   return `ip:${keySegment(req.ip)}`;
 };
 
@@ -144,7 +138,7 @@ const buildRateLimiter = (
           principalSource: principal?.principalSource ?? authReq.codeApiAuthContext?.principalSource,
           tenantHash: hashLabel(principal?.tenantId ?? authReq.codeApiAuthContext?.tenantId),
           userHash: hashLabel(principal?.userId ?? authReq.codeApiAuthContext?.userId),
-          credentialHash: hashLabel(principal?.credentialId ?? authReq.apiKey?._id?.toString()),
+          credentialHash: hashLabel(principal?.credentialId),
         });
       }
 

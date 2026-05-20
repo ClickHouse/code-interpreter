@@ -15,7 +15,7 @@ import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
 import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
-import { getCredentialId, getLegacyApiKeyString, getPrincipalOrReject } from '../auth/principal';
+import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { jobsSubmitted } from '../metrics';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
@@ -110,7 +110,6 @@ const router = Router();
 router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
   const principal = getPrincipalOrReject(req, res);
   if (!principal) return;
-  const apiKeyString = getLegacyApiKeyString(req);
   const apiKeyId = getCredentialId(req);
   const userId = principal.userId;
 
@@ -201,7 +200,6 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       payload: sandboxSecurity.payload,
       apiKeyId,
       isPyPlot,
-      apiKeyString,
       principalSource: principal.principalSource,
       executionId: execution_id,
       tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',

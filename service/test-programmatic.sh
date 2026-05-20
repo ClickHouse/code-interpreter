@@ -16,16 +16,16 @@ fi
 
 # Configuration
 SERVICE_URL="${SERVICE_URL:-http://localhost:3112}"
-API_KEY="${API_KEY:-}"
+BEARER_TOKEN="${CODEAPI_BEARER_TOKEN:-${BEARER_TOKEN:-}}"
 MAX_ITERATIONS=10
 POLL_INTERVAL=1
 
-# Validate API key
-if [ -z "$API_KEY" ]; then
-    echo "Error: API_KEY not set. Either:"
-    echo "  1. Set API_KEY environment variable"
-    echo "  2. Add API_KEY=your-key to .env file"
-    echo "  3. Export API_KEY in your shell"
+# Validate bearer token
+if [ -z "$BEARER_TOKEN" ]; then
+    echo "Error: BEARER_TOKEN not set. Either:"
+    echo "  1. Set BEARER_TOKEN environment variable"
+    echo "  2. Add BEARER_TOKEN=your-key to .env file"
+    echo "  3. Export BEARER_TOKEN in your shell"
     exit 1
 fi
 
@@ -193,7 +193,7 @@ run_test() {
     
     local response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{
             \"code\": $(echo "$code" | jq -Rs .),
             \"tools\": $tools,
@@ -225,7 +225,7 @@ run_test() {
         
         response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
             -H "Content-Type: application/json" \
-            -H "X-API-Key: $API_KEY" \
+            -H "Authorization: Bearer $BEARER_TOKEN" \
             -d "{
                 \"continuation_token\": \"$continuation_token\",
                 \"tool_results\": $tool_results
@@ -492,7 +492,7 @@ except ToolExecutionError as e:
     local response
     response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{\"code\": $(echo "$code" | jq -Rs .), \"tools\": $tools}")
     echo "$response" | jq '.'
 
@@ -514,7 +514,7 @@ except ToolExecutionError as e:
 
     response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{\"continuation_token\": \"$continuation_token\", \"tool_results\": $error_results}")
     echo "$response" | jq '.'
 
@@ -547,7 +547,7 @@ test_expired_token() {
     http_code=$(curl -s -o /tmp/ptc_expired_body.json -w "%{http_code}" \
         -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{\"continuation_token\": \"$unknown_token\", \"tool_results\": [{\"call_id\": \"call_001\", \"result\": {\"ok\": true}}]}")
     cat /tmp/ptc_expired_body.json | jq '.' 2>/dev/null || cat /tmp/ptc_expired_body.json
 
@@ -563,7 +563,7 @@ test_expired_token() {
     http_code=$(curl -s -o /tmp/ptc_expired_body.json -w "%{http_code}" \
         -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{\"continuation_token\": \"$stale_token\", \"tool_results\": [{\"call_id\": \"call_001\", \"result\": {\"ok\": true}}]}")
     cat /tmp/ptc_expired_body.json | jq '.' 2>/dev/null || cat /tmp/ptc_expired_body.json
 
@@ -699,7 +699,7 @@ echo "UNREACHABLE: $result"'
     local response
     response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{\"code\": $(echo "$code" | jq -Rs .), \"tools\": $tools, \"language\": \"bash\"}")
     echo "$response" | jq '.' 2>/dev/null || echo "$response"
 
@@ -719,7 +719,7 @@ echo "UNREACHABLE: $result"'
 
     response=$(curl -s -X POST "$SERVICE_URL/v1/exec/programmatic" \
         -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
         -d "{\"continuation_token\": \"$continuation_token\", \"tool_results\": $error_results}")
     echo "$response" | jq '.'
 
@@ -748,7 +748,7 @@ echo "==========================================================================
 echo "  PROGRAMMATIC TOOL CALLING TEST SUITE"
 echo "============================================================================="
 echo "  Service URL: $SERVICE_URL"
-echo "  API Key: ${API_KEY:0:10}..."
+echo "  bearer token: ${BEARER_TOKEN:0:10}..."
 echo "============================================================================="
 
 # Check dependencies
@@ -850,7 +850,7 @@ case "${1:-all}" in
         echo ""
         echo "Environment variables:"
         echo "  SERVICE_URL  - Service API URL (default: http://localhost:3112)"
-        echo "  API_KEY      - API key for authentication"
+        echo "  BEARER_TOKEN      - bearer token for authentication"
         exit 1
         ;;
 esac

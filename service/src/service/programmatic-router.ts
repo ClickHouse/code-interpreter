@@ -13,7 +13,7 @@ import type { LCTool } from '../preamble';
 import { isReservedPtcFilename } from '../ptc-constants';
 import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveOutputBucketSessionKey, SessionKeyResolutionError } from '../session-key';
-import { getCredentialId, getLegacyApiKeyString, getPrincipalOrReject } from '../auth/principal';
+import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import {
   jobsSubmitted,
   ptcReplayContinuations,
@@ -356,7 +356,6 @@ function buildReplayPayload(
 async function runReplayIteration(
   req: t.AuthenticatedRequest,
   state: ExecutionState,
-  apiKeyString: string,
   apiKeyId: string,
   userId: string,
 ): Promise<t.ExecuteResult> {
@@ -397,7 +396,6 @@ async function runReplayIteration(
     payload: sandboxSecurity.payload,
     apiKeyId,
     isPyPlot: state.isPyPlot ?? false,
-    apiKeyString,
     principalSource: state.principalSource,
     executionId: state.execution_id,
     tenantId: state.tenantId,
@@ -429,12 +427,11 @@ async function handleReplayInitial(
   req: t.AuthenticatedRequest,
   res: Response,
   params: {
-    apiKeyString: string;
     apiKeyId: string;
     userId: string;
   },
 ): Promise<void> {
-  const { apiKeyString, apiKeyId, userId } = params;
+  const { apiKeyId, userId } = params;
   const {
     code,
     tools,
@@ -593,21 +590,20 @@ async function handleReplayInitial(
     timeout,
   });
 
-  await runAndRespond(req, res, state, apiKeyString, apiKeyId, userId);
+  await runAndRespond(req, res, state, apiKeyId, userId);
 }
 
 async function handleReplayContinuation(
   req: t.AuthenticatedRequest,
   res: Response,
   params: {
-    apiKeyString: string;
     apiKeyId: string;
     userId: string;
     decoded: { execution_id: string };
     tool_results: NonNullable<t.ProgrammaticRequestBody['tool_results']>;
   },
 ): Promise<void> {
-  const { apiKeyString, apiKeyId, userId, decoded, tool_results } = params;
+  const { apiKeyId, userId, decoded, tool_results } = params;
 
   /** Record the outcome of every replay continuation in one place via
    * `res.on('finish')` so each early-return branch (lock contention,
@@ -778,7 +774,7 @@ async function handleReplayContinuation(
       });
     }
 
-    await runAndRespond(req, res, state, apiKeyString, apiKeyId, userId);
+    await runAndRespond(req, res, state, apiKeyId, userId);
   } finally {
     await releaseExecutionLock(decoded.execution_id, lockToken);
   }
@@ -788,7 +784,6 @@ async function runAndRespond(
   req: t.AuthenticatedRequest,
   res: Response,
   state: ExecutionState,
-  apiKeyString: string,
   apiKeyId: string,
   userId: string,
 ): Promise<void> {
@@ -806,7 +801,7 @@ async function runAndRespond(
 
   let result: t.ExecuteResult;
   try {
-    result = await runReplayIteration(req, state, apiKeyString, apiKeyId, userId);
+    result = await runReplayIteration(req, state, apiKeyId, userId);
   } catch (err) {
     logger.error('Replay iteration failed', { execution_id: state.execution_id, err });
     await cleanupExecution(state.execution_id, 'replay');
@@ -974,7 +969,6 @@ async function runAndRespond(
 router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
   const principal = getPrincipalOrReject(req, res);
   if (!principal) return;
-  const apiKeyString = getLegacyApiKeyString(req);
   const apiKeyId = getCredentialId(req);
   const userId = principal.userId;
 
@@ -1029,14 +1023,13 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
       const existing = await getExecutionState(decoded.execution_id);
       if (existing?.mode === 'replay') {
         return await handleReplayContinuation(req, res, {
-          apiKeyString,
           apiKeyId,
           userId,
           decoded,
           tool_results,
         });
       }
-      return await handleBlocking(req, res, { apiKeyString, apiKeyId, userId });
+      return await handleBlocking(req, res, { apiKeyId, userId });
     }
 
     /** Initial requests use the process-level default. `language: bash`
@@ -1048,9 +1041,9 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
       });
     }
     if (env.PTC_MODE === 'replay') {
-      return await handleReplayInitial(req, res, { apiKeyString, apiKeyId, userId });
+      return await handleReplayInitial(req, res, { apiKeyId, userId });
     }
-    return await handleBlocking(req, res, { apiKeyString, apiKeyId, userId });
+    return await handleBlocking(req, res, { apiKeyId, userId });
   } catch (err) {
     logger.error(`[${INSTANCE_ID}] Programmatic routing error:`, err);
     if (!res.headersSent) {
@@ -1068,9 +1061,9 @@ router.post('/exec/programmatic', executionLimiter, async (req: t.AuthenticatedR
 async function handleBlocking(
   req: t.AuthenticatedRequest,
   res: Response,
-  params: { apiKeyString: string; apiKeyId: string; userId: string },
+  params: { apiKeyId: string; userId: string },
 ): Promise<void | ReturnType<typeof res.status>> {
-  const { apiKeyString, apiKeyId, userId } = params;
+  const { apiKeyId, userId } = params;
   const {
     code,
     tools,
@@ -1340,7 +1333,6 @@ async function handleBlocking(
       payload: sandboxSecurity.payload,
       apiKeyId,
       isPyPlot: false,
-      apiKeyString,
       principalSource: req.codeApiAuthContext?.principalSource,
       executionId: execution_id,
       tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',

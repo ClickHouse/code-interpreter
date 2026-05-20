@@ -5,7 +5,7 @@ export interface AuthProvider {
   verify(req: Request): Promise<CodeApiPrincipal | null>;
 }
 
-export type CodeApiAuthProviderMode = 'librechat-jwt' | 'legacy-api-key' | 'both' | 'none';
+export type CodeApiAuthProviderMode = 'librechat-jwt' | 'none';
 
 export class AuthProviderConfigError extends Error {
   constructor(message: string) {
@@ -17,14 +17,9 @@ export class AuthProviderConfigError extends Error {
 export function getAuthProviderMode(): CodeApiAuthProviderMode {
   const mode = process.env.CODEAPI_AUTH_PROVIDER;
   if (mode == null || mode === '') {
-    return 'legacy-api-key';
+    return 'librechat-jwt';
   }
-  if (
-    mode === 'librechat-jwt' ||
-    mode === 'legacy-api-key' ||
-    mode === 'both' ||
-    mode === 'none'
-  ) {
+  if (mode === 'librechat-jwt' || mode === 'none') {
     return mode;
   }
   throw new AuthProviderConfigError(`Invalid CODEAPI_AUTH_PROVIDER: ${mode}`);

@@ -64,17 +64,4 @@ const otherQueueEvents = new QueueEvents(Queues.other, { connection });
  * BullMQ coordination objects. */
 setMaxListeners(0, pyQueue, otherQueue, pyQueueEvents, otherQueueEvents);
 
-const webhookQueue = new Queue<t.WebhookJobData>('stripe-webhooks', {
-  connection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: {
-      type: 'exponential',
-      delay: 1000,
-    },
-    removeOnComplete: true,
-    removeOnFail: 1000,
-  },
-});
-
-export { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, webhookQueue, connection };
+export { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection };

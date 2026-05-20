@@ -79,12 +79,12 @@ describe('buildReplayExecutionState', () => {
     });
   });
 
-  test('falls back to legacy identity only when no managed auth context exists', () => {
+  test('falls back to JWT identity only when no managed auth context exists', () => {
     const state = build({ authContext: undefined, userId: 'user_api_key' });
 
     expect(state.tenantId).toBe('legacy');
     expect(state.canonicalUserId).toBe('user_api_key');
-    expect(state.principalSource).toBe('legacy_api_key');
+    expect(state.principalSource).toBe('librechat_jwt');
     expect(state.authContextHash).toBeUndefined();
   });
 });

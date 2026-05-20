@@ -6,10 +6,10 @@ import { Languages } from './enum';
 
 export const languageConfig: Record<Languages | string, t.LanguageConfig | undefined> = {
   [Languages.bash]: { language: 'bash', version: '5.2.0', fileName: 'script.sh' },
-  [Languages.js]: { language: 'bun-js', version: '1.3.13', fileName: 'index.js' },
+  [Languages.js]: { language: 'bun-js', version: '1.3.14', fileName: 'index.js' },
   [Languages.node]: { language: 'node', version: '24.15.0', fileName: 'index.js' },
   [Languages.py]: { language: 'python', version: '3.14.4', fileName: 'main.py' },
-  [Languages.ts]: { language: 'bun-ts', version: '1.3.13', fileName: 'main.ts' },
+  [Languages.ts]: { language: 'bun-ts', version: '1.3.14', fileName: 'main.ts' },
 };
 
 const languageAliases: Record<string, Languages> = {
@@ -93,9 +93,6 @@ export const env = {
   MAX_UPLOAD_WAIT: Number(process.env.MAX_UPLOAD_WAIT) || 500,
   MAX_FILE_SIZE: defaultMaxFileSize,
   JOB_TIMEOUT: defaultJobTimeoutMs, // 5 minutes (increased for complex matplotlib rendering)
-  // API Rate Limiting
-  KEY_CACHE_TTL: Number(process.env.KEY_CACHE_TTL) || 120, // 2 minutes
-  USER_CACHE_TTL: Number(process.env.USER_CACHE_TTL) || 120, // 2 minutes
   // Execution Rate Limits
   EXEC_LIMIT_WINDOW: Number(process.env.RATE_LIMIT_WINDOW) || 30 * 1000, // 30 seconds
   EXEC_MAX_REQUESTS: Number(process.env.MAX_REQUESTS) || 20, // execution requests per window
@@ -110,13 +107,6 @@ export const env = {
   FETCH_MAX_REQUESTS: Number(process.env.FETCH_MAX_REQUESTS) || 120, // 120 requests per minute
   // Redis Key Cache Config
   SESSION_CACHE_TTL: Number(process.env.SESSION_CACHE_TTL) || 86400,
-  // Emails
-  EMAIL_SERVER: process.env.EMAIL_SERVER ?? '',
-  DOMAIN_NAME: process.env.DOMAIN_NAME ?? 'code.librechat.ai',
-  FROM_NO_REPLY_EMAIL: process.env.FROM_NO_REPLY_EMAIL ?? 'LibreChat <noreply@mail.librechat.ai>',
-  NEWSLETTER_SECRET: process.env.NEWSLETTER_SECRET!,
-  // Optional logging
-  LOGGING_ENABLED: (process.env.LOGGING_ENABLED) === 'true',
   /** Strict tenant isolation. When true, sessionKey resolution fails closed
    *  (500) on requests whose auth context lacks `tenantId`, instead of
    *  silently falling back to the `'legacy'` tenant prefix. Default OFF in

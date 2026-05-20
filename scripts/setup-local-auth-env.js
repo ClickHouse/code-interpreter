@@ -20,7 +20,7 @@ Options:
   --librechat <path>       LibreChat repo path (default: ~/LibreChat)
   --librechat-env <path>   LibreChat .env path override
   --codeapi-env <path>     CodeAPI .env path override (default: services/codeapi/.env)
-  --provider <mode>        librechat-jwt | both (default: librechat-jwt)
+  --provider <mode>        librechat-jwt (default: librechat-jwt)
   --base-url <url>         LibreChat CodeAPI base URL (default: http://localhost:3112/v1)
   --help, -h              Show this help
 `);
@@ -64,8 +64,8 @@ function parseArgs(argv) {
     }
   }
 
-  if (out.provider !== 'librechat-jwt' && out.provider !== 'both') {
-    throw new Error('--provider must be "librechat-jwt" or "both"');
+  if (out.provider !== 'librechat-jwt') {
+    throw new Error('--provider must be "librechat-jwt"');
   }
 
   return out;
@@ -297,11 +297,6 @@ function main() {
   }
   if (executionManifest.generated) {
     console.log('Generated a new local Ed25519 execution-manifest keypair for CodeAPI.');
-  }
-  if (args.provider === 'both') {
-    console.log(
-      'Note: CODEAPI_AUTH_PROVIDER=both also requires legacy auth config such as MONGODB_URI or SANDBOX_ACCESS_TOKEN when LOCAL_MODE=false.',
-    );
   }
 }
 

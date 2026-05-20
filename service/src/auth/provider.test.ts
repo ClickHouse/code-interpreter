@@ -12,18 +12,15 @@ afterEach(() => {
 });
 
 describe('CodeAPI auth provider mode', () => {
-  test('defaults to legacy API-key mode when unset', () => {
+  test('defaults to LibreChat JWT mode when unset', () => {
     delete process.env.CODEAPI_AUTH_PROVIDER;
 
-    expect(getAuthProviderMode()).toBe('legacy-api-key');
+    expect(getAuthProviderMode()).toBe('librechat-jwt');
   });
 
   test('accepts configured provider modes', () => {
     process.env.CODEAPI_AUTH_PROVIDER = 'librechat-jwt';
     expect(getAuthProviderMode()).toBe('librechat-jwt');
-
-    process.env.CODEAPI_AUTH_PROVIDER = 'both';
-    expect(getAuthProviderMode()).toBe('both');
 
     process.env.CODEAPI_AUTH_PROVIDER = 'none';
     expect(getAuthProviderMode()).toBe('none');

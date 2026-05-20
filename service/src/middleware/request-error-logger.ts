@@ -52,7 +52,7 @@ export function buildRequestErrorLogMeta(error: unknown, req: Request): Record<s
     requestId: req.header('x-request-id') || req.header('x-correlation-id'),
     userAgent: req.header('user-agent'),
     ip: req.ip,
-    authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'legacy-api-key',
+    authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'librechat-jwt',
     principalSource: authReq.codeApiPrincipal?.principalSource,
     userId: authReq.codeApiAuthContext?.userId,
     tenantId: authReq.codeApiAuthContext?.tenantId,
@@ -69,9 +69,9 @@ export function buildRequestNotFoundLogMeta(req: Request): Record<string, unknow
     requestId: req.header('x-request-id') || req.header('x-correlation-id'),
     userAgent: req.header('user-agent'),
     ip: req.ip,
-    authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'legacy-api-key',
+    authProvider: process.env.CODEAPI_AUTH_PROVIDER || 'librechat-jwt',
     hasBearerToken: Boolean(req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()),
-    hasApiKey: Boolean(req.header('X-API-Key')),
+    hasApiKeyHeader: Boolean(req.header('X-API-Key')),
     hasSyntheticToken: hasSyntheticAccessToken(req),
   };
 }

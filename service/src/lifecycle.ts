@@ -1,7 +1,6 @@
 import type { Queue } from 'bullmq';
 import type { Express } from 'express';
-import { pyQueue, otherQueue, webhookQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
-import { connectDb } from './connect';
+import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
 import { validateStartupAuthConfig } from './auth/startup';
 import { env } from './config';
 import { validateApiHardenedConfig, validateWorkerHardenedConfig } from './secure-startup';
@@ -10,29 +9,9 @@ import logger from './logger';
 const { INSTANCE_ID } = env;
 let isShuttingDown = false;
 let isStartingUp = true;
-type ApiKeysModule = typeof import('@librechat/api-keys');
-
-let apiKeysModulePromise: Promise<ApiKeysModule> | null = null;
-
-function getApiKeysModule(): Promise<ApiKeysModule> {
-  apiKeysModulePromise ??= import('@librechat/api-keys');
-  return apiKeysModulePromise;
-}
-
-async function validateRemoteAccessToken(token: string): Promise<string> {
-  const { validateRemoteToken } = await getApiKeysModule();
-  return validateRemoteToken(token);
-}
-
-async function setAccessUser(userId: string): Promise<void> {
-  await connection.set('access-user', userId);
-}
 
 async function validateLifecycleAuthConfig(): Promise<void> {
-  await validateStartupAuthConfig({
-    setAccessUser,
-    validateRemoteToken: validateRemoteAccessToken,
-  });
+  await validateStartupAuthConfig();
 }
 
 // Flag to track if this process runs workers
@@ -86,13 +65,11 @@ function setupQueueListeners(queue: Queue, name: string): void {
 export async function startupApiOnly(): Promise<void> {
   logger.info('Starting API service (no workers)...');
   validateApiHardenedConfig();
-  await connectDb();
   await validateLifecycleAuthConfig();
 
   // Set up queue listeners for monitoring (optional, for observability)
   setupQueueListeners(pyQueue, 'Python');
   setupQueueListeners(otherQueue, 'Other');
-  setupQueueListeners(webhookQueue, 'Webhook');
 
   isStartingUp = false;
   logger.info('API service startup complete');
@@ -106,14 +83,8 @@ export async function startupWorkerOnly(): Promise<void> {
   logger.info('Starting Worker service...');
   validateWorkerHardenedConfig();
 
-  // Connect to database (may be no-op if MONGODB_URI not set)
-  // This ensures consistency with other startup functions and supports
-  // workers that need DB for logging/usage tracking in production
-  await connectDb();
-
   // Dynamically import workers to start them
   const { pyWorker, otherWorker } = await import('./workers');
-  const { webhookWorker } = await import('./webhook/worker');
 
   registerWorkers();
 
@@ -121,7 +92,6 @@ export async function startupWorkerOnly(): Promise<void> {
   const checkWorkers = (): void => {
     const isPyWorkerRunning = pyWorker.isRunning();
     const isOtherWorkerRunning = otherWorker.isRunning();
-    const isWebhookWorkerRunning = webhookWorker.isRunning();
 
     if (!isPyWorkerRunning) {
       throw new Error('Python worker is not running');
@@ -129,10 +99,6 @@ export async function startupWorkerOnly(): Promise<void> {
     if (!isOtherWorkerRunning) {
       throw new Error('Other worker is not running');
     }
-    if (!isWebhookWorkerRunning) {
-      throw new Error('Webhook worker is not running');
-    }
-
     logger.info('Workers health check passed');
   };
 
@@ -149,7 +115,6 @@ async function gracefulStartup(): Promise<void> {
   logger.info('Starting up service (combined API + Workers)...');
   validateApiHardenedConfig();
   validateWorkerHardenedConfig();
-  await connectDb();
   await validateLifecycleAuthConfig();
 
   try {
@@ -157,20 +122,17 @@ async function gracefulStartup(): Promise<void> {
 
     // Import workers (this starts them)
     const { pyWorker, otherWorker } = await import('./workers');
-    const { webhookWorker } = await import('./webhook/worker');
 
     registerWorkers();
 
     // Set up queue event listeners
     setupQueueListeners(pyQueue, 'Python');
     setupQueueListeners(otherQueue, 'Other');
-    setupQueueListeners(webhookQueue, 'Webhook');
 
     // Verify workers are running
     const checkWorkers = (): void => {
       const isPyWorkerRunning = pyWorker.isRunning();
       const isOtherWorkerRunning = otherWorker.isRunning();
-      const isWebhookWorkerRunning = webhookWorker.isRunning();
 
       if (!isPyWorkerRunning) {
         throw new Error('Python worker is not running');
@@ -178,10 +140,6 @@ async function gracefulStartup(): Promise<void> {
       if (!isOtherWorkerRunning) {
         throw new Error('Other worker is not running');
       }
-      if (!isWebhookWorkerRunning) {
-        throw new Error('Webhook worker is not running');
-      }
-
       logger.info('Workers health check passed');
     };
 
@@ -190,8 +148,7 @@ async function gracefulStartup(): Promise<void> {
     // Resume queues (in case they were paused)
     await Promise.all([
       pyQueue.resume(),
-      otherQueue.resume(),
-      webhookQueue.resume()
+      otherQueue.resume()
     ]);
 
     isStartingUp = false;
@@ -225,7 +182,6 @@ export async function gracefulShutdown(): Promise<void> {
     if (hasWorkers) {
       // Worker shutdown: close workers gracefully
       const { pyWorker, otherWorker } = await import('./workers');
-      const { webhookWorker } = await import('./webhook/worker');
 
       // Pause workers and wait for active jobs to complete
       // Note: We pause workers, NOT queues (queues are shared)
@@ -250,8 +206,7 @@ export async function gracefulShutdown(): Promise<void> {
       // Close workers
       await Promise.all([
         pyWorker.close(),
-        otherWorker.close(),
-        webhookWorker.close()
+        otherWorker.close()
       ]);
       logger.info('Workers closed');
     }
