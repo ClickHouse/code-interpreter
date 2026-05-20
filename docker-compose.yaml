@@ -174,7 +174,7 @@ services:
             target: production
         container_name: file_server
         ports:
-            - 3000:3000
+            - ${CODEAPI_FILE_SERVER_PORT:-13000}:3000
         environment:
             - MINIO_BUCKET=test-bucket
             - MINIO_ENDPOINT=minio
@@ -196,14 +196,14 @@ services:
         container_name: redis
         command: redis-server --requirepass localdev
         ports:
-            - 6379:6379
+            - ${CODEAPI_REDIS_PORT:-16379}:6379
 
     minio:
         image: quay.io/minio/minio
         container_name: minio
         ports:
-            - 9000:9000
-            - 9001:9001
+            - ${CODEAPI_MINIO_PORT:-19000}:9000
+            - ${CODEAPI_MINIO_CONSOLE_PORT:-19001}:9001
         volumes:
             - minio_data:/data
         environment:
