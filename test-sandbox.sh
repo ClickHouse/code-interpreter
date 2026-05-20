@@ -159,6 +159,21 @@ test_numpy() {
     fi
 }
 
+test_statsmodels() {
+    log_info "Testing statsmodels import and STL decomposition..."
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import numpy as np\nfrom statsmodels.tsa.seasonal import STL\nseries = np.arange(24, dtype=float) + np.tile([0.0, 1.0, 0.0, -1.0], 6)\nfit = STL(series, period=4).fit()\nprint(round(float(fit.trend[-1]), 2))"}]}')
+
+    stdout=$(echo "$result" | jq -r '.run.stdout // empty')
+    if [[ "$stdout" =~ ^[0-9.-]+ ]]; then
+        log_success "statsmodels: got '$stdout'"
+        return 0
+    else
+        log_error "statsmodels: expected numeric STL trend output, got '$stdout'"
+        echo "$result" | jq .
+        return 1
+    fi
+}
+
 test_chdb() {
     log_info "Testing chDB import and query..."
     result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import chdb\nprint(chdb.query(\"SELECT sum(number) FROM numbers(5)\", \"CSV\"))"}]}')
@@ -384,6 +399,7 @@ FAILED=0
 
 test_basic_python || FAILED=$((FAILED + 1))
 test_numpy || FAILED=$((FAILED + 1))
+test_statsmodels || FAILED=$((FAILED + 1))
 test_chdb || FAILED=$((FAILED + 1))
 test_file_write || FAILED=$((FAILED + 1))
 test_network_blocked || FAILED=$((FAILED + 1))

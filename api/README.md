@@ -63,7 +63,7 @@ All prefixed with `SANDBOX_` unless noted:
 
 Runtimes are auto-discovered from `/pkgs` at startup. Each package provides `compile` and `run` shell scripts. Currently tested and supported:
 
-- **Python** 3.14 -- includes `matplotlib`, `numpy`, `pandas`, `scipy`, chDB (`chdb`), and other scientific packages
+- **Python** 3.14 -- includes `matplotlib`, `numpy`, `pandas`, `scipy`, `statsmodels`, chDB (`chdb`), and other scientific packages
 - **Node.js** 24 -- runs `.js` files with curated offline npm packages
 - **Bun** (JavaScript/TypeScript) -- runs `.js`, `.ts`, and `.bun` files with the same curated offline package set
 

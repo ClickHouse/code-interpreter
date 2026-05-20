@@ -160,6 +160,7 @@ install_python_packages() {
         pandas \
         lifelines \
         scipy \
+        statsmodels \
         pillow \
         scikit-learn \
         scikit-image \
