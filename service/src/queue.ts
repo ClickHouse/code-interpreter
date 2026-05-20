@@ -8,6 +8,7 @@ import type * as t from './types';
 import { Jobs, Queues } from './enum';
 import { env } from './config';
 import logger from './logger';
+import { redisKeepAliveOptions } from './redis-options';
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_DELAY = 2000;
@@ -40,6 +41,7 @@ const connection = new IORedis({
   enableReadyCheck: true,
   connectTimeout: 10000,
   disconnectTimeout: 2000,
+  ...redisKeepAliveOptions(),
   tls: process.env.REDIS_TLS === 'true' ? {
     rejectUnauthorized: false
   } as tls.ConnectionOptions : undefined,

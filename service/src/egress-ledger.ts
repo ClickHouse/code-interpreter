@@ -5,6 +5,7 @@ import { env } from './config';
 import type { EgressGrantClaims } from './egress-grant';
 import { EgressGrantError } from './egress-grant';
 import logger from './logger';
+import { redisKeepAliveOptions } from './redis-options';
 
 type LedgerStatus = 'active' | 'revoked';
 
@@ -69,6 +70,7 @@ function redisConnection(): IORedis {
     retryStrategy,
     enableReadyCheck: true,
     connectTimeout: 10000,
+    ...redisKeepAliveOptions(),
     tls: process.env.REDIS_TLS === 'true'
       ? { rejectUnauthorized: false } as tls.ConnectionOptions
       : undefined,

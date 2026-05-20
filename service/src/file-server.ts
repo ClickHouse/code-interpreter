@@ -15,6 +15,7 @@ import { httpMetricsMiddleware } from './middleware/httpMetrics';
 import { internalServiceAuthEnabled, requireInternalServiceAuth } from './internal-service-auth';
 import logger from './fileServerLogger';
 import { env } from './config';
+import { redisKeepAliveOptions } from './redis-options';
 
 const { INSTANCE_ID } = env;
 
@@ -102,6 +103,7 @@ const redisClient = new IORedis({
     rejectUnauthorized: false
   } as tls.ConnectionOptions : undefined,
   connectTimeout: 10000,
+  ...redisKeepAliveOptions(),
   maxRetriesPerRequest: 3,
   retryStrategy(times: number): number {
     const delay = Math.min(times * 500, 2000);

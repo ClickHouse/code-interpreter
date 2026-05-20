@@ -13,6 +13,7 @@ import {
 import { internalServiceAuthEnabled, isAuthorizedInternalServiceRequest } from './internal-service-auth';
 import { isRegisteredToolName } from './tool-scope';
 import logger from './toolCallServerLogger';
+import { redisKeepAliveOptions } from './redis-options';
 
 const INSTANCE_ID = process.env.INSTANCE_ID ?? nanoid();
 const PORT = Number(process.env.TOOL_CALL_SERVER_PORT) || 3033;
@@ -35,6 +36,7 @@ const redis = new IORedis({
     rejectUnauthorized: false
   } as tls.ConnectionOptions : undefined,
   connectTimeout: 10000,
+  ...redisKeepAliveOptions(),
   maxRetriesPerRequest: 3,
   retryStrategy(times: number): number {
     const delay = Math.min(times * 500, 2000);
