@@ -10,6 +10,7 @@ services:
     environment:
       - KVM_ENABLED=false
       - SANDBOX_USE_CGROUPV2=false
+      - SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP=false
     healthcheck:
       test:
         - CMD-SHELL

@@ -18,6 +18,7 @@
 #   SKIP_BUN=1               # Skip Bun installation
 #   SKIP_PYTHON=1            # Skip Python installation
 #   FORCE_REBUILD=1          # Delete existing packages first
+#   BUN_PACKAGE_BATCH_SIZE=4 # Positive integer number of direct JS packages per Bun install batch
 #
 
 set -e
@@ -51,6 +52,15 @@ load_js_packages() {
 should_load_js_packages() {
     [ "${SKIP_JS_PACKAGES:-}" != "1" ] &&
         { [ "${SKIP_NODE:-}" != "1" ] || [ "${SKIP_BUN:-}" != "1" ]; }
+}
+
+validate_bun_package_batch_size() {
+    local batch_size="${BUN_PACKAGE_BATCH_SIZE:-4}"
+    if [[ ! "$batch_size" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: BUN_PACKAGE_BATCH_SIZE must be a positive integer (got: ${batch_size})" >&2
+        return 1
+    fi
+    printf '%s\n' "$batch_size"
 }
 
 if should_load_js_packages; then
@@ -379,29 +389,44 @@ install_bun_packages() {
     fi
 
     local pkg_dest="/pkgs/bun/${BUN_VERSION}"
-    local packages
-    printf -v packages "%q " "${JS_PACKAGES[@]}"
+    local batch_size
+    batch_size="$(validate_bun_package_batch_size)"
+    local batch_index=1
+    local batch_count=$(( (${#JS_PACKAGES[@]} + batch_size - 1) / batch_size ))
 
     echo "=============================================="
     echo "  Installing Bun packages"
     echo "=============================================="
 
-    docker exec "$CONTAINER_NAME" bash -c "
-        set -e
-        cd ${pkg_dest}
-        ./bun add --exact ${packages}
-    "
+    for ((i = 0; i < ${#JS_PACKAGES[@]}; i += batch_size)); do
+        local batch_packages
+        printf -v batch_packages "%q " "${JS_PACKAGES[@]:i:batch_size}"
+        echo "Installing Bun package batch ${batch_index}/${batch_count}"
+        docker exec "$CONTAINER_NAME" bash -c "
+            set -e
+            cd ${pkg_dest}
+            BUN_CONFIG_MAX_HTTP_REQUESTS=${BUN_CONFIG_MAX_HTTP_REQUESTS:-8} ./bun add --exact ${batch_packages}
+        "
+        batch_index=$((batch_index + 1))
+    done
 
     # Mirror the manifest into bun's global tree (BUN_INSTALL=${pkg_dest} ->
     # ${pkg_dest}/install/global/node_modules) so `bun pm ls -g`, `bun add -g`,
     # and global CLI shims at ${pkg_dest}/install/global/bin work as LLMs
     # expect. The local tree above is still what feeds the
     # /mnt/data/node_modules symlink used by `import` from user code.
-    docker exec "$CONTAINER_NAME" bash -c "
-        set -e
-        cd ${pkg_dest}
-        BUN_INSTALL=${pkg_dest} ./bun install -g --exact ${packages}
-    "
+    batch_index=1
+    for ((i = 0; i < ${#JS_PACKAGES[@]}; i += batch_size)); do
+        local batch_packages
+        printf -v batch_packages "%q " "${JS_PACKAGES[@]:i:batch_size}"
+        echo "Installing global Bun package batch ${batch_index}/${batch_count}"
+        docker exec "$CONTAINER_NAME" bash -c "
+            set -e
+            cd ${pkg_dest}
+            BUN_CONFIG_MAX_HTTP_REQUESTS=${BUN_CONFIG_MAX_HTTP_REQUESTS:-8} BUN_INSTALL=${pkg_dest} ./bun install -g --exact ${batch_packages}
+        "
+        batch_index=$((batch_index + 1))
+    done
 
     docker exec "$CONTAINER_NAME" bash -c "echo \$(date +%s)000 > ${pkg_dest}/.package-installed"
 

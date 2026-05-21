@@ -4,6 +4,7 @@ set -e
 echo "Starting NsJail sandbox API..."
 
 SANDBOX_USE_CGROUPV2="${SANDBOX_USE_CGROUPV2:-true}"
+SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP="${SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP:-true}"
 NSJAIL_CONFIG_SOURCE="${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}"
 
 # Mount tmpfs on /tmp for fast, memory-backed file I/O.
@@ -53,8 +54,9 @@ else
     echo "No /proc submounts detected — fresh procfs supported"
 fi
 
-# Remove umount binary now that we're done with it (not needed by sandbox)
-rm -f /usr/bin/umount 2>/dev/null || true
+if [ "$SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP" = "true" ]; then
+    rm -f /usr/bin/umount 2>/dev/null || true
+fi
 
 # Set up cgroup v2 delegation for NsJail when the container runtime allows it.
 if [ "$SANDBOX_USE_CGROUPV2" = "true" ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then

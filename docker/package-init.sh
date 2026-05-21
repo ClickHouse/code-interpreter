@@ -38,6 +38,15 @@ load_js_packages() {
     fi
 }
 
+validate_bun_package_batch_size() {
+    local batch_size="${BUN_PACKAGE_BATCH_SIZE:-4}"
+    if [[ ! "$batch_size" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: BUN_PACKAGE_BATCH_SIZE must be a positive integer (got: ${batch_size})" >&2
+        return 1
+    fi
+    printf '%s\n' "$batch_size"
+}
+
 package_name_from_spec() {
     local spec="$1"
     echo "${spec%@*}"
@@ -420,11 +429,28 @@ echo ""
 
 if [ "$BUN_INSTALLED" = true ] && [ "${#JS_PACKAGES[@]}" -gt 0 ] && [ -f "$BUN_DEST/bun" ]; then
     cd "$BUN_DEST"
-    if ! ./bun add --exact "${JS_PACKAGES[@]}"; then
-        echo "ERROR: Bun package installation failed"
+    BUN_BATCH_FAILED=false
+    if ! BUN_PACKAGE_BATCH_SIZE="$(validate_bun_package_batch_size)"; then
         INSTALL_FAILED=true
     else
-        echo "$(date +%s)000" > "$BUN_DEST/.package-installed"
+        BUN_BATCH_COUNT=$(( (${#JS_PACKAGES[@]} + BUN_PACKAGE_BATCH_SIZE - 1) / BUN_PACKAGE_BATCH_SIZE ))
+        BUN_BATCH_INDEX=1
+
+        for ((i = 0; i < ${#JS_PACKAGES[@]}; i += BUN_PACKAGE_BATCH_SIZE)); do
+            echo "Installing Bun package batch ${BUN_BATCH_INDEX}/${BUN_BATCH_COUNT}"
+            if ! BUN_CONFIG_MAX_HTTP_REQUESTS="${BUN_CONFIG_MAX_HTTP_REQUESTS:-8}" ./bun add --exact "${JS_PACKAGES[@]:i:BUN_PACKAGE_BATCH_SIZE}"; then
+                BUN_BATCH_FAILED=true
+                break
+            fi
+            BUN_BATCH_INDEX=$((BUN_BATCH_INDEX + 1))
+        done
+
+        if [ "$BUN_BATCH_FAILED" = true ]; then
+            echo "ERROR: Bun package installation failed"
+            INSTALL_FAILED=true
+        else
+            echo "$(date +%s)000" > "$BUN_DEST/.package-installed"
+        fi
     fi
 
     echo ""
