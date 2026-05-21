@@ -129,6 +129,12 @@ const SECCOMP_POLICY = [
    * surfaces. lookup_dcookie: profiling, deprecated upstream. */
   '    settimeofday, adjtimex, clock_adjtime, syslog,',
   archSpecificLowPrioritySyscalls,
+  /* AF_VSOCK reaches the host hypervisor on KVM-based runners (the runner
+   * launcher uses krun -> libkrun; the guest sees virtio-vsock). Audit
+   * showed a VSOCK socket() succeeded and connect() hung instead of
+   * returning ENETUNREACH. KILL it explicitly so synthetic coverage sees
+   * SIGSYS rather than an ordinary EPERM-style denial. */
+  '    socket(domain) { domain == AF_VSOCK },',
   '    ioctl(fd, request) { (request & 0xFF00) == KVM_IOCTL_MAGIC }',
   '  },',
   '  ERRNO(38) {',
@@ -164,7 +170,7 @@ const SECCOMP_POLICY = [
    * showed a VSOCK socket() succeeded and connect() hung instead of
    * returning ENETUNREACH — that surface should not be reachable from
    * sandboxed code. */
-  '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG || domain == AF_VSOCK }',
+  '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG }',
   '  }',
   '}',
   'USE sandbox DEFAULT ALLOW',

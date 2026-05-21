@@ -215,15 +215,19 @@ describe('NsJail seccomp policy', () => {
     expect(policy).toContain('#define fspick 433');
   });
 
-  test('rejects AF_VSOCK in the socket(domain) filter', () => {
+  test('KILLs AF_VSOCK in the socket(domain) filter', () => {
     const policy = seccompPolicy();
     expect(policy).toContain('#define AF_VSOCK 40');
-    /* Same line that already denies AF_INET / AF_NETLINK / AF_ALG must
-     * extend to AF_VSOCK. Anchor on `socket(domain)` so we are sure we
-     * are looking at the right rule, not a stray mention. */
-    const socketRule = policy.split('\n').find(line => line.includes('socket(domain)'));
-    expect(socketRule).toBeDefined();
-    expect(socketRule).toContain('AF_VSOCK');
+    const killBlock = policy.split('KILL {')[1]?.split('  },')[0] ?? '';
+    const errnoBlock = policy.split('ERRNO(1)')[1] ?? '';
+
+    const killSocketRule = killBlock.split('\n').find(line => line.includes('socket(domain)'));
+    expect(killSocketRule).toBeDefined();
+    expect(killSocketRule).toContain('AF_VSOCK');
+
+    const errnoSocketRule = errnoBlock.split('\n').find(line => line.includes('socket(domain)'));
+    expect(errnoSocketRule).toBeDefined();
+    expect(errnoSocketRule).not.toContain('AF_VSOCK');
   });
 
   test('KILLs the defense-in-depth batch from the audit', () => {
