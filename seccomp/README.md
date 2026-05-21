@@ -24,6 +24,8 @@ The `nsjail.json` profile uses a whitelist approach - only explicitly allowed sy
 
 The following dangerous syscalls are NOT in the whitelist and will return EPERM:
 
+- `socket(AF_ALG)` - Linux userspace crypto API used by Copy Fail (CVE-2026-31431)
+- `socket(AF_RXRPC)` - RxRPC socket family used by Dirty Frag (CVE-2026-43500)
 - `kexec_load`, `kexec_file_load` - Kernel replacement
 - `init_module`, `finit_module`, `delete_module` - Kernel module loading
 - `reboot` - System reboot

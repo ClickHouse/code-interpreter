@@ -165,11 +165,9 @@ const SECCOMP_POLICY = [
    * runtimes the sandbox supports. */
   '    pidfd_open(pid) { pid == 1 },',
   '    pidfd_send_signal,',
-  /* AF_VSOCK reaches the host hypervisor on KVM-based runners (the runner
-   * launcher uses krun -> libkrun; the guest sees virtio-vsock). Audit
-   * showed a VSOCK socket() succeeded and connect() hung instead of
-   * returning ENETUNREACH — that surface should not be reachable from
-   * sandboxed code. */
+  /* Block direct network and kernel-control socket domains from sandboxed
+   * code. AF_ALG covers the Linux kernel crypto API used by Copy Fail, and
+   * AF_RXRPC covers the RxRPC family used by Dirty Frag. */
   '    socket(domain) { domain == AF_INET || domain == AF_INET6 || domain == AF_NETLINK || domain == AF_KEY || domain == AF_RXRPC || domain == AF_ALG }',
   '  }',
   '}',

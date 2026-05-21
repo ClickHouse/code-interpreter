@@ -230,6 +230,17 @@ describe('NsJail seccomp policy', () => {
     expect(errnoSocketRule).not.toContain('AF_VSOCK');
   });
 
+  test('rejects Copy Fail and Dirty Frag socket entry points in the sandbox', () => {
+    const policy = seccompPolicy();
+    const errnoBlock = policy.split('ERRNO(1)')[1] ?? '';
+    const socketRule = errnoBlock.split('\n').find(line => line.includes('socket(domain)'));
+    expect(socketRule).toBeDefined();
+    for (const family of ['AF_ALG', 'AF_RXRPC', 'AF_INET', 'AF_INET6']) {
+      expect(socketRule).toContain(family);
+    }
+    expect(socketRule).not.toContain('AF_VSOCK');
+  });
+
   test('KILLs the defense-in-depth batch from the audit', () => {
     const policy = seccompPolicy();
     for (const name of ['settimeofday', 'adjtimex', 'clock_adjtime', 'syslog']) {
@@ -270,6 +281,9 @@ describe('NsJail seccomp policy', () => {
     ]) {
       expect(policy).toMatch(new RegExp(`\\b${name}\\b[,\\s]`));
     }
+    expect(policy).toContain('clone3');
+    expect(policy).toContain('vmsplice');
+    expect(policy).toContain('clone(flags) { (flags & CLONE_NAMESPACE_FLAGS) != 0 }');
   });
 
   test('does not emit a blank Kafel line on arm64 (filter strips empty arch slot)', () => {

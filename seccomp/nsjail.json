@@ -399,16 +399,34 @@
 			"action": "SCMP_ACT_ALLOW"
 		},
 		{
-			"comment": "Allow socket() for every domain except AF_ALG (domain 38). AF_ALG falls through to the profile's defaultAction (SCMP_ACT_ERRNO, EPERM), blocking CVE-2026-31431 (Copy Fail) at the container layer as defense-in-depth - the inner Kafel policy in api/src/nsjail.ts already blocks AF_ALG for user code under nsjail, so this rule's value is covering host-side processes (libkrun, launcher, supervisor, sandbox API) and the no-KVM fallback path. Single rule because libseccomp/runc reject mixing different actions for the same syscall (EEXIST) even when arg filters partition the input space.",
+			"comment": "Allow socket(AF_UNIX) for local process plumbing. Socket domains are enumerated instead of broadly allowed so AF_ALG (Copy Fail / CVE-2026-31431) and AF_RXRPC (Dirty Frag / CVE-2026-43500) fall through to SCMP_ACT_ERRNO.",
 			"names": ["socket"],
 			"action": "SCMP_ACT_ALLOW",
-			"args": [
-				{
-					"index": 0,
-					"value": 38,
-					"op": "SCMP_CMP_NE"
-				}
-			]
+			"args": [{ "index": 0, "value": 1, "op": "SCMP_CMP_EQ" }]
+		},
+		{
+			"comment": "Allow socket(AF_INET) for sandbox-runner HTTP and egress-gateway forwarding.",
+			"names": ["socket"],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [{ "index": 0, "value": 2, "op": "SCMP_CMP_EQ" }]
+		},
+		{
+			"comment": "Allow socket(AF_INET6) for dual-stack Docker/Kubernetes networking.",
+			"names": ["socket"],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [{ "index": 0, "value": 10, "op": "SCMP_CMP_EQ" }]
+		},
+		{
+			"comment": "Allow socket(AF_NETLINK) for NsJail/network namespace setup.",
+			"names": ["socket"],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [{ "index": 0, "value": 16, "op": "SCMP_CMP_EQ" }]
+		},
+		{
+			"comment": "Allow socket(AF_VSOCK) for KVM/libkrun host-side plumbing.",
+			"names": ["socket"],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [{ "index": 0, "value": 40, "op": "SCMP_CMP_EQ" }]
 		},
 		{
 			"comment": "iptables/netfilter for network isolation",
