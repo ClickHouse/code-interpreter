@@ -11,7 +11,7 @@ import {
   buildScopedSentinel,
   isReservedPtcFilename,
 } from './ptc-constants';
-import { pendingInputHashesFromRawPayload } from './tool-input-signature';
+import { hashToolInput, pendingInputHashesFromRawPayload } from './tool-input-signature';
 
 // Load async matplotlib template for programmatic tool calling
 const templateCodeAsync = fs.readFileSync(path.join(__dirname, 'matplotlib-async.py'), 'utf8');
@@ -648,17 +648,16 @@ export function extractPendingFromStdout(
     .filter(isPendingWithIndex)
     .map(({ c, index }) => {
       const callSite = (c as { call_site?: unknown }).call_site;
-      const inputHash = (c as { input_hash?: unknown }).input_hash;
       const rawInputHash = rawInputHashes[index];
+      const hasObjectInput = c.input != null && typeof c.input === 'object';
+      const input = (hasObjectInput ? c.input : {}) as Record<string, unknown>;
       return {
         call_id: c.call_id,
         tool_name: c.tool_name,
-        input: (c.input && typeof c.input === 'object' ? c.input : {}) as Record<string, unknown>,
-        ...(typeof inputHash === 'string'
-          ? { input_hash: inputHash }
-          : typeof rawInputHash === 'string'
-            ? { input_hash: rawInputHash }
-            : {}),
+        input,
+        input_hash: hasObjectInput && typeof rawInputHash === 'string'
+          ? rawInputHash
+          : hashToolInput(input),
         ...(typeof callSite === 'string' ? { call_site: callSite } : {}),
       };
     });

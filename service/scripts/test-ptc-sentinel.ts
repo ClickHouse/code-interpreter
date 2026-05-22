@@ -12,7 +12,7 @@ import {
   extractPendingFromStdout,
 } from '../src/preamble';
 import { isReservedPtcFilename, PTC_HISTORY_FILENAME } from '../src/ptc-constants';
-import { hashRawToolInputJson } from '../src/tool-input-signature';
+import { hashRawToolInputJson, hashToolInput } from '../src/tool-input-signature';
 
 let passed = 0;
 let failed = 0;
@@ -43,19 +43,24 @@ console.log('extractPendingFromStdout:');
 // 2. One pending call appended to user stdout.
 {
   const user = 'computing...\n';
+  const forgedHash = 'a'.repeat(64);
   const block = sentinelBlock({
     pending: [{
       call_id: 'call_001',
       tool_name: 'lookup',
       input: { q: 'foo' },
-      input_hash: 'a'.repeat(64),
+      input_hash: forgedHash,
     }],
   });
   const r = extractPendingFromStdout(user + block);
   assert(r.pending !== null && r.pending.length === 1, 'single call parsed');
   assert(r.pending?.[0].call_id === 'call_001', 'call_id extracted');
   assert(r.pending?.[0].tool_name === 'lookup', 'tool_name extracted');
-  assert(r.pending?.[0].input_hash === 'a'.repeat(64), 'input_hash extracted');
+  assert(
+    r.pending?.[0].input_hash === hashToolInput({ q: 'foo' }),
+    'input_hash recomputed from parsed input',
+  );
+  assert(r.pending?.[0].input_hash !== forgedHash, 'sandbox-supplied input_hash ignored');
   assert(
     JSON.stringify(r.pending?.[0].input) === JSON.stringify({ q: 'foo' }),
     'input extracted',

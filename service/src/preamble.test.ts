@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { generatePreamble } from './preamble';
+import { buildScopedSentinel, extractPendingFromStdout, generatePreamble } from './preamble';
+import { hashToolInput } from './tool-input-signature';
 
 const baseConfig = {
   callbackUrl: 'http://orchestrator:3112/internal/tool-call',
@@ -63,5 +64,32 @@ describe('generatePreamble — Unix-vs-TCP transport gate', () => {
     expect(preamble).toContain('_TOOL_CALL_SOCKET = "/tmp/tcs.sock"');
     expect(preamble).not.toMatch(/os\.environ\.get\(['"]TOOL_CALL_SOCKET['"]/);
     expect(preamble).not.toMatch(/os\.environ\[['"]TOOL_CALL_SOCKET['"]\]/);
+  });
+});
+
+describe('extractPendingFromStdout — input hash metadata', () => {
+  test('ignores sandbox-supplied input_hash and uses the parsed input hash', () => {
+    const executionId = 'exec_hash_guard';
+    const { start, end } = buildScopedSentinel(executionId);
+    const forgedHash = hashToolInput({ resource: 'B' });
+    const expectedHash = hashToolInput({ resource: 'A' });
+    const payload = {
+      pending: [{
+        call_id: 'call_001',
+        tool_name: 'authorize',
+        input: { resource: 'A' },
+        input_hash: forgedHash,
+      }],
+    };
+
+    const parsed = extractPendingFromStdout(
+      `before\n${start}\n${JSON.stringify(payload)}\n${end}\n`,
+      executionId,
+    );
+
+    expect(parsed.pending).toHaveLength(1);
+    expect(parsed.pending?.[0]?.input).toEqual({ resource: 'A' });
+    expect(parsed.pending?.[0]?.input_hash).toBe(expectedHash);
+    expect(parsed.pending?.[0]?.input_hash).not.toBe(forgedHash);
   });
 });
