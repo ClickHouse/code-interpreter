@@ -41,6 +41,7 @@ function runBash(
   writeFileSync(historyPath, JSON.stringify(history));
   try {
     const out = execFileSync('bash', [file], {
+      cwd: dir,
       env: { ...process.env, PTC_HISTORY_PATH: historyPath },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -197,6 +198,34 @@ echo "AFTER"
     'bare: correct input',
   );
   assert(!r.stdout.includes('AFTER'), 'bare: aborts after first tool call');
+}
+
+{
+  const user = `
+exec 9>lockfile
+get_weather '{"city":"Seoul"}' > weather.json
+echo "file=$(cat weather.json)"
+`;
+  const r1 = runBash(assemble(user), {});
+  const p1 = extractPending(r1.stdout);
+  assert(r1.exitCode === 0, 'redirect_pending: exit 0');
+  assert(p1.pending !== null && p1.pending.length === 1, 'redirect_pending: pending emitted');
+  assert(
+    Boolean((p1.pending?.[0]?.input as { city?: string } | undefined)?.city === 'Seoul'),
+    'redirect_pending: correct input',
+  );
+  assert(!p1.stdout.includes('file='), 'redirect_pending: aborts before reading file');
+
+  const r2 = runBash(assemble(user), {
+    call_001: { result: { temperature: 72, city: 'Seoul' } },
+  });
+  const p2 = extractPending(r2.stdout);
+  assert(r2.exitCode === 0, 'redirect_replay: exit 0');
+  assert(p2.pending === null, 'redirect_replay: no pending');
+  assert(
+    p2.stdout.includes('file={"temperature":72,"city":"Seoul"}'),
+    'redirect_replay: redirected file contains tool output',
+  );
 }
 
 {

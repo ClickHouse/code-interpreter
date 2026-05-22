@@ -281,8 +281,8 @@ _ptc_note_subshell_tool_command() {
 _ptc_maybe_emit_pending() {
     local _ptc_force_pending_emit=0
     # Command substitutions and background jobs run in deeper subshells.
-    # They may record pending calls, but only the main user-code subshell
-    # or the parent fallback should emit the sentinel on stdout.
+    # They may record pending calls; the main user-code subshell exits
+    # before side effects, and the parent emits the sentinel on stdout.
     if [ "\${BASH_SUBSHELL:-0}" -gt 1 ]; then
         if declare -F _ptc_is_bare_tool_command >/dev/null 2>&1 && _ptc_is_bare_tool_command "$BASH_COMMAND"; then
             _ptc_note_subshell_tool_command
@@ -329,6 +329,10 @@ _ptc_maybe_emit_pending() {
         _ptc_cleanup_tempfiles
         trap - DEBUG EXIT
         exit 1
+    fi
+    if [ "\${BASH_SUBSHELL:-0}" -eq 1 ]; then
+        trap - DEBUG EXIT
+        exit 0
     fi
     printf '\\n%s\\n' "$_PTC_SENTINEL_START"
     printf '%s\\n' "$_ptc_payload"

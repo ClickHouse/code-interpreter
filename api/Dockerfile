@@ -78,6 +78,7 @@ RUN apt-get update && \
     procps \
     iptables \
     bc \
+    file \
     jq \
     poppler-utils \
     fonts-dejavu \
