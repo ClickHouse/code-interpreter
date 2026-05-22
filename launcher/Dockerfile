@@ -43,6 +43,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     coreutils \
     util-linux \
+    bsdextrautils \
     locales \
     procps \
     iptables \

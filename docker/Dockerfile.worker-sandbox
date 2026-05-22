@@ -79,6 +79,7 @@ RUN chmod +x /usr/local/bin/apt-install
 RUN apt-install \
     coreutils \
     util-linux \
+    bsdextrautils \
     locales \
     procps \
     iptables \
