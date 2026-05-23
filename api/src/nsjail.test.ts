@@ -272,6 +272,7 @@ describe('NsJail seccomp policy', () => {
      * that have been audit-critical historically. */
     for (const name of [
       'ptrace', 'memfd_create', 'userfaultfd',
+      'kexec_load', 'kexec_file_load',
       'mount', 'umount2', 'pivot_root',
       'init_module', 'finit_module', 'delete_module',
       'unshare', 'seccomp',

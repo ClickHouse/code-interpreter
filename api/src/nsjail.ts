@@ -58,6 +58,7 @@ const syscallDefines = process.arch === 'arm64'
       ...sharedSyscallDefines,
       '#define umount2 39',
       '#define seccomp 277',
+      '#define kexec_file_load 294',
       '#define setns 268',
       '#define syslog 116',
       '#define settimeofday 170',
@@ -82,9 +83,7 @@ const syscallDefines = process.arch === 'arm64'
       '#define lookup_dcookie 212',
     ];
 
-const kexecSyscalls = process.arch === 'arm64'
-  ? '    kexec_load, bpf, perf_event_open,'
-  : '    kexec_load, kexec_file_load, bpf, perf_event_open,';
+const kexecSyscalls = '    kexec_load, kexec_file_load, bpf, perf_event_open,';
 
 /* x86-only syscalls that must not appear in the arm64 policy or Kafel will
  * fail to parse (the symbol/define is absent). lookup_dcookie was deprecated
