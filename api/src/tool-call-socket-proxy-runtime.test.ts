@@ -138,8 +138,11 @@ async function spawnProxy(opts: { upstreamUrl: string; env?: Record<string, stri
     stop: async () => {
       proc.kill('SIGTERM');
       await new Promise<void>(r => {
-        proc.once('exit', () => r());
-        setTimeout(() => { proc.kill('SIGKILL'); r(); }, 1000);
+        const killTimer = setTimeout(() => { proc.kill('SIGKILL'); r(); }, 1000);
+        proc.once('exit', () => {
+          clearTimeout(killTimer);
+          r();
+        });
       });
     },
   };
@@ -150,6 +153,46 @@ function rawConnect(socketPath: string): Promise<net.Socket> {
     const sock = net.createConnection(socketPath);
     sock.once('connect', () => resolve(sock));
     sock.once('error', reject);
+  });
+}
+
+function slowHeaderConnect(
+  socketPath: string,
+  dripEveryMs: number,
+): Promise<{ socket: net.Socket; close: () => void }> {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(socketPath);
+    let drip: ReturnType<typeof setInterval> | undefined;
+    const clearDrip = (): void => {
+      if (drip) clearInterval(drip);
+      drip = undefined;
+    };
+    const onInitialError = (error: Error): void => {
+      clearDrip();
+      reject(error);
+    };
+
+    sock.once('error', onInitialError);
+    sock.once('connect', () => {
+      sock.off('error', onInitialError);
+      sock.on('error', () => { /* connection was destroyed by the proxy */ });
+      sock.once('close', clearDrip);
+      sock.write('POST /tool-call HTTP/1.1\r\nHost: x\r\nX-Drip: ');
+      drip = setInterval(() => {
+        if (sock.destroyed) {
+          clearDrip();
+          return;
+        }
+        try { sock.write('x'); } catch { clearDrip(); }
+      }, dripEveryMs);
+      resolve({
+        socket: sock,
+        close: () => {
+          clearDrip();
+          sock.destroy();
+        },
+      });
+    });
   });
 }
 
@@ -274,6 +317,41 @@ describeIfRuntime('tool-call-socket-proxy under Node runtime (production parity)
       await upstream.close();
     }
   });
+
+  test('CIRCUMVENTION: slow incomplete headers cannot starve all connection slots', async () => {
+    /* Header-drip clients are more subtle than silent sockets: they send
+     * bytes under the idle timeout, so socket.setTimeout never fires. The
+     * proxy must still reclaim each accepted socket on an absolute
+     * accept-to-headers deadline before all maxConnections slots can be held. */
+    const upstream = await startUpstream();
+    const proxy = await spawnProxy({
+      upstreamUrl: upstream.url,
+      env: {
+        TCS_MAX_CONNECTIONS: '4',
+        TCS_HEADER_TIMEOUT_MS: '500',
+        TCS_CONNECTION_RATE_BURST: '32',
+        TCS_CONNECTION_RATE_REFILL_PER_SEC: '200',
+      },
+    });
+    const drips: Array<{ socket: net.Socket; close: () => void }> = [];
+
+    try {
+      for (let i = 0; i < 4; i++) {
+        drips.push(await slowHeaderConnect(proxy.socketPath, 100));
+      }
+
+      await new Promise(r => setTimeout(r, 900));
+
+      const res = await postToolCall(proxy.socketPath, '{"x":1}');
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true, received: 7 });
+      expect(upstream.calls()).toBe(1);
+    } finally {
+      drips.forEach(drip => drip.close());
+      await proxy.stop();
+      await upstream.close();
+    }
+  }, { timeout: 10_000 });
 
   test('CIRCUMVENTION: HTTP request smuggling (Content-Length + Transfer-Encoding) does not reach upstream', async () => {
     /* The classic CL.TE / TE.CL smuggling primitive: send both headers

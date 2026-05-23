@@ -9,6 +9,7 @@ export interface ToolCallSocketProxyOptions {
   maxConnections?: number;
   maxActiveRequests?: number;
   idleSocketTimeoutMs?: number;
+  headerTimeoutMs?: number;
   requestBodyTimeoutMs?: number;
   activeRequestTimeoutMs?: number;
   maxBodyBytes?: number;
@@ -246,6 +247,7 @@ export async function startToolCallSocketProxy(
   const maxConnections = opts.maxConnections ?? defaultMaxConnections();
   const maxActiveRequests = opts.maxActiveRequests ?? defaultMaxActiveRequests();
   const idleSocketTimeoutMs = opts.idleSocketTimeoutMs ?? DEFAULT_IDLE_SOCKET_TIMEOUT_MS;
+  const headerTimeoutMs = opts.headerTimeoutMs ?? idleSocketTimeoutMs;
   const requestBodyTimeoutMs = opts.requestBodyTimeoutMs ?? DEFAULT_REQUEST_BODY_TIMEOUT_MS;
   const activeRequestTimeoutMs = opts.activeRequestTimeoutMs ?? defaultActiveRequestTimeoutMs();
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
@@ -258,8 +260,19 @@ export async function startToolCallSocketProxy(
   const socketMode = opts.socketMode ?? 0o666;
 
   const activeSockets = new Set<net.Socket>();
+  /* Absolute accept-to-headers deadlines cover slow-header clients. Node's
+   * headersTimeout and socket idle timers are not a short per-socket deadline
+   * for AF_UNIX header drip attacks, so track the accepted socket ourselves
+   * until node:http has parsed enough bytes to dispatch a request. */
+  const headerReceiveDeadlines = new WeakMap<net.Socket, ReturnType<typeof setTimeout>>();
   let activeRequests = 0;
   let activeUpstreams = 0;
+
+  const clearHeaderReceiveDeadline = (socket: net.Socket): void => {
+    const deadline = headerReceiveDeadlines.get(socket);
+    if (deadline) clearTimeout(deadline);
+    headerReceiveDeadlines.delete(socket);
+  };
 
   /* Connection-rate limiter — counters the audit pattern of 500 AF_UNIX
    * connect()s in <50 ms. Without this, even though the proxy itself
@@ -280,6 +293,7 @@ export async function startToolCallSocketProxy(
 
   const server = http.createServer((req, res) => {
     const socket = req.socket;
+    clearHeaderReceiveDeadline(socket);
     socket.setTimeout(requestBodyTimeoutMs, () => destroySocket(socket));
     req.setTimeout(requestBodyTimeoutMs, () => destroySocket(socket));
     res.setHeader('Connection', 'close');
@@ -501,7 +515,7 @@ export async function startToolCallSocketProxy(
   });
 
   server.maxConnections = maxConnections;
-  server.headersTimeout = idleSocketTimeoutMs;
+  server.headersTimeout = headerTimeoutMs;
   server.keepAliveTimeout = 1;
   /* Bound the entire request reception (first byte -> last body byte) to
    * the body-upload window. Prevents slow-loris drip attacks: socket-idle
@@ -533,11 +547,19 @@ export async function startToolCallSocketProxy(
     }
 
     activeSockets.add(socket);
+    const headerReceiveDeadline = setTimeout(() => {
+      headerReceiveDeadlines.delete(socket);
+      destroySocket(socket);
+    }, headerTimeoutMs);
+    headerReceiveDeadlines.set(socket, headerReceiveDeadline);
+
     socket.setTimeout(idleSocketTimeoutMs, () => destroySocket(socket));
     socket.on('close', () => {
+      clearHeaderReceiveDeadline(socket);
       activeSockets.delete(socket);
     });
     socket.on('error', () => {
+      clearHeaderReceiveDeadline(socket);
       activeSockets.delete(socket);
     });
   });
@@ -601,6 +623,8 @@ if (require.main === module) {
   const rawTarget = process.env.SANDBOX_FORWARD_TARGET || '';
   const socketUid = process.env.TCS_SOCKET_UID ? Number(process.env.TCS_SOCKET_UID) : undefined;
   const socketGid = process.env.TCS_SOCKET_GID ? Number(process.env.TCS_SOCKET_GID) : undefined;
+  const maxConnections = parsePositiveInt(process.env.TCS_MAX_CONNECTIONS);
+  const headerTimeoutMs = parsePositiveInt(process.env.TCS_HEADER_TIMEOUT_MS);
   /* Operator overrides for the connection-rate limiter — see
    * createTokenBucket comment for the kernel-slab-pressure motivation.
    * Defaults (burst=64, refill=20/sec) are sized for the SDK's tool-call
@@ -630,6 +654,8 @@ if (require.main === module) {
 
   startToolCallSocketProxy({
     socketPath, rawTarget, socketUid, socketGid,
+    maxConnections,
+    headerTimeoutMs,
     connectionRateBurst: rateBurst,
     connectionRateRefillPerSec: rateRefillPerSec,
   })
