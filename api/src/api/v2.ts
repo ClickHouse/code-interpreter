@@ -221,6 +221,7 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
           publicKey: config.execution_manifest_public_key,
           secret: config.execution_manifest_secret,
           body: req.body,
+          bodyHashRequiredAfterSeconds: config.execution_manifest_body_hash_required_after_seconds,
         });
       } catch (error) {
         metricsOutcome = 'manifest_error';

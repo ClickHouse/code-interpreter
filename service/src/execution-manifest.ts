@@ -71,6 +71,7 @@ export interface ExecutionManifestClaims {
   max_requests: number;
   iat: number;
   exp: number;
+  execute_body_sha256?: string;
   chc_user_id?: string;
   org_id?: string;
   service_id?: string;
@@ -117,6 +118,17 @@ function canonicalJson(value: unknown): string {
   }
 
   throw new ExecutionManifestError('malformed', 'Execution manifest contains an unsupported value');
+}
+
+function bodyForManifestDigest(body: unknown): unknown {
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return body;
+  const { execution_manifest: _executionManifest, ...rest } = body as Record<string, unknown>;
+  return rest;
+}
+
+export function executionManifestBodySha256(body: unknown): string {
+  const canonicalBody = canonicalJson(bodyForManifestDigest(body));
+  return crypto.createHash('sha256').update(canonicalBody, 'utf8').digest('base64url');
 }
 
 function hmacSha256(data: string, secret: string): Buffer {
@@ -195,6 +207,12 @@ function validateClaimsShape(value: unknown): asserts value is ExecutionManifest
   }
   if (!Array.isArray(claims.read_sessions) || claims.read_sessions.some(session => typeof session !== 'string' || session === '')) {
     throw new ExecutionManifestError('malformed', 'Execution manifest read_sessions is invalid');
+  }
+  if (
+    claims.execute_body_sha256 !== undefined &&
+    (typeof claims.execute_body_sha256 !== 'string' || claims.execute_body_sha256 === '')
+  ) {
+    throw new ExecutionManifestError('malformed', 'Execution manifest execute_body_sha256 is invalid');
   }
   for (const file of claims.input_files) {
     if (

@@ -2,6 +2,7 @@ import type { TFile } from './job';
 import {
   EXECUTION_MANIFEST_HEADER,
   ExecutionManifestError,
+  executionManifestBodySha256,
   type ExecutionManifestClaims,
   type ExecutionManifestInputFile,
   verifyExecutionManifestWithKey,
@@ -34,6 +35,34 @@ function fileKey(file: ExecutionManifestInputFile): string {
 
 function stringArraysEqual(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+interface ManifestBodyHashOptions {
+  nowSeconds?: number;
+  bodyHashRequiredAfterSeconds?: number;
+}
+
+function assertManifestBodyHashMatches(
+  manifest: ExecutionManifestClaims,
+  body: ExecuteRequestBody,
+  options: ManifestBodyHashOptions = {},
+): void {
+  if (!manifest.execute_body_sha256) {
+    const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000);
+    /* Updated sandbox pods can receive still-valid manifests from older
+     * service workers during a rolling deploy. Keep that compatibility window
+     * bounded so body-hash enforcement closes automatically after rollout. */
+    if (
+      options.bodyHashRequiredAfterSeconds !== undefined &&
+      nowSeconds < options.bodyHashRequiredAfterSeconds
+    ) {
+      return;
+    }
+    throw new ExecutionManifestError('scope_mismatch', 'Execution manifest body hash does not match request');
+  }
+  if (manifest.execute_body_sha256 !== executionManifestBodySha256(body)) {
+    throw new ExecutionManifestError('scope_mismatch', 'Execution manifest body hash does not match request');
+  }
 }
 
 export function collectExecuteRequestInputFiles(body: ExecuteRequestBody): ExecutionManifestInputFile[] {
@@ -69,6 +98,7 @@ export function collectExecuteRequestInputFiles(body: ExecuteRequestBody): Execu
 export function assertManifestMatchesExecuteRequest(
   manifest: ExecutionManifestClaims,
   body: ExecuteRequestBody,
+  options: ManifestBodyHashOptions = {},
 ): void {
   const outputSessionId = body.output_session_id ?? body.session_id;
   if (!outputSessionId || manifest.output_session_id !== outputSessionId) {
@@ -96,6 +126,8 @@ export function assertManifestMatchesExecuteRequest(
   if (!stringArraysEqual(expectedReadSessions, manifestReadSessions)) {
     throw new ExecutionManifestError('scope_mismatch', 'Execution manifest read sessions do not match request');
   }
+
+  assertManifestBodyHashMatches(manifest, body, options);
 }
 
 export function verifyExecuteRequestManifest(args: {
@@ -104,6 +136,7 @@ export function verifyExecuteRequestManifest(args: {
   secret?: string;
   body: ExecuteRequestBody;
   nowSeconds?: number;
+  bodyHashRequiredAfterSeconds?: number;
 }): ExecutionManifestClaims {
   if (!args.headerValue) {
     throw new ExecutionManifestError('missing_header', `${EXECUTION_MANIFEST_HEADER} is required`);
@@ -114,6 +147,9 @@ export function verifyExecuteRequestManifest(args: {
   }, {
     nowSeconds: args.nowSeconds,
   });
-  assertManifestMatchesExecuteRequest(manifest, args.body);
+  assertManifestMatchesExecuteRequest(manifest, args.body, {
+    nowSeconds: args.nowSeconds,
+    bodyHashRequiredAfterSeconds: args.bodyHashRequiredAfterSeconds,
+  });
   return manifest;
 }

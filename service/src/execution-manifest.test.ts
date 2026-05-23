@@ -4,6 +4,7 @@ import { buildExecutionManifestClaims, collectManifestInputFiles } from './execu
 import {
   EXECUTION_MANIFEST_VERSION,
   ExecutionManifestError,
+  executionManifestBodySha256,
   type ExecutionManifestErrorReason,
   type ExecutionManifestClaims,
   signExecutionManifest,
@@ -93,6 +94,29 @@ describe('execution manifest signing', () => {
     } as ExecutionManifestClaims;
 
     expect(signExecutionManifest(first, SECRET)).toBe(signExecutionManifest(second, SECRET));
+  });
+
+  test('hashes canonical execute bodies without the manifest token field', () => {
+    const firstBody = {
+      execution_manifest: 'first-token',
+      session_id: 'sess_output',
+      language: 'python',
+      files: [{ name: 'main.py', content: 'print(1)' }],
+      env_vars: { ZED: 'last', ALPHA: 'first' },
+    };
+    const secondBody = {
+      env_vars: { ALPHA: 'first', ZED: 'last' },
+      files: [{ content: 'print(1)', name: 'main.py' }],
+      language: 'python',
+      session_id: 'sess_output',
+      execution_manifest: 'second-token',
+    };
+
+    expect(executionManifestBodySha256(firstBody)).toBe(executionManifestBodySha256(secondBody));
+    expect(executionManifestBodySha256({
+      ...firstBody,
+      files: [{ name: 'main.py', content: 'print(2)' }],
+    })).not.toBe(executionManifestBodySha256(firstBody));
   });
 
   test('rejects tampered and expired manifests', () => {

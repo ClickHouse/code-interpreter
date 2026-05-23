@@ -27,6 +27,7 @@ const requireExecutionManifest = (
   process.env.SANDBOX_REQUIRE_EGRESS_MANIFEST
   ?? (egressGatewayUrl ? 'true' : 'false')
 ) === 'true';
+const sandboxStartedAtSeconds = Math.floor(Date.now() / 1000);
 
 function cleanDirectory(raw: string | undefined): string | undefined {
   if (!raw?.trim()) return undefined;
@@ -83,6 +84,11 @@ export const config = {
   max_path_length: safeInt(process.env.SANDBOX_MAX_PATH_LENGTH, 256),
   max_output_files: safeInt(process.env.SANDBOX_MAX_OUTPUT_FILES, 50),
   require_execution_manifest: requireExecutionManifest,
+  execution_manifest_body_hash_required_after_seconds: sandboxStartedAtSeconds + safeInt(
+    process.env.SANDBOX_EXECUTION_MANIFEST_BODY_HASH_LEGACY_GRACE_SECONDS,
+    600,
+    0,
+  ),
   execution_manifest_public_key: process.env.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY ?? '',
   // Legacy HMAC verifier fallback for rolling upgrades only. Cloud split-runner
   // deployments should mount SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY instead so a

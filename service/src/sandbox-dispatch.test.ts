@@ -5,6 +5,7 @@ import { EGRESS_GRANT_HEADER } from './egress-grant';
 import {
   EXECUTION_MANIFEST_HEADER,
   EXECUTION_MANIFEST_VERSION,
+  executionManifestBodySha256,
   type ExecutionManifestClaims,
   verifyExecutionManifest,
   verifyExecutionManifestWithPublicKey,
@@ -71,6 +72,7 @@ describe('sandbox execute request dispatch', () => {
     expect(request.headers[EXECUTION_MANIFEST_HEADER]).toBeUndefined();
     expect(request.body.execution_manifest).toEqual(expect.any(String));
     expect(verifyExecutionManifest(request.body.execution_manifest!, SECRET, { nowSeconds: 1_100 })).toEqual(claims({
+      execute_body_sha256: executionManifestBodySha256(request.body),
       iat: 1_000,
       exp: 1_300,
     }));
@@ -87,6 +89,25 @@ describe('sandbox execute request dispatch', () => {
     });
 
     expect(verifyExecutionManifestWithPublicKey(request.body.execution_manifest!, PUBLIC_KEY, { nowSeconds: 1_100 })).toEqual(claims({
+      execute_body_sha256: executionManifestBodySha256(request.body),
+      iat: 1_000,
+      exp: 1_300,
+    }));
+  });
+
+  test('binds body-carried egress grants into signed execution manifests', () => {
+    const request = buildSandboxExecuteRequest({
+      payload: payload(),
+      egressGrantToken: 'ceg1.sealed-grant',
+      executionManifestClaims: claims(),
+      executionManifestSecret: SECRET,
+      executionManifestTtlSeconds: 300,
+      nowSeconds: 1_000,
+    });
+
+    expect(request.body.egress_grant).toBe('ceg1.sealed-grant');
+    expect(verifyExecutionManifest(request.body.execution_manifest!, SECRET, { nowSeconds: 1_100 })).toEqual(claims({
+      execute_body_sha256: executionManifestBodySha256(request.body),
       iat: 1_000,
       exp: 1_300,
     }));
