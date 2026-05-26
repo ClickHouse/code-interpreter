@@ -180,6 +180,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     socat \
     curl \
     util-linux \
+    grep \
     gawk \
     findutils \
     ca-certificates \

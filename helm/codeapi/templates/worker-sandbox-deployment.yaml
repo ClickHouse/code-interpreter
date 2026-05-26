@@ -244,6 +244,8 @@ spec:
               value: {{ .Values.workerSandbox.launcher.ramMib | default 2048 | quote }}
             - name: LAUNCHER_LOG_LEVEL
               value: {{ .Values.workerSandbox.launcher.logLevel | default 3 | quote }}
+            - name: LAUNCHER_FILTER_VSOCK_ENOTCONN
+              value: {{ .Values.workerSandbox.launcher.filterVsockEnotconn | quote }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL

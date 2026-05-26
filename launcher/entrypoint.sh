@@ -55,4 +55,12 @@ resolve_url EGRESS_GATEWAY_URL
 resolve_url FILE_SERVER_URL
 resolve_host_port SANDBOX_FORWARD_TARGET
 
+if [ "${LAUNCHER_FILTER_VSOCK_ENOTCONN:-true}" = "true" ]; then
+    # libkrun can emit this benign TSI/vsock teardown line after the guest has
+    # already closed its side of the socket. It contains the word "error", so
+    # text-based log panels count it as an app failure unless we drop it here.
+    exec /usr/local/bin/launcher "$@" \
+        2> >(grep --line-buffered -vF 'devices::virtio::vsock::tsi_stream error sending shutdown to socket: ENOTCONN' >&2)
+fi
+
 exec /usr/local/bin/launcher "$@"

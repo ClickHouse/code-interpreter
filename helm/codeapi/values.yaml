@@ -137,6 +137,7 @@ workerSandbox:
     vcpus: 2
     ramMib: 2048
     logLevel: 3
+    filterVsockEnotconn: true
 
   # Resource limits (higher because it runs code + microVM)
   resources:

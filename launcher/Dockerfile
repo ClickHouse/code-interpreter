@@ -117,6 +117,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \
     socat \
     util-linux \
+    grep \
     gawk \
     findutils \
     ca-certificates \
