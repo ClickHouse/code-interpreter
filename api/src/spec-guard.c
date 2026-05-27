@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,34 @@
 #  endif
 #endif
 
+static void close_fd_loop(long start, long end) {
+    if (start < 3) start = 3;
+    if (end > INT_MAX) end = INT_MAX;
+    if (start > end) return;
+    for (long fd = start; fd <= end; fd++) {
+        close((int)fd);
+    }
+}
+
+static bool close_proc_fds(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (d == NULL) return false;
+
+    int dir_fd = dirfd(d);
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char *end = NULL;
+        long fd = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0') continue;
+        if (fd < 3 || fd > (long)INT_MAX) continue;
+        if ((int)fd == dir_fd) continue;  /* don't close our iterator */
+        close((int)fd);
+    }
+    closedir(d);
+    return true;
+}
+
 /* Close every file descriptor >= 3 (preserve stdin/stdout/stderr) before
  * the user command runs. The bug this prevents:
  *
@@ -52,44 +81,35 @@
  * Order of attempts:
  *   1. close_range(3, ~0U, 0)  (Linux 5.9+; one syscall, fastest)
  *   2. /proc/self/fd walk      (only closes actually-open FDs; cheap)
- *   3. RLIMIT_NOFILE loop      (last resort; may iterate millions)
+ *   3. low-fd loop + /proc retry (handles opendir() == EMFILE)
+ *   4. bounded high-fd loop     (last resort; may iterate millions)
  */
 static void close_inherited_fds(void) {
-#ifdef __NR_close_range
+#if defined(__NR_close_range) && !defined(SPEC_GUARD_TEST_DISABLE_CLOSE_RANGE)
     long rc = syscall(__NR_close_range, (unsigned int)3, ~0U, 0u);
     if (rc == 0) return;
     /* ENOSYS on pre-5.9 kernels, EINVAL on some odd builds. Fall through. */
 #endif
 
-    DIR *d = opendir("/proc/self/fd");
-    if (d != NULL) {
-        int dir_fd = dirfd(d);
-        struct dirent *entry;
-        while ((entry = readdir(d)) != NULL) {
-            if (entry->d_name[0] == '.') continue;
-            char *end = NULL;
-            long fd = strtol(entry->d_name, &end, 10);
-            if (end == entry->d_name || *end != '\0') continue;
-            if (fd < 3 || fd > (long)INT_MAX) continue;
-            if ((int)fd == dir_fd) continue;  /* don't close our iterator */
-            close((int)fd);
-        }
-        closedir(d);
-        return;
-    }
+    if (close_proc_fds()) return;
 
-    /* No /proc — uncommon but possible. Bound the loop by RLIMIT_NOFILE.
-     * Avoids spinning to 2^31 on systems with no rlimit. */
+    /* If opendir("/proc/self/fd") failed with EMFILE, free low-numbered
+     * descriptors first so the retry can open the iterator and discover
+     * inherited descriptors above the now-lowered RLIMIT_NOFILE. */
     struct rlimit rl;
-    long max_fd = 1024;
+    long soft_max = 1024;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0
         && rl.rlim_cur != RLIM_INFINITY
         && rl.rlim_cur <= 1048576) {
-        max_fd = (long)rl.rlim_cur;
+        soft_max = (long)rl.rlim_cur;
     }
-    for (int fd = 3; fd < (int)max_fd; fd++) {
-        close(fd);
-    }
+    close_fd_loop(3, soft_max - 1);
+    if (close_proc_fds()) return;
+
+    /* No usable /proc — uncommon but possible. The current soft/hard limit
+     * may already have been lowered below inherited descriptor numbers, so
+     * sweep to a conservative cap rather than trusting RLIMIT_NOFILE. */
+    close_fd_loop(soft_max, 1048576);
 }
 
 int main(int argc, char *argv[]) {
