@@ -8,6 +8,7 @@ import {
   SandboxJobUidPool,
   applySandboxPathPermissionsNoFollow,
   assertWorkspaceOwnershipCapability,
+  checkSandboxWorkspaceHealth,
   clearRetainedWorkspaceCleanupsForTest,
   cleanupSandboxWorkspace,
   compatibilityModeForSkippedChown,
@@ -19,6 +20,7 @@ import {
   retainWorkspaceCleanupUntilRemoved,
   retainedWorkspaceCleanupCount,
   retryRetainedWorkspaceCleanups,
+  sandboxJobUidPool,
   workspaceOwnershipCapabilityErrors,
 } from './workspace-isolation';
 
@@ -107,6 +109,63 @@ describe('sandbox workspace root and reaper', () => {
     const st = await fsp.lstat(root);
     expect(st.isDirectory()).toBe(true);
     expect(modeOf(st.mode)).toBe(SANDBOX_WORKSPACE_MODE);
+  });
+
+  test('workspace health exercises root preparation', async () => {
+    config.per_job_uids = false;
+    const root = await mkroot('codeapi-workspace-health-');
+
+    const health = await checkSandboxWorkspaceHealth(root);
+
+    expect(health).toEqual({
+      status: 'healthy',
+      workspaceRoot: root,
+      retainedWorkspaceCleanups: 0,
+      uidSlots: {
+        total: sandboxJobUidPool.slotCount,
+        retained: 0,
+      },
+    });
+    expect(modeOf((await fsp.lstat(root)).mode)).toBe(SANDBOX_WORKSPACE_MODE);
+    expect(await fsp.readdir(root)).toEqual([]);
+  });
+
+  test('workspace health fails when retained cleanups exhaust UID slots', async () => {
+    config.per_job_uids = true;
+    const root = await mkroot('codeapi-workspace-health-retained-');
+    for (let i = 0; i < sandboxJobUidPool.slotCount; i++) {
+      retainWorkspaceCleanupUntilRemoved({
+        workspaceId: `ws_retained_${i}`,
+        dir: path.join(root, `ws_retained_${i}`),
+        identity: {
+          slot: i,
+          uid: 200000 + i,
+          gid: 200000 + i,
+          perJobUid: true,
+        },
+      }, () => {});
+    }
+
+    await expect(checkSandboxWorkspaceHealth(root)).rejects.toThrow('exhausted all');
+  });
+
+  test('workspace health fails when retained cleanups exhaust legacy slots', async () => {
+    config.per_job_uids = false;
+    const root = await mkroot('codeapi-workspace-health-legacy-retained-');
+    for (let i = 0; i < sandboxJobUidPool.slotCount; i++) {
+      retainWorkspaceCleanupUntilRemoved({
+        workspaceId: `ws_legacy_retained_${i}`,
+        dir: path.join(root, `ws_legacy_retained_${i}`),
+        identity: {
+          slot: i,
+          uid: 65534,
+          gid: 65534,
+          perJobUid: false,
+        },
+      }, () => {});
+    }
+
+    await expect(checkSandboxWorkspaceHealth(root)).rejects.toThrow('exhausted all');
   });
 
   test('rejects a symlink workspace root', async () => {

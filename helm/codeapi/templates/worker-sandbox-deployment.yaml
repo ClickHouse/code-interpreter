@@ -342,16 +342,18 @@ spec:
           {{- end }}
           livenessProbe:
             httpGet:
-              path: /api/v2/runtimes
+              path: /api/v2/health
               port: sandbox
             initialDelaySeconds: 60
             periodSeconds: 30
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
-              path: /api/v2/runtimes
+              path: /api/v2/health
               port: sandbox
             initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 5
           resources:
             {{- $sandboxResources := deepCopy .Values.workerSandbox.resources }}
             {{- if $useKvmDevicePlugin }}

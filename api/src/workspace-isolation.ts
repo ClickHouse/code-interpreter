@@ -38,6 +38,16 @@ export interface SandboxWorkspaceLease {
   identity: SandboxJobIdentity;
 }
 
+export interface SandboxWorkspaceHealth {
+  status: 'healthy';
+  workspaceRoot: string;
+  retainedWorkspaceCleanups: number;
+  uidSlots: {
+    total: number;
+    retained: number;
+  };
+}
+
 function errorCode(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error
     ? String((error as { code?: unknown }).code)
@@ -291,6 +301,40 @@ export async function prepareWorkspaceRoot(root = SANDBOX_WORKSPACE_ROOT): Promi
     assertWorkspaceOwnershipCapability();
   }
   await fsp.chmod(root, SANDBOX_WORKSPACE_MODE);
+}
+
+function sandboxWorkspaceHealthProbeIdentity(): SandboxJobIdentity {
+  return {
+    slot: -1,
+    uid: config.per_job_uids ? config.job_uid_base : SANDBOX_INSIDE_UID,
+    gid: config.per_job_uids ? config.job_gid_base : SANDBOX_INSIDE_GID,
+    perJobUid: config.per_job_uids,
+  };
+}
+
+export async function checkSandboxWorkspaceHealth(root = SANDBOX_WORKSPACE_ROOT): Promise<SandboxWorkspaceHealth> {
+  const retainedCleanups = retainedWorkspaceCleanupCount();
+  if (retainedCleanups >= sandboxJobUidPool.slotCount) {
+    throw new SandboxWorkspaceIsolationError(
+      `Retained sandbox workspace cleanups exhausted all ${sandboxJobUidPool.slotCount} UID slots`,
+    );
+  }
+
+  const lease = await createSandboxWorkspace(sandboxWorkspaceHealthProbeIdentity(), root);
+  const removed = await cleanupSandboxWorkspace(lease);
+  if (!removed) {
+    throw new SandboxWorkspaceIsolationError('Sandbox workspace health probe cleanup failed');
+  }
+
+  return {
+    status: 'healthy',
+    workspaceRoot: root,
+    retainedWorkspaceCleanups: retainedCleanups,
+    uidSlots: {
+      total: sandboxJobUidPool.slotCount,
+      retained: retainedCleanups,
+    },
+  };
 }
 
 export async function createSandboxWorkspace(

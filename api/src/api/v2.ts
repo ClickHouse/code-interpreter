@@ -10,6 +10,7 @@ import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 import { EGRESS_GRANT_HEADER } from '../egress';
 import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 import { classifySandboxSafeError } from '../safe-error';
+import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
 
 const router = express.Router();
 
@@ -325,6 +326,19 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       language: metricsLanguage,
       outcome: metricsOutcome,
       durationSeconds: (performance.now() - started) / 1000,
+    });
+  }
+});
+
+router.get('/health', async (_req: Request, res: Response) => {
+  try {
+    return res.status(200).json(await checkSandboxWorkspaceHealth());
+  } catch (error) {
+    logger.error({ err: error }, 'Sandbox workspace health check failed');
+    return res.status(503).json({
+      status: 'unhealthy',
+      error: 'workspace_unavailable',
+      message: 'Sandbox workspace root is unavailable',
     });
   }
 });
