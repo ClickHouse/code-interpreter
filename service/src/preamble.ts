@@ -805,6 +805,7 @@ export function createProgrammaticPayload(options: CreateProgrammaticPayloadOpti
     run_timeout,
     language: 'python',
     version: '3.14.4',
+    ...(mode === 'blocking' ? { tool_call_socket: true } : {}),
     files: [
       {
         name: 'main.py',

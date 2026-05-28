@@ -188,8 +188,31 @@ describe('execution manifest claim construction', () => {
       chc_user_id: 'chc_123',
       principal_source: 'librechat',
       auth_context_hash: 'hash_123',
+      tool_call_socket: false,
       iat: 100,
     });
     expect(built.exp).toBeGreaterThan(100);
+  });
+
+  test('marks tool-call socket access as an explicit signed claim', () => {
+    const payload: t.PayloadBody = {
+      language: 'python',
+      version: '3.14.4',
+      session_id: 'sess_output',
+      tool_call_socket: true,
+      files: [{ name: 'main.py', content: 'print(1)' }],
+    };
+
+    const built = buildExecutionManifestClaims({
+      req: {} as t.AuthenticatedRequest,
+      executionId: 'exec_ptc',
+      userId: 'api_key_user',
+      sessionKey: 'tenant:legacy:user:api_key_user',
+      outputSessionId: 'sess_output',
+      payload,
+      nowSeconds: 100,
+    });
+
+    expect(built.tool_call_socket).toBe(true);
   });
 });

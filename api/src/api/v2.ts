@@ -5,7 +5,7 @@ import { getLatestRuntimeMatchingLanguageVersion, getRuntimes } from '../runtime
 import { logger } from '../logger';
 import { config } from '../config';
 import { Job, ValidationError } from '../job';
-import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError } from '../execution-manifest';
+import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError, type ExecutionManifestClaims } from '../execution-manifest';
 import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 import { EGRESS_GRANT_HEADER } from '../egress';
 import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
@@ -35,6 +35,7 @@ export interface ExecuteRequestBody {
   env_vars?: Record<string, string>;
   egress_grant?: string;
   execution_manifest?: string;
+  tool_call_socket?: boolean;
 }
 
 export const ENV_VAR_KEY_RE = /^[A-Z_][A-Z0-9_]*$/i;
@@ -73,7 +74,56 @@ export function tokenFromBodyOrHeader(
   return headerValue;
 }
 
-function getJob(body: ExecuteRequestBody, egressGrantToken?: string): Job {
+export function authorizeToolCallSocket(
+  body: Pick<ExecuteRequestBody, 'tool_call_socket'>,
+  manifest: ExecutionManifestClaims | undefined,
+  options: {
+    nowSeconds?: number;
+    legacyClaimGraceUntilSeconds?: number;
+    allowUnsignedLocalToolCallSocket?: boolean;
+  } = {},
+): boolean {
+  const requested = body.tool_call_socket === true;
+  const manifestAllowsSocket = manifest?.tool_call_socket === true;
+  const manifestHasBodyHash = typeof manifest?.execute_body_sha256 === 'string' && manifest.execute_body_sha256 !== '';
+
+  if (requested) {
+    if (options.allowUnsignedLocalToolCallSocket === true && manifest === undefined) {
+      return true;
+    }
+    if (!manifestAllowsSocket || !manifestHasBodyHash) {
+      throw new ExecutionManifestError(
+        'scope_mismatch',
+        'Tool-call socket access is not authorized by the execution manifest',
+      );
+    }
+    return true;
+  }
+
+  if (manifestAllowsSocket) {
+    if (!manifestHasBodyHash) {
+      throw new ExecutionManifestError(
+        'scope_mismatch',
+        'Tool-call socket access requires a body-bound execution manifest',
+      );
+    }
+    return true;
+  }
+
+  const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000);
+  if (
+    manifest?.tool_call_socket === undefined &&
+    manifestHasBodyHash &&
+    options.legacyClaimGraceUntilSeconds !== undefined &&
+    nowSeconds < options.legacyClaimGraceUntilSeconds
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function getJob(body: ExecuteRequestBody, egressGrantToken?: string, toolCallSocketEnabled = false): Job {
   const {
     session_id, language, version, args, stdin, files,
     compile_memory_limit, run_memory_limit,
@@ -90,6 +140,9 @@ function getJob(body: ExecuteRequestBody, egressGrantToken?: string): Job {
   }
   if (!files || !Array.isArray(files)) {
     throw { message: 'files is required as an array' };
+  }
+  if (body.tool_call_socket !== undefined && typeof body.tool_call_socket !== 'boolean') {
+    throw { message: 'tool_call_socket must be a boolean if specified' };
   }
   for (const [i, file] of files.entries()) {
     if (typeof file.content !== 'string' && typeof file.id !== 'string') {
@@ -132,6 +185,7 @@ function getJob(body: ExecuteRequestBody, egressGrantToken?: string): Job {
     extra_env_vars: sanitizeEnvVars(env_vars),
     output_session_id: body.output_session_id,
     egress_grant: egressGrantToken,
+    tool_call_socket_enabled: toolCallSocketEnabled,
   });
 }
 
@@ -215,9 +269,12 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
    * the child exits would let another job reuse that UID concurrently. */
 
   try {
+    let verifiedManifest: ExecutionManifestClaims | undefined;
+    let toolCallSocketEnabled = false;
+
     if (config.require_execution_manifest) {
       try {
-        verifyExecuteRequestManifest({
+        verifiedManifest = verifyExecuteRequestManifest({
           headerValue: tokenFromBodyOrHeader(req.body, 'execution_manifest', req.header(EXECUTION_MANIFEST_HEADER)),
           publicKey: config.execution_manifest_public_key,
           secret: config.execution_manifest_secret,
@@ -237,9 +294,25 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
     }
 
     try {
+      toolCallSocketEnabled = authorizeToolCallSocket(req.body, verifiedManifest, {
+        legacyClaimGraceUntilSeconds: config.tool_call_socket_legacy_claim_grace_until_seconds,
+        allowUnsignedLocalToolCallSocket: !config.hardened_sandbox_mode && !config.require_execution_manifest,
+      });
+    } catch (error) {
+      metricsOutcome = 'manifest_error';
+      if (error instanceof ExecutionManifestError) {
+        const status = manifestErrorStatus(error);
+        logger.warn({ reason: error.reason, status }, 'Rejected sandbox request by tool-call socket manifest scope');
+        return res.status(status).json({ message: error.message });
+      }
+      throw error;
+    }
+
+    try {
       job = getJob(
         req.body,
         tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
+        toolCallSocketEnabled,
       );
       metricsLanguage = job.runtime.language;
       markActiveExecution();

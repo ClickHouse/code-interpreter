@@ -225,10 +225,23 @@ interface ExecuteOptions {
   stdin?: string;
   extraPkgdirs?: string[];
   identity: SandboxJobIdentity;
+  enableToolCallSocket?: boolean;
 }
 
 export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate = defaultNsJailSetupGate): Promise<NsJailResult> {
-  const { command, envVars, submissionDir, pkgdir, timeout, memoryLimit, outputMaxSize, stdin, extraPkgdirs, identity } = opts;
+  const {
+    command,
+    envVars,
+    submissionDir,
+    pkgdir,
+    timeout,
+    memoryLimit,
+    outputMaxSize,
+    stdin,
+    extraPkgdirs,
+    identity,
+    enableToolCallSocket,
+  } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
   const cfgPath = `/tmp/nsjail-${logId}.cfg`;
@@ -245,6 +258,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     command,
     extraPkgdirs,
     identity,
+    enableToolCallSocket,
   });
 
   const startTime = Date.now();
@@ -600,10 +614,22 @@ interface BuildArgsOptions {
   command: string[];
   extraPkgdirs?: string[];
   identity: SandboxJobIdentity;
+  enableToolCallSocket?: boolean;
 }
 
 export function buildArgs(opts: BuildArgsOptions): string[] {
-  const { logPath, cfgPath, pkgdir, timeout, memoryLimit, envVars, command, extraPkgdirs, identity } = opts;
+  const {
+    logPath,
+    cfgPath,
+    pkgdir,
+    timeout,
+    memoryLimit,
+    envVars,
+    command,
+    extraPkgdirs,
+    identity,
+    enableToolCallSocket,
+  } = opts;
 
   const timeoutSecs = Math.max(1, Math.ceil(timeout / 1000));
 
@@ -655,7 +681,7 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
     args.push('--cgroup_mem_max', String(memoryLimit));
   }
 
-  if (config.allowed_local_network_port > 0) {
+  if (config.allowed_local_network_port > 0 && enableToolCallSocket === true) {
     const socketPath = '/tmp/tcs.sock';
     args.push('-B', `${socketPath}:${socketPath}`);
   }
@@ -665,11 +691,12 @@ export function buildArgs(opts: BuildArgsOptions): string[] {
   }
 
   /* TOOL_CALL_SOCKET is intentionally NOT exported: the path is fixed at
-   * /tmp/tcs.sock and the runtime preamble references it as a literal.
+   * /tmp/tcs.sock and the blocking-mode runtime preamble references it
+   * as a literal.
    * Skipping the env entry shrinks the surface user code can introspect
-   * (`os.environ`) and keeps the socket discoverable only by code that
-   * already knows where to look. The /tmp/tcs.sock bind-mount above is
-   * what actually makes the path connectable. */
+   * (`os.environ`). The per-job /tmp/tcs.sock bind-mount above is what
+   * actually makes the path connectable, and ordinary execute/replay jobs
+   * do not receive that mount. */
 
   args.push('--');
   args.push('/usr/local/bin/spec-guard', ...command);

@@ -665,6 +665,7 @@ export class Job {
   memory_limits: { run: number; compile: number };
   extra_env_vars?: Record<string, string>;
   egressGrantToken?: string;
+  toolCallSocketEnabled: boolean;
   outputSessionId: string;
 
   private log: Logger;
@@ -693,6 +694,7 @@ export class Job {
     extra_env_vars?: Record<string, string>;
     output_session_id?: string;
     egress_grant?: string;
+    tool_call_socket_enabled?: boolean;
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
@@ -724,6 +726,7 @@ export class Job {
     this.memory_limits = opts.memory_limits;
     this.extra_env_vars = opts.extra_env_vars;
     this.egressGrantToken = opts.egress_grant;
+    this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
   }
 
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
@@ -1097,6 +1100,7 @@ export class Job {
       stdin,
       extraPkgdirs,
       identity: this.sandboxIdentity(),
+      enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
     });
   }
 

@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { buildScopedSentinel, extractPendingFromStdout, generatePreamble } from './preamble';
+import {
+  buildScopedSentinel,
+  createProgrammaticPayload,
+  extractPendingFromStdout,
+  generatePreamble,
+} from './preamble';
 import { hashToolInput } from './tool-input-signature';
 
 const baseConfig = {
@@ -91,5 +96,40 @@ describe('extractPendingFromStdout — input hash metadata', () => {
     expect(parsed.pending?.[0]?.input).toEqual({ resource: 'A' });
     expect(parsed.pending?.[0]?.input_hash).toBe(expectedHash);
     expect(parsed.pending?.[0]?.input_hash).not.toBe(forgedHash);
+  });
+});
+
+describe('createProgrammaticPayload — tool-call socket opt-in', () => {
+  const req = {
+    body: {
+      code: 'print("ok")',
+    },
+  } as Parameters<typeof createProgrammaticPayload>[0]['req'];
+
+  test('requests the sandbox socket for blocking PTC only', () => {
+    const payload = createProgrammaticPayload({
+      req,
+      session_id: 'session-blocking',
+      execution_id: 'exec-blocking',
+      callbackUrl: 'http://egress-gateway:3190',
+      callbackToken: 'sealed-token',
+      tools: [],
+      mode: 'blocking',
+    });
+
+    expect(payload.tool_call_socket).toBe(true);
+  });
+
+  test('does not request the sandbox socket for replay PTC', () => {
+    const payload = createProgrammaticPayload({
+      req,
+      session_id: 'session-replay',
+      execution_id: 'exec-replay',
+      tools: [],
+      mode: 'replay',
+      history: {},
+    });
+
+    expect(payload.tool_call_socket).toBeUndefined();
   });
 });

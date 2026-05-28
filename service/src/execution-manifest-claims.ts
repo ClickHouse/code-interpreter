@@ -74,6 +74,7 @@ export function buildExecutionManifestClaims(args: {
     max_requests: env.EXECUTION_MANIFEST_MAX_REQUESTS,
     iat: now,
     exp: now + env.EXECUTION_MANIFEST_TTL_SECONDS,
+    tool_call_socket: args.payload.tool_call_socket === true,
     ...((args.chcUserId ?? ctx?.chcUserId) ? { chc_user_id: args.chcUserId ?? ctx?.chcUserId } : {}),
     ...((args.orgId ?? ctx?.orgId) ? { org_id: args.orgId ?? ctx?.orgId } : {}),
     ...((args.serviceId ?? ctx?.serviceId) ? { service_id: args.serviceId ?? ctx?.serviceId } : {}),

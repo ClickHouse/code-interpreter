@@ -10,6 +10,13 @@ function valueAfter(args: string[], flag: string): string | undefined {
   return idx >= 0 ? args[idx + 1] : undefined;
 }
 
+function hasArgPair(args: string[], flag: string, value: string): boolean {
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === flag && args[i + 1] === value) return true;
+  }
+  return false;
+}
+
 function seccompPolicy(): string {
   const args = buildArgs({
     logPath: '/tmp/nsjail-test.log',
@@ -99,6 +106,30 @@ describe('NsJail args', () => {
       if (args[i] === '-E' && args[i + 1].startsWith('TOOL_CALL_SOCKET=')) {
         throw new Error(`unexpected TOOL_CALL_SOCKET envar: ${args[i + 1]}`);
       }
+    }
+  });
+
+  test('binds the tool-call socket only for jobs that explicitly request it', () => {
+    const originalAllowedPort = config.allowed_local_network_port;
+    config.allowed_local_network_port = 3190;
+    try {
+      const baseOpts = {
+        logPath: '/tmp/nsjail-test.log',
+        pkgdir: '/pkgs/python/3.14.4',
+        timeout: 1000,
+        memoryLimit: -1,
+        envVars: {},
+        command: ['/bin/bash', '/pkgs/python/3.14.4/run', 'main.py'],
+        identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+      };
+
+      const withoutSocket = buildArgs(baseOpts);
+      expect(hasArgPair(withoutSocket, '-B', '/tmp/tcs.sock:/tmp/tcs.sock')).toBe(false);
+
+      const withSocket = buildArgs({ ...baseOpts, enableToolCallSocket: true });
+      expect(hasArgPair(withSocket, '-B', '/tmp/tcs.sock:/tmp/tcs.sock')).toBe(true);
+    } finally {
+      config.allowed_local_network_port = originalAllowedPort;
     }
   });
 });

@@ -89,6 +89,11 @@ export const config = {
     600,
     0,
   ),
+  tool_call_socket_legacy_claim_grace_until_seconds: sandboxStartedAtSeconds + safeInt(
+    process.env.SANDBOX_TOOL_CALL_SOCKET_LEGACY_CLAIM_GRACE_SECONDS,
+    3600,
+    0,
+  ),
   execution_manifest_public_key: process.env.SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY ?? '',
   // Legacy HMAC verifier fallback for rolling upgrades only. Cloud split-runner
   // deployments should mount SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY instead so a

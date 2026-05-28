@@ -72,6 +72,7 @@ export interface ExecutionManifestClaims {
   iat: number;
   exp: number;
   execute_body_sha256?: string;
+  tool_call_socket?: boolean;
   chc_user_id?: string;
   org_id?: string;
   service_id?: string;
@@ -213,6 +214,9 @@ function validateClaimsShape(value: unknown): asserts value is ExecutionManifest
     (typeof claims.execute_body_sha256 !== 'string' || claims.execute_body_sha256 === '')
   ) {
     throw new ExecutionManifestError('malformed', 'Execution manifest execute_body_sha256 is invalid');
+  }
+  if (claims.tool_call_socket !== undefined && typeof claims.tool_call_socket !== 'boolean') {
+    throw new ExecutionManifestError('malformed', 'Execution manifest tool_call_socket is invalid');
   }
   for (const file of claims.input_files) {
     if (

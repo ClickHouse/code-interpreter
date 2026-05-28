@@ -178,6 +178,12 @@ export interface PayloadBody {
    * for the same reason as `egress_grant`.
    */
   execution_manifest?: string;
+  /**
+   * Allows this single execution to see the sandbox tool-call unix socket.
+   * Only blocking-mode PTC needs it; replay-mode PTC and ordinary execute
+   * requests should leave the socket unmounted.
+   */
+  tool_call_socket?: boolean;
   args?: string[];
   /**
    * Extra environment variables to inject into the sandboxed process via nsjail -E.
