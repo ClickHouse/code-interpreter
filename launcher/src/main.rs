@@ -11,6 +11,18 @@ mod ffi {
         pub fn krun_create_ctx() -> i32;
         pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
         pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> i32;
+        pub fn krun_add_disk(
+            ctx_id: u32,
+            block_id: *const c_char,
+            disk_path: *const c_char,
+            read_only: bool,
+        ) -> i32;
+        pub fn krun_set_root_disk_remount(
+            ctx_id: u32,
+            device: *const c_char,
+            fstype: *const c_char,
+            options: *const c_char,
+        ) -> i32;
         pub fn krun_add_virtiofs(
             ctx_id: u32,
             c_tag: *const c_char,
@@ -127,9 +139,13 @@ mod seccomp {
             libc::SYS_prlimit64 as u32,
             libc::SYS_fcntl as u32,
             libc::SYS_ftruncate as u32,
+            libc::SYS_fsync as u32,
+            libc::SYS_fdatasync as u32,
             libc::SYS_pread64 as u32,
+            libc::SYS_pwrite64 as u32,
             libc::SYS_preadv as u32,
             libc::SYS_pwritev as u32,
+            libc::SYS_fallocate as u32,
             libc::SYS_readlinkat as u32,
             libc::SYS_getdents64 as u32,
             libc::SYS_fstatfs as u32,
@@ -364,6 +380,28 @@ fn guest_nofile_rlimit(limit: libc::rlim_t) -> CString {
     ))
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match non_empty_env(name)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        Some(value) => {
+            eprintln!("[launcher] WARNING: ignoring invalid boolean {name}={value:?}");
+            default
+        }
+        None => default,
+    }
+}
+
 fn is_allowed_guest_env_key(key: &str, egress_gateway_enabled: bool) -> bool {
     const ALLOW_EXACT: &[&str] = &[
         "CODEAPI_HARDENED_SANDBOX_MODE",
@@ -448,6 +486,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048);
     let rootfs = env::var("LAUNCHER_ROOTFS").unwrap_or_else(|_| "/sandbox-rootfs".into());
+    let root_disk = non_empty_env("LAUNCHER_ROOT_DISK");
+    let root_disk_read_only = env_bool("LAUNCHER_ROOT_DISK_READ_ONLY", true);
+    let root_device = non_empty_env("LAUNCHER_ROOT_DEVICE").unwrap_or_else(|| "/dev/vda".into());
+    let root_fstype = non_empty_env("LAUNCHER_ROOT_FSTYPE").unwrap_or_else(|| "ext4".into());
+    let root_options = non_empty_env("LAUNCHER_ROOT_OPTIONS").unwrap_or_else(|| "ro".into());
     let exec_path = env::var("LAUNCHER_EXEC").unwrap_or_else(|_| "/sandbox_api/entrypoint.sh".into());
     let log_level: u32 = env::var("LAUNCHER_LOG_LEVEL")
         .ok()
@@ -459,10 +502,20 @@ fn main() {
         .unwrap_or(65_536);
 
     raise_nofile_limit(nofile_target);
-    eprintln!("[launcher] Booting microVM: vcpus={vcpus} ram={ram_mib}MiB rootfs={rootfs}");
+    if let Some(root_disk) = &root_disk {
+        eprintln!(
+            "[launcher] Booting microVM: vcpus={vcpus} ram={ram_mib}MiB root_disk={root_disk} device={root_device} fstype={root_fstype} options={root_options} read_only={root_disk_read_only}"
+        );
+    } else {
+        eprintln!("[launcher] Booting microVM: vcpus={vcpus} ram={ram_mib}MiB rootfs={rootfs}");
+    }
     eprintln!("[launcher] Guest entrypoint: {exec_path}");
 
     let rootfs_c = cstr(&rootfs);
+    let root_disk_c = root_disk.as_ref().map(|value| cstr(value));
+    let root_device_c = cstr(&root_device);
+    let root_fstype_c = cstr(&root_fstype);
+    let root_options_c = cstr(&root_options);
     let exec_c = cstr(&exec_path);
 
     let port_map_strs = vec![cstr("2000:2000")];
@@ -498,7 +551,29 @@ fn main() {
         let ctx = ctx as u32;
 
         ffi::check("set_vm_config", ffi::krun_set_vm_config(ctx, vcpus, ram_mib));
-        ffi::check("set_root", ffi::krun_set_root(ctx, rootfs_c.as_ptr()));
+        if let Some(root_disk_c) = &root_disk_c {
+            let block_id = cstr("root");
+            ffi::check(
+                "add_root_disk",
+                ffi::krun_add_disk(
+                    ctx,
+                    block_id.as_ptr(),
+                    root_disk_c.as_ptr(),
+                    root_disk_read_only,
+                ),
+            );
+            ffi::check(
+                "set_root_disk_remount",
+                ffi::krun_set_root_disk_remount(
+                    ctx,
+                    root_device_c.as_ptr(),
+                    root_fstype_c.as_ptr(),
+                    root_options_c.as_ptr(),
+                ),
+            );
+        } else {
+            ffi::check("set_root", ffi::krun_set_root(ctx, rootfs_c.as_ptr()));
+        }
 
         if std::path::Path::new(&packages_host).exists() {
             let tag = cstr("packages");

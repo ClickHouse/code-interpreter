@@ -190,18 +190,38 @@ COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/loca
 
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
+COPY docker/sandbox-runner-healthcheck.sh /usr/local/bin/sandbox-runner-healthcheck.sh
 COPY docker/sandbox-entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh /usr/local/bin/sandbox-runner-healthcheck.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 2000/tcp
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
-FROM sandbox-runner-base AS sandbox-runner-baked
+FROM debian:bookworm AS sandbox-rootfs-image
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    e2fsprogs \
+    coreutils \
+    gawk \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=sandbox-build / /sandbox-rootfs/
 COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
+COPY docker/build-rootfs-image.sh /usr/local/bin/build-rootfs-image.sh
 
 RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+RUN chmod +x /usr/local/bin/build-rootfs-image.sh \
+    && /usr/local/bin/build-rootfs-image.sh /sandbox-rootfs /sandbox-rootfs.img
+
+FROM sandbox-runner-base AS sandbox-runner-baked
+
+COPY --from=sandbox-rootfs-image /sandbox-rootfs.img /sandbox-rootfs.img
+
+ENV LAUNCHER_ROOT_DISK=/sandbox-rootfs.img \
+    LAUNCHER_ROOT_DISK_READ_ONLY=true \
+    LAUNCHER_ROOT_DEVICE=/dev/vda \
+    LAUNCHER_ROOT_FSTYPE=ext4 \
+    LAUNCHER_ROOT_OPTIONS=ro
 
 FROM sandbox-runner-base AS sandbox-runner
 

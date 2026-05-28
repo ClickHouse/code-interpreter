@@ -246,6 +246,8 @@ spec:
               value: {{ .Values.workerSandbox.launcher.logLevel | default 3 | quote }}
             - name: LAUNCHER_FILTER_VSOCK_ENOTCONN
               value: {{ .Values.workerSandbox.launcher.filterVsockEnotconn | quote }}
+            - name: SANDBOX_RUNNER_FD_LIVENESS_LIMIT
+              value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | default 40000 | quote }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL
@@ -341,9 +343,9 @@ spec:
                 - MKNOD
           {{- end }}
           livenessProbe:
-            httpGet:
-              path: /api/v2/health
-              port: sandbox
+            exec:
+              command:
+                - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 60
             periodSeconds: 30
             timeoutSeconds: 5
