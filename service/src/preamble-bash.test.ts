@@ -39,10 +39,22 @@ const tools: LCTool[] = [
     },
   },
 ];
+const clickHouseTool: LCTool = {
+  name: 'run_select_query_mcp_ClickHouse',
+  description: 'Run a ClickHouse SELECT query.',
+  parameters: {
+    type: 'object',
+    properties: {
+      serviceId: { type: 'string' },
+      query: { type: 'string' },
+    },
+    required: ['serviceId', 'query'],
+  },
+};
 
-function assemble(userCode: string): string {
+function assemble(userCode: string, toolSet: LCTool[] = tools): string {
   return [
-    generateBashReplayPreamble({ executionId, tools }),
+    generateBashReplayPreamble({ executionId, tools: toolSet }),
     userCode,
     generateBashReplayPostamble(),
   ].join('\n');
@@ -88,6 +100,82 @@ function pendingNames(stdout: string): string[] {
 }
 
 describe('generateBashReplayPreamble - command substitution pending emission', () => {
+  test('emits ClickHouse-style object input with SQL quotes from double-quoted JSON', () => {
+    const run = runBash(assemble(`
+SVC="45886e06-932b-4cff-bb49-3f7281d80717"
+result=$(run_select_query_mcp_ClickHouse "{\\"serviceId\\":\\"$SVC\\",\\"query\\":\\"SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c FROM system.columns WHERE database='default' AND table='uk_prices_3' AND tempAvg != -9999\\"}")
+echo "AFTER: $result"
+`, [clickHouseTool]));
+
+    const parsed = extractPendingFromStdout(run.stdout, executionId);
+    expect(run.exitCode).toBe(0);
+    expect(parsed.pending).toHaveLength(1);
+    expect(parsed.pending?.[0]?.tool_name).toBe('run_select_query_mcp_ClickHouse');
+    expect(parsed.pending?.[0]?.input).toEqual({
+      serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
+      query:
+        "SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c FROM system.columns WHERE database='default' AND table='uk_prices_3' AND tempAvg != -9999",
+    });
+    expect(parsed.stdout).not.toContain('AFTER');
+  });
+
+  test('emits ClickHouse-style object input with shell-escaped SQL quotes', () => {
+    const run = runBash(assemble(`
+result=$(run_select_query_mcp_ClickHouse '{"serviceId":"45886e06-932b-4cff-bb49-3f7281d80717","query":"SELECT name, type FROM system.columns WHERE database='"'"'default'"'"' AND table='"'"'uk_prices_3'"'"' ORDER BY position"}')
+echo "AFTER: $result"
+`, [clickHouseTool]));
+
+    const parsed = extractPendingFromStdout(run.stdout, executionId);
+    expect(run.exitCode).toBe(0);
+    expect(parsed.pending).toHaveLength(1);
+    expect(parsed.pending?.[0]?.tool_name).toBe('run_select_query_mcp_ClickHouse');
+    expect(parsed.pending?.[0]?.input).toEqual({
+      serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
+      query:
+        "SELECT name, type FROM system.columns WHERE database='default' AND table='uk_prices_3' ORDER BY position",
+    });
+    expect(parsed.stdout).not.toContain('AFTER');
+  });
+
+  test('batches parallel ClickHouse-style command substitutions into one pending block', () => {
+    const run = runBash(assemble(`
+SVC="45886e06-932b-4cff-bb49-3f7281d80717"
+
+{
+  r1=$(run_select_query_mcp_ClickHouse "{\\"serviceId\\":\\"$SVC\\",\\"query\\":\\"SELECT name, type, comment FROM system.columns WHERE database='default' AND table='uk_prices_3' ORDER BY position\\"}")
+  printf '%s\\n' "$r1" > /mnt/data/cols_uk.json
+} &
+
+{
+  r2=$(run_select_query_mcp_ClickHouse "{\\"serviceId\\":\\"$SVC\\",\\"query\\":\\"SELECT name, type, comment FROM system.columns WHERE database='default' AND table='weather_noaa_mt' ORDER BY position\\"}")
+  printf '%s\\n' "$r2" > /mnt/data/cols_weather.json
+} &
+
+{
+  r3=$(run_select_query_mcp_ClickHouse "{\\"serviceId\\":\\"$SVC\\",\\"query\\":\\"SELECT name, engine, total_rows, formatReadableSize(total_bytes) AS size, sorting_key, partition_key FROM system.tables WHERE database='default' AND name IN ('uk_prices_3','weather_noaa_mt')\\"}")
+  printf '%s\\n' "$r3" > /mnt/data/table_meta.json
+} &
+
+wait
+echo "AFTER"
+`, [clickHouseTool]), 3000);
+
+    const parsed = extractPendingFromStdout(run.stdout, executionId);
+    expect(run.exitCode).toBe(0);
+    expect(parsed.pending).toHaveLength(3);
+    expect(parsed.pending?.map(call => call.tool_name)).toEqual([
+      'run_select_query_mcp_ClickHouse',
+      'run_select_query_mcp_ClickHouse',
+      'run_select_query_mcp_ClickHouse',
+    ]);
+    expect(parsed.pending?.map(call => (call.input as { query: string }).query).sort()).toEqual([
+      "SELECT name, engine, total_rows, formatReadableSize(total_bytes) AS size, sorting_key, partition_key FROM system.tables WHERE database='default' AND name IN ('uk_prices_3','weather_noaa_mt')",
+      "SELECT name, type, comment FROM system.columns WHERE database='default' AND table='uk_prices_3' ORDER BY position",
+      "SELECT name, type, comment FROM system.columns WHERE database='default' AND table='weather_noaa_mt' ORDER BY position",
+    ]);
+    expect(parsed.stdout).not.toContain('AFTER');
+  });
+
   test('emits a command-substitution tool call before later user code while another job is running', () => {
     const run = runBash(assemble(`
 sleep 0.2 &
