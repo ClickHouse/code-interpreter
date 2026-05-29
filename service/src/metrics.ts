@@ -95,6 +95,21 @@ export const activeJobs = new Gauge({
   labelNames: ['language'] as const,
 });
 
+let bullmqQueueMetricsCollector: (() => Promise<void> | void) | undefined;
+
+export const bullmqQueueJobs = new Gauge({
+  name: 'codeapi_bullmq_queue_jobs',
+  help: 'Number of BullMQ jobs by queue and state',
+  labelNames: ['queue', 'state'] as const,
+  async collect() {
+    await bullmqQueueMetricsCollector?.();
+  },
+});
+
+export function registerBullmqQueueMetricsCollector(collector: (() => Promise<void> | void) | undefined): void {
+  bullmqQueueMetricsCollector = collector;
+}
+
 export const workerRunning = new Gauge({
   name: 'codeapi_worker_running',
   help: 'Whether a worker is running (1) or stopped (0)',
