@@ -226,6 +226,7 @@ interface ExecuteOptions {
   extraPkgdirs?: string[];
   identity: SandboxJobIdentity;
   enableToolCallSocket?: boolean;
+  suppressSuccessLogs?: boolean;
 }
 
 export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate = defaultNsJailSetupGate): Promise<NsJailResult> {
@@ -241,6 +242,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     extraPkgdirs,
     identity,
     enableToolCallSocket,
+    suppressSuccessLogs,
   } = opts;
   const logId = nanoid();
   const logPath = `/tmp/nsjail-${logId}.log`;
@@ -531,12 +533,14 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
       const match = memoryStat.match(new RegExp(`^${key}\\s+(\\d+)`, 'm'));
       return match ? parseInt(match[1], 10) : 0;
     };
-    logger.info({
-      memoryMb: Math.round(parseInt(memoryCurrent, 10) / 1048576),
-      anonMb: Math.round(parseStatValue('anon') / 1048576),
-      fileCacheMb: Math.round(parseStatValue('file') / 1048576),
-      shmemMb: Math.round(parseStatValue('shmem') / 1048576),
-    }, 'Post-execution memory');
+    if (suppressSuccessLogs !== true) {
+      logger.info({
+        memoryMb: Math.round(parseInt(memoryCurrent, 10) / 1048576),
+        anonMb: Math.round(parseStatValue('anon') / 1048576),
+        fileCacheMb: Math.round(parseStatValue('file') / 1048576),
+        shmemMb: Math.round(parseStatValue('shmem') / 1048576),
+      }, 'Post-execution memory');
+    }
   } catch { /* cgroup files may not be accessible in all environments */ }
 
   let logMessage: string | null = null;

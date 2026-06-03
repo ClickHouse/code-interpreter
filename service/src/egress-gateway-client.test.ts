@@ -7,6 +7,7 @@ import {
   restoreGatewaySandboxResult,
   revokeGatewayEgressGrant,
 } from './egress-gateway-client';
+import { CODEAPI_SYNTHETIC_INTERNAL_REQUEST_HEADER } from './internal-synthetic';
 import type { ExecutionManifestClaims } from './execution-manifest';
 import type * as t from './types';
 
@@ -139,5 +140,31 @@ describe('egress gateway client', () => {
     expect(calls[0].body).toMatchObject({ egressGrantToken: 'sealed-grant' });
     expect(calls[1].url).toBe('http://egress-gateway:3190/internal/egress-grants/revoke');
     expect(calls[1].body).toEqual({ egressGrantToken: 'sealed-grant', reason: 'completed' });
+  });
+
+  test('marks synthetic egress grant lifecycle calls for gateway log suppression', async () => {
+    const calls: AxiosPostCall[] = [];
+    setup(calls, {
+      grant_id: 'grant_123',
+      payload: payload(),
+      egressGrantToken: 'sealed-grant',
+      executionManifestClaims: claims(),
+      result: { session_id: 'sess_output', files: [] },
+    });
+
+    await createGatewayEgressGrant({ payload: payload(), claims: claims(), isSynthetic: true });
+    await restoreGatewaySandboxResult({
+      grantId: 'grant_123',
+      egressGrantToken: 'sealed-grant',
+      result: { session_id: 'sess_output', files: [] },
+      isSynthetic: true,
+    });
+    await revokeGatewayEgressGrant({ grantId: 'grant_123', reason: 'completed', isSynthetic: true });
+
+    expect(calls.map(call => call.config.headers?.[CODEAPI_SYNTHETIC_INTERNAL_REQUEST_HEADER])).toEqual([
+      'true',
+      'true',
+      'true',
+    ]);
   });
 });

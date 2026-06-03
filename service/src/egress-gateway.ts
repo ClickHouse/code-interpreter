@@ -19,6 +19,11 @@ import {
 import type { ExecutionManifestClaims } from './execution-manifest';
 import { openEgressRouteHandle } from './egress-route-params';
 import { internalServiceHeaders, requireConfiguredInternalServiceAuth } from './internal-service-auth';
+import { isSyntheticPrincipalSource } from './auth/synthetic';
+import {
+  CODEAPI_SYNTHETIC_INTERNAL_REQUEST_HEADER,
+  isSyntheticInternalRequestHeader,
+} from './internal-synthetic';
 import {
   assertEgressGrantActive,
   createEgressLedger,
@@ -100,6 +105,11 @@ function auditFields(res: Response): EgressAuditFields {
   return (res.locals.egressAuditFields as EgressAuditFields | undefined) ?? {};
 }
 
+function isSyntheticEgressRequest(res: Response): boolean {
+  return res.locals.syntheticInternalRequest === true
+    || isSyntheticPrincipalSource(auditFields(res).principalSource);
+}
+
 function setGrantAudit(res: Response, grant: EgressGrantClaims): void {
   res.locals.egressAuditFields = {
     execHash: hashLabel(grant.exec_id),
@@ -120,11 +130,14 @@ function setPtcAudit(res: Response, args: { callbackExecId: string; requestExecI
 app.use((req: Request, res: Response, next: NextFunction) => {
   const started = Date.now();
   const id = req.header('x-request-id') ?? crypto.randomUUID();
+  res.locals.syntheticInternalRequest = req.path.startsWith('/internal/')
+    && isSyntheticInternalRequestHeader(req.header(CODEAPI_SYNTHETIC_INTERNAL_REQUEST_HEADER));
   res.locals.egressRequestId = id;
   res.setHeader('X-Request-ID', id);
 
   res.on('finish', () => {
     if (req.path === '/live' || req.path === '/health' || req.path === '/ready' || req.path === '/metrics') return;
+    if (res.statusCode < 400 && isSyntheticEgressRequest(res)) return;
     logger.info('Egress gateway request completed', {
       requestId: id,
       method: req.method,
@@ -384,13 +397,16 @@ app.post('/internal/egress-grants', express.json({ limit: env.HTTP_JSON_LIMIT })
       secret: env.EGRESS_GRANT_SECRET,
     });
     const grant = openEgressGrant(prepared.egressGrantToken, env.EGRESS_GRANT_SECRET);
+    setGrantAudit(res, grant);
     await createEgressLedger(grant);
-    logger.info('Egress grant created', {
-      grantHash: hashLabel(grant.grant_id),
-      execHash: hashLabel(grant.exec_id),
-      tenantHash: hashLabel(grant.tenant_id),
-      userHash: hashLabel(grant.user_id),
-    });
+    if (!isSyntheticPrincipalSource(grant.principal_source)) {
+      logger.info('Egress grant created', {
+        grantHash: hashLabel(grant.grant_id),
+        execHash: hashLabel(grant.exec_id),
+        tenantHash: hashLabel(grant.tenant_id),
+        userHash: hashLabel(grant.user_id),
+      });
+    }
     return res.status(201).json({ grant_id: grantId, ...prepared });
   } catch (error) {
     return sendEgressError(req, res, error);

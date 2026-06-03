@@ -55,6 +55,10 @@ export function hasSyntheticAccessToken(req: SyntheticAuthRequest): boolean {
   return getSyntheticAccessToken(req) !== null;
 }
 
+export function isSyntheticPrincipalSource(source: unknown): boolean {
+  return source === CODEAPI_SYNTHETIC_PRINCIPAL_SOURCE;
+}
+
 export function validateSyntheticAccessTokenConfig(
   token: string | null | undefined = process.env.CODEAPI_SYNTHETIC_ACCESS_TOKEN,
 ): void {

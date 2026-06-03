@@ -221,6 +221,7 @@ export type JobData = {
   userId: string;
   apiKeyId: string;
   principalSource?: string;
+  isSynthetic?: boolean;
   payload: PayloadBody;
   isPyPlot?: boolean;
   executionId?: string;

@@ -13,6 +13,7 @@ import { classifySandboxSafeError } from '../safe-error';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
 
 const router = express.Router();
+const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
 
 export interface ExecuteRequestBody {
   /** Top-level execution session id (one sandbox `/exec` invocation).
@@ -123,7 +124,12 @@ export function authorizeToolCallSocket(
   return false;
 }
 
-function getJob(body: ExecuteRequestBody, egressGrantToken?: string, toolCallSocketEnabled = false): Job {
+function getJob(
+  body: ExecuteRequestBody,
+  egressGrantToken?: string,
+  toolCallSocketEnabled = false,
+  isSynthetic = false,
+): Job {
   const {
     session_id, language, version, args, stdin, files,
     compile_memory_limit, run_memory_limit,
@@ -186,6 +192,7 @@ function getJob(body: ExecuteRequestBody, egressGrantToken?: string, toolCallSoc
     output_session_id: body.output_session_id,
     egress_grant: egressGrantToken,
     tool_call_socket_enabled: toolCallSocketEnabled,
+    is_synthetic: isSynthetic,
   });
 }
 
@@ -313,6 +320,7 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
         req.body,
         tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
         toolCallSocketEnabled,
+        verifiedManifest?.principal_source === SYNTHETIC_PRINCIPAL_SOURCE,
       );
       metricsLanguage = job.runtime.language;
       markActiveExecution();

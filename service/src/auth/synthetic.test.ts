@@ -7,6 +7,7 @@ import {
   CODEAPI_SYNTHETIC_PRINCIPAL_SOURCE,
   hasSyntheticAccessToken,
   isSyntheticExecRequest,
+  isSyntheticPrincipalSource,
   validateSyntheticAccessTokenConfig,
 } from './synthetic';
 
@@ -99,5 +100,11 @@ describe('synthetic CodeAPI auth', () => {
       tenantId: 'canary-tenant',
       principalSource: CODEAPI_SYNTHETIC_PRINCIPAL_SOURCE,
     });
+  });
+
+  test('identifies synthetic principal sources for log suppression', () => {
+    expect(isSyntheticPrincipalSource(CODEAPI_SYNTHETIC_PRINCIPAL_SOURCE)).toBe(true);
+    expect(isSyntheticPrincipalSource('librechat_jwt')).toBe(false);
+    expect(isSyntheticPrincipalSource(undefined)).toBe(false);
   });
 });

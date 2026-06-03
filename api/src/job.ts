@@ -666,6 +666,7 @@ export class Job {
   extra_env_vars?: Record<string, string>;
   egressGrantToken?: string;
   toolCallSocketEnabled: boolean;
+  isSynthetic: boolean;
   outputSessionId: string;
 
   private log: Logger;
@@ -695,6 +696,7 @@ export class Job {
     output_session_id?: string;
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
+    is_synthetic?: boolean;
   }) {
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
@@ -727,6 +729,7 @@ export class Job {
     this.extra_env_vars = opts.extra_env_vars;
     this.egressGrantToken = opts.egress_grant;
     this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
+    this.isSynthetic = opts.is_synthetic === true;
   }
 
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
@@ -792,15 +795,17 @@ export class Job {
     this.workspaceLease = await createSandboxWorkspace(this.jobIdentity);
     this.submissionDir = this.workspaceLease.dir;
 
-    this.log.info(
-      {
-        submissionDir: this.submissionDir,
-        workspaceId: this.workspaceLease.workspaceId,
-        uid: this.jobIdentity.uid,
-        gid: this.jobIdentity.gid,
-      },
-      'Priming job',
-    );
+    if (!this.isSynthetic) {
+      this.log.info(
+        {
+          submissionDir: this.submissionDir,
+          workspaceId: this.workspaceLease.workspaceId,
+          uid: this.jobIdentity.uid,
+          gid: this.jobIdentity.gid,
+        },
+        'Priming job',
+      );
+    }
 
     if (this.fileEgressBaseUrl() && this.files.some(f => f.id && f.storage_session_id)) {
       await this.autoLoadDirkeep();
@@ -1101,11 +1106,14 @@ export class Job {
       extraPkgdirs,
       identity: this.sandboxIdentity(),
       enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
+      suppressSuccessLogs: this.isSynthetic,
     });
   }
 
   async execute(): Promise<ExecuteResult> {
-    this.log.info({ runtime: this.runtime.language, version: this.runtime.version.raw }, 'Executing');
+    if (!this.isSynthetic) {
+      this.log.info({ runtime: this.runtime.language, version: this.runtime.version.raw }, 'Executing');
+    }
 
     const codeFiles = this.files.filter(
       f => !isDirkeep(f.name) && (!f.encoding || f.encoding === 'utf8'),
@@ -1118,7 +1126,9 @@ export class Job {
     let compileErrored = false;
 
     if (this.runtime.compiled) {
-      this.log.info('Compiling');
+      if (!this.isSynthetic) {
+        this.log.info('Compiling');
+      }
       compile = await this.safeCall(
         'compile',
         codeFiles.map(f => f.name),
@@ -1131,7 +1141,9 @@ export class Job {
 
     let run: NsJailResult | undefined;
     if (!compileErrored && codeFiles.length > 0) {
-      this.log.info('Running');
+      if (!this.isSynthetic) {
+        this.log.info('Running');
+      }
       run = await this.safeCall(
         'run',
         [codeFiles[0].name, ...this.args],
@@ -1802,7 +1814,9 @@ export class Job {
   }
 
   async cleanup(): Promise<void> {
-    this.log.info('Cleaning up');
+    if (!this.isSynthetic) {
+      this.log.info('Cleaning up');
+    }
     let workspaceRemoved = true;
     const workspaceLease = this.workspaceLease;
     const jobIdentity = this.jobIdentity;

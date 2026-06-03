@@ -10,6 +10,7 @@ import { summarizeSandboxResponse, summarizeText } from './execution-log';
 import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgressGrant } from './egress-gateway-client';
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
+import { isSyntheticPrincipalSource } from './auth/synthetic';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
@@ -27,6 +28,7 @@ function isAbortError(error: unknown): boolean {
 
 async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
   const { code, payload, isPyPlot } = job.data;
+  const isSyntheticJob = job.data.isSynthetic === true || isSyntheticPrincipalSource(job.data.principalSource);
   const language = payload?.language ?? 'unknown';
   const endTimer = jobProcessingDuration.startTimer({ language });
   activeJobs.inc({ language });
@@ -47,6 +49,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       const prepared = await createGatewayEgressGrant({
         payload,
         claims: refreshEgressGrantClaims(job.data.egressGrantClaims, nowSeconds),
+        isSynthetic: isSyntheticJob,
         signal: controller.signal,
       });
       egressGrantId = prepared.grant_id;
@@ -86,11 +89,14 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         grantId: egressGrantId,
         egressGrantToken: egressGrantTokenForRestore,
         result: response.data,
+        isSynthetic: isSyntheticJob,
         signal: controller.signal,
       })
       : response.data;
 
-    logger.info('Sandbox response', summarizeSandboxResponse(responseData));
+    if (!isSyntheticJob) {
+      logger.info('Sandbox response', summarizeSandboxResponse(responseData));
+    }
 
     const { files } = responseData;
     const run = responseData.run;
@@ -147,6 +153,7 @@ async function processJob(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       await revokeGatewayEgressGrant({
         grantId: egressGrantId,
         egressGrantToken: egressGrantId ? undefined : egressGrantTokenForRestore,
+        isSynthetic: isSyntheticJob,
         reason: revokeReason,
         timeoutMs: env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
       }).catch(error => {
@@ -184,12 +191,16 @@ workerRunning.set({ worker_type: 'python' }, 1);
 workerRunning.set({ worker_type: 'other' }, 1);
 
 pyWorker.on('completed', job => {
-  logger.info(`[${WORKER_ID}] Python job completed ${job.id}`);
+  if (job.data.isSynthetic !== true) {
+    logger.info(`[${WORKER_ID}] Python job completed ${job.id}`);
+  }
   jobsCompleted.inc({ language: 'python' });
 });
 
 otherWorker.on('completed', job => {
-  logger.info(`[${WORKER_ID}] Other job completed ${job.id}`);
+  if (job.data.isSynthetic !== true) {
+    logger.info(`[${WORKER_ID}] Other job completed ${job.id}`);
+  }
   jobsCompleted.inc({ language: 'other' });
 });
 

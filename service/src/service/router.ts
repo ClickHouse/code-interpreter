@@ -16,6 +16,7 @@ import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
+import { isSyntheticPrincipalSource } from '../auth/synthetic';
 import { getExecutionIdentity } from '../execution-identity';
 import { jobsSubmitted } from '../metrics';
 import { Jobs, Languages } from '../enum';
@@ -114,6 +115,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   const apiKeyId = getCredentialId(req);
   const userId = principal.userId;
   const identity = getExecutionIdentity(req, userId);
+  const isSyntheticRequest = isSyntheticPrincipalSource(identity.principalSource);
 
   if (checkServiceShutDown()) {
     return res.status(503).json({ error: 'Service is shutting down' });
@@ -168,15 +170,17 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   await connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
   try {
-    logger.info('Request received', {
-      userId,
-      apiKeyId,
-      user: user_id,
-      session_id,
-      language,
-      files: summarizeRequestedFiles(authorizedFiles),
-      sessionKey,
-    });
+    if (!isSyntheticRequest) {
+      logger.info('Request received', {
+        userId,
+        apiKeyId,
+        user: user_id,
+        session_id,
+        language,
+        files: summarizeRequestedFiles(authorizedFiles),
+        sessionKey,
+      });
+    }
 
     const isPyPlot = language === Languages.py && (code.includes('import matplotlib') || code.includes('import seaborn'));
     const rawPayload = createPayload({
@@ -201,6 +205,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       userId,
       payload: sandboxSecurity.payload,
       apiKeyId,
+      isSynthetic: isSyntheticRequest,
       isPyPlot,
       principalSource: identity.principalSource,
       executionId: execution_id,
@@ -234,7 +239,9 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
 
     const result = await job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT);
 
-    logger.info('Execution completed', { session_id, user_id });
+    if (!isSyntheticRequest) {
+      logger.info('Execution completed', { session_id, user_id });
+    }
     return res.status(200).json(result);
   } catch (error) {
     logger.error(`[${INSTANCE_ID}] Session ID: ${session_id} | User ID: ${user_id} | Error during execution:`, error);

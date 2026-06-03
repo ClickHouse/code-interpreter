@@ -1,12 +1,14 @@
 import axios from 'axios';
 import { env } from './config';
 import type { ExecutionManifestClaims } from './execution-manifest';
+import { CODEAPI_SYNTHETIC_INTERNAL_REQUEST_HEADER } from './internal-synthetic';
 import { internalServiceHeaders } from './internal-service-auth';
 import type * as t from './types';
 
 type GatewayRequestOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
+  isSynthetic?: boolean;
 };
 
 export interface GatewayPreparedEgress {
@@ -23,17 +25,26 @@ function gatewayUrl(path: string): string {
   return `${env.EGRESS_GATEWAY_URL.replace(/\/+$/, '')}${path}`;
 }
 
+function gatewayHeaders(headers: Record<string, string>, isSynthetic?: boolean): Record<string, string> {
+  const resolved = internalServiceHeaders(headers);
+  if (isSynthetic === true) {
+    resolved[CODEAPI_SYNTHETIC_INTERNAL_REQUEST_HEADER] = 'true';
+  }
+  return resolved;
+}
+
 export async function createGatewayEgressGrant(args: {
   payload: t.PayloadBody;
   claims: ExecutionManifestClaims;
+  isSynthetic?: boolean;
   signal?: AbortSignal;
 }): Promise<GatewayPreparedEgress> {
-  const { signal, ...body } = args;
+  const { signal, isSynthetic, ...body } = args;
   const response = await axios.post<GatewayPreparedEgress>(
     gatewayUrl('/internal/egress-grants'),
     body,
     {
-      headers: internalServiceHeaders({ 'Content-Type': 'application/json' }),
+      headers: gatewayHeaders({ 'Content-Type': 'application/json' }, isSynthetic),
       signal,
       timeout: env.EGRESS_GATEWAY_REQUEST_TIMEOUT_MS,
     },
@@ -45,6 +56,7 @@ export async function restoreGatewaySandboxResult<T extends { session_id: string
   grantId?: string;
   egressGrantToken: string;
   result: T;
+  isSynthetic?: boolean;
   signal?: AbortSignal;
 }): Promise<T> {
   const path = args.grantId
@@ -54,7 +66,7 @@ export async function restoreGatewaySandboxResult<T extends { session_id: string
     gatewayUrl(path),
     { result: args.result, egressGrantToken: args.egressGrantToken },
     {
-      headers: internalServiceHeaders({ 'Content-Type': 'application/json' }),
+      headers: gatewayHeaders({ 'Content-Type': 'application/json' }, args.isSynthetic),
       signal: args.signal,
       timeout: env.EGRESS_GATEWAY_REQUEST_TIMEOUT_MS,
     },
@@ -65,6 +77,7 @@ export async function restoreGatewaySandboxResult<T extends { session_id: string
 export async function revokeGatewayEgressGrant(args: {
   grantId?: string;
   egressGrantToken?: string;
+  isSynthetic?: boolean;
   reason: string;
   timeoutMs?: number;
 }): Promise<void> {
@@ -81,7 +94,7 @@ export async function revokeGatewayEgressGrant(args: {
     gatewayUrl(path),
     body,
     {
-      headers: internalServiceHeaders({ 'Content-Type': 'application/json' }),
+      headers: gatewayHeaders({ 'Content-Type': 'application/json' }, args.isSynthetic),
       timeout: args.timeoutMs ?? env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
     },
   );
