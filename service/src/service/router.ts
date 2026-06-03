@@ -16,6 +16,7 @@ import { env, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
+import { getExecutionIdentity } from '../execution-identity';
 import { jobsSubmitted } from '../metrics';
 import { Jobs, Languages } from '../enum';
 import { FileRefAuthorizationError, authorizeRequestedFiles } from './file-authorization';
@@ -112,6 +113,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
   if (!principal) return;
   const apiKeyId = getCredentialId(req);
   const userId = principal.userId;
+  const identity = getExecutionIdentity(req, userId);
 
   if (checkServiceShutDown()) {
     return res.status(503).json({ error: 'Service is shutting down' });
@@ -200,10 +202,10 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       payload: sandboxSecurity.payload,
       apiKeyId,
       isPyPlot,
-      principalSource: principal.principalSource,
+      principalSource: identity.principalSource,
       executionId: execution_id,
-      tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',
-      canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
+      tenantId: identity.storageNamespace,
+      canonicalUserId: identity.canonicalUserId,
       executionManifestClaims: sandboxSecurity.executionManifestClaims,
       egressGrantClaims: sandboxSecurity.egressGrantClaims,
       egressGrantToken: sandboxSecurity.egressGrantToken

@@ -1,5 +1,6 @@
 import { env } from './config';
 import type * as t from './types';
+import { buildExecutionIdentity } from './execution-identity';
 import {
   EXECUTION_MANIFEST_VERSION,
   type ExecutionManifestClaims,
@@ -59,12 +60,23 @@ export function buildExecutionManifestClaims(args: {
   const inputFiles = collectManifestInputFiles(args.payload);
   const readSessions = Array.from(new Set(inputFiles.map(file => file.session_id))).sort();
   const ctx = args.req.codeApiAuthContext;
+  const identity = buildExecutionIdentity({
+    userId: args.userId,
+    authContext: ctx,
+    storageNamespace: args.tenantId,
+    canonicalUserId: args.canonicalUserId,
+    orgId: args.orgId,
+    serviceId: args.serviceId,
+    chcUserId: args.chcUserId,
+    principalSource: args.principalSource,
+    authContextHash: args.authContextHash,
+  });
 
   return {
     v: EXECUTION_MANIFEST_VERSION,
     exec_id: args.executionId,
-    tenant_id: args.tenantId ?? ctx?.tenantId ?? 'legacy',
-    user_id: args.canonicalUserId ?? ctx?.userId ?? args.userId,
+    tenant_id: identity.storageNamespace,
+    user_id: identity.canonicalUserId,
     session_key: args.sessionKey,
     input_files: inputFiles,
     read_sessions: readSessions,
@@ -75,11 +87,11 @@ export function buildExecutionManifestClaims(args: {
     iat: now,
     exp: now + env.EXECUTION_MANIFEST_TTL_SECONDS,
     tool_call_socket: args.payload.tool_call_socket === true,
-    ...((args.chcUserId ?? ctx?.chcUserId) ? { chc_user_id: args.chcUserId ?? ctx?.chcUserId } : {}),
-    ...((args.orgId ?? ctx?.orgId) ? { org_id: args.orgId ?? ctx?.orgId } : {}),
-    ...((args.serviceId ?? ctx?.serviceId) ? { service_id: args.serviceId ?? ctx?.serviceId } : {}),
-    principal_source: args.principalSource ?? ctx?.principalSource ?? 'librechat_jwt',
-    ...((args.authContextHash ?? ctx?.authContextHash) ? { auth_context_hash: args.authContextHash ?? ctx?.authContextHash } : {}),
+    ...(identity.chcUserId ? { chc_user_id: identity.chcUserId } : {}),
+    ...(identity.orgId ? { org_id: identity.orgId } : {}),
+    ...(identity.serviceId ? { service_id: identity.serviceId } : {}),
+    principal_source: identity.principalSource,
+    ...(identity.authContextHash ? { auth_context_hash: identity.authContextHash } : {}),
   };
 }
 

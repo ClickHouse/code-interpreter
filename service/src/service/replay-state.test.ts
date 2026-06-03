@@ -4,10 +4,63 @@ import type { AddressInfo } from 'net';
 import RedisMock from 'ioredis-mock';
 import { env } from '../config';
 import {
+  checkContinuationPreconditions,
   cleanupExecution,
   resetRedisForTests,
   setRedisForTests,
+  type ExecutionState,
+  type ToolHistoryDelta,
 } from './replay-state';
+
+const VALID_RESULT = [{ call_id: 'call_001', result: 'ok' }];
+const EMPTY_DELTA: ToolHistoryDelta = {
+  serializedByCallId: new Map(),
+  newCallIds: [],
+  bytesDelta: 0,
+};
+
+function replayState(overrides: Partial<ExecutionState> = {}): ExecutionState {
+  return {
+    execution_id: 'exec_123',
+    session_id: 'session_123',
+    userId: 'user_123',
+    tenantId: 'oss-default',
+    apiKeyId: 'key_123',
+    startTime: 1778250000000,
+    lastActivity: 1778250000000,
+    mode: 'replay',
+    emittedCallIds: ['call_001'],
+    ...overrides,
+  };
+}
+
+describe('checkContinuationPreconditions', () => {
+  test('compares replay continuations against the persisted storage namespace', () => {
+    const result = checkContinuationPreconditions({
+      state: replayState(),
+      results: VALID_RESULT,
+      userId: 'user_123',
+      apiKeyId: 'key_123',
+      tenantId: 'oss-default',
+      delta: EMPTY_DELTA,
+    });
+
+    expect(result).toEqual({ ok: true });
+  });
+
+  test('rejects replay continuations whose storage namespace differs', () => {
+    const result = checkContinuationPreconditions({
+      state: replayState(),
+      results: VALID_RESULT,
+      userId: 'user_123',
+      apiKeyId: 'key_123',
+      tenantId: undefined,
+      delta: EMPTY_DELTA,
+    });
+
+    expect(result).toEqual({ ok: false, status: 403, error: 'Forbidden' });
+  });
+});
 
 describe('cleanupExecution', () => {
   let redis: InstanceType<typeof RedisMock>;

@@ -1,5 +1,6 @@
 import { CODE_ENV_KINDS } from './types';
 import type { AuthenticatedRequest, CodeEnvKind } from './types';
+import { getExecutionIdentity, resolveStorageNamespace } from './execution-identity';
 
 /* Read directly from `process.env` (not the snapshotted `env` object)
  * so test suites can flip the flag between cases without module-cache
@@ -10,7 +11,6 @@ function strictTenantIsolation(): boolean {
 }
 
 const KNOWN_KINDS_RUNTIME = new Set<string>(CODE_ENV_KINDS);
-const DEFAULT_SINGLE_TENANT_ID = 'legacy';
 
 /**
  * Inputs sufficient to derive a sessionKey. `RequestFile` (per-file
@@ -44,16 +44,18 @@ export class SessionKeyResolutionError extends Error {
  * auth context and the resource it belongs to.
  *
  * Output shape per kind:
- *   - `skill`:  `<tenant>:skill:<id>:v:<version>`
- *   - `agent`:  `<tenant>:agent:<id>`
- *   - `user`:   `<tenant>:user:<authContext.userId>`
+ *   - `skill`:  `<storageNamespace>:skill:<id>:v:<version>`
+ *   - `agent`:  `<storageNamespace>:agent:<id>`
+ *   - `user`:   `<storageNamespace>:user:<executionIdentity.canonicalUserId>`
  *
  * Cross-user-within-tenant sharing for `'skill'` and `'agent'` is a
  * designed property of the kind switch (the user dimension is omitted
  * from the sessionKey for those kinds), not an emergent side effect of
  * any legacy `entity_id` behavior.
  *
- * Tenant prefix is derived server-side from `req.codeApiAuthContext.tenantId`.
+ * Storage namespace is derived server-side from execution identity. Enterprise
+ * deployments currently map this from `req.codeApiAuthContext.tenantId`; OSS
+ * or single-tenant deployments use the configured single-tenant namespace.
  * When `CODEAPI_TENANT_ISOLATION_STRICT=true` and tenantId is missing, throws a
  * 500 — the auth layer is responsible for populating it on every
  * authenticated request, and a missing value would otherwise silently
@@ -65,7 +67,7 @@ export function resolveSessionKey(
   req: AuthenticatedRequest,
   input: SessionKeyInput,
 ): string {
-  const tenantPrefix = resolveTenantPrefix(req);
+  const storageNamespace = resolveSessionStorageNamespace(req);
 
   switch (input.kind) {
     case 'skill': {
@@ -75,22 +77,22 @@ export function resolveSessionKey(
           `resolveSessionKey: kind 'skill' requires version (got id=${input.id})`,
         );
       }
-      return `${tenantPrefix}:skill:${input.id}:v:${input.version}`;
+      return `${storageNamespace}:skill:${input.id}:v:${input.version}`;
     }
     case 'agent':
-      return `${tenantPrefix}:agent:${input.id}`;
+      return `${storageNamespace}:agent:${input.id}`;
     case 'user': {
       /* `input.id` is informational only for `kind: 'user'` — the
        * sessionKey derives from auth context. Kept on the input for
        * shape uniformity. */
-      const userId = req.codeApiAuthContext?.userId ?? '';
+      const userId = getExecutionIdentity(req).canonicalUserId;
       if (!userId) {
         throw new SessionKeyResolutionError(
           400,
           'resolveSessionKey: kind \'user\' requires authContext.userId',
         );
       }
-      return `${tenantPrefix}:user:${userId}`;
+      return `${storageNamespace}:user:${userId}`;
     }
     default: {
       /* Exhaustive check: TypeScript catches missing switch arms when a
@@ -110,15 +112,15 @@ export function resolveSessionKey(
  * entity_id-driven derivation. See codeapi #1455 / Phase C design.
  */
 export function resolveOutputBucketSessionKey(req: AuthenticatedRequest): string {
-  const tenantPrefix = resolveTenantPrefix(req);
-  const userId = req.codeApiAuthContext?.userId ?? '';
+  const storageNamespace = resolveSessionStorageNamespace(req);
+  const userId = getExecutionIdentity(req).canonicalUserId;
   if (!userId) {
     throw new SessionKeyResolutionError(
       500,
       'resolveOutputBucketSessionKey: authContext.userId is missing',
     );
   }
-  return `${tenantPrefix}:user:${userId}`;
+  return `${storageNamespace}:user:${userId}`;
 }
 
 /**
@@ -167,24 +169,17 @@ export function parseUploadSessionKeyInput(args: {
   return { kind: kind as CodeEnvKind, id: resolvedId };
 }
 
-function resolveTenantPrefix(req: AuthenticatedRequest): string {
-  const tenant = req.codeApiAuthContext?.tenantId;
-  if (!tenant) {
-    if (strictTenantIsolation()) {
-      throw new SessionKeyResolutionError(
-        500,
-        'tenantId missing from auth context (CODEAPI_TENANT_ISOLATION_STRICT=true)',
-      );
-    }
-    return resolveSingleTenantId();
+function resolveSessionStorageNamespace(req: AuthenticatedRequest): string {
+  const identity = getExecutionIdentity(req);
+  if (!strictTenantIsolation() || req.codeApiAuthContext?.tenantId) {
+    return identity.storageNamespace;
   }
-  return tenant;
-}
 
-function resolveSingleTenantId(): string {
-  const configured = process.env.CODEAPI_JWT_SINGLE_TENANT_ID;
-  if (configured != null && configured.trim() !== '') {
-    return configured.trim();
-  }
-  return DEFAULT_SINGLE_TENANT_ID;
+  return resolveStorageNamespace(req.codeApiAuthContext, {
+    requireTenant: true,
+    onMissingTenant: () => new SessionKeyResolutionError(
+      500,
+      'tenantId missing from auth context (CODEAPI_TENANT_ISOLATION_STRICT=true)',
+    ),
+  });
 }

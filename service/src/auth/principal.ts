@@ -1,5 +1,6 @@
 import type { Response } from 'express';
 import type * as t from '../types';
+import { applyExecutionIdentity, executionIdentityFromPrincipal } from '../execution-identity';
 
 export type CodeApiPrincipal = {
   userId: string;
@@ -16,6 +17,7 @@ export type CodeApiPrincipal = {
 
 export function applyPrincipal(req: t.AuthenticatedRequest, principal: CodeApiPrincipal): void {
   req.codeApiPrincipal = principal;
+  applyExecutionIdentity(req, executionIdentityFromPrincipal(principal));
   if (principal.planId) {
     req.planId = principal.planId;
   }

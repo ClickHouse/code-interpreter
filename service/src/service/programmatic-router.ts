@@ -14,6 +14,7 @@ import { isReservedPtcFilename } from '../ptc-constants';
 import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveOutputBucketSessionKey, SessionKeyResolutionError } from '../session-key';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
+import { getExecutionIdentity } from '../execution-identity';
 import {
   jobsSubmitted,
   ptcReplayContinuations,
@@ -529,6 +530,7 @@ async function handleReplayInitial(
   const session_id = nanoid();
   const execution_id = nanoid();
   const authContext = req.codeApiAuthContext;
+  const identity = getExecutionIdentity(req, userId);
   const isPyPlot = language === 'python' && (
     code.includes('import matplotlib') || code.includes('import seaborn')
   );
@@ -542,6 +544,7 @@ async function handleReplayInitial(
     userId,
     apiKeyId,
     authContext,
+    identity,
     code,
     tools: tools as LCTool[],
     files: authorizedFiles.length > 0 ? authorizedFiles : undefined,
@@ -683,12 +686,13 @@ async function handleReplayContinuation(
     /** Mode/auth/issued-call-id/cap checks are pure functions of state
      * + input; the helper centralizes the branch logic so it's
      * exhaustively unit-testable in `test-replay-state.ts`. */
+    const identity = getExecutionIdentity(req, userId);
     const pre = checkContinuationPreconditions({
       state,
       results: enrichedResults,
       userId,
       apiKeyId,
-      tenantId: req.codeApiAuthContext?.tenantId,
+      tenantId: identity.storageNamespace,
       authContextHash: req.codeApiAuthContext?.authContextHash,
       delta,
     });
@@ -698,7 +702,7 @@ async function handleReplayContinuation(
           execution_id: state.execution_id,
           requestUserId: userId,
           requestApiKeyId: apiKeyId,
-          requestTenantId: req.codeApiAuthContext?.tenantId,
+          requestTenantId: identity.storageNamespace,
           executionUserId: state.userId,
           executionApiKeyId: state.apiKeyId,
           executionTenantId: state.tenantId,
@@ -1117,12 +1121,13 @@ async function handleBlocking(
       return res.status(404).json({ error: 'Execution not found or expired' });
     }
 
+    const identity = getExecutionIdentity(req, userId);
     if (
       execution.userId !== userId ||
       (execution.apiKeyId != null && execution.apiKeyId !== apiKeyId) ||
       (
         execution.tenantId != null &&
-        execution.tenantId !== req.codeApiAuthContext?.tenantId
+        execution.tenantId !== identity.storageNamespace
       ) ||
       (
         execution.authContextHash != null &&
@@ -1133,7 +1138,7 @@ async function handleBlocking(
         execution_id,
         requestUserId: userId,
         requestApiKeyId: apiKeyId,
-        requestTenantId: req.codeApiAuthContext?.tenantId,
+        requestTenantId: identity.storageNamespace,
         executionUserId: execution.userId,
         executionApiKeyId: execution.apiKeyId,
         executionTenantId: execution.tenantId,
@@ -1251,6 +1256,7 @@ async function handleBlocking(
 
   const session_id = nanoid();
   const execution_id = nanoid();
+  const identity = getExecutionIdentity(req, userId);
 
   connection.set(`session:${session_id}`, sessionKey, 'EX', env.SESSION_CACHE_TTL);
 
@@ -1259,13 +1265,13 @@ async function handleBlocking(
     session_id,
     sessionKey,
     userId,
-    tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',
-    canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
-    orgId: req.codeApiAuthContext?.orgId,
-    serviceId: req.codeApiAuthContext?.serviceId,
-    chcUserId: req.codeApiAuthContext?.chcUserId,
-    principalSource: req.codeApiAuthContext?.principalSource,
-    authContextHash: req.codeApiAuthContext?.authContextHash,
+    tenantId: identity.storageNamespace,
+    canonicalUserId: identity.canonicalUserId,
+    orgId: identity.orgId,
+    serviceId: identity.serviceId,
+    chcUserId: identity.chcUserId,
+    principalSource: identity.principalSource,
+    authContextHash: identity.authContextHash,
     apiKeyId,
     startTime: Date.now(),
     lastActivity: Date.now(),
@@ -1358,10 +1364,10 @@ async function handleBlocking(
       payload: sandboxSecurity.payload,
       apiKeyId,
       isPyPlot: false,
-      principalSource: req.codeApiAuthContext?.principalSource,
+      principalSource: identity.principalSource,
       executionId: execution_id,
-      tenantId: req.codeApiAuthContext?.tenantId ?? 'legacy',
-      canonicalUserId: req.codeApiAuthContext?.userId ?? userId,
+      tenantId: identity.storageNamespace,
+      canonicalUserId: identity.canonicalUserId,
       executionManifestClaims: sandboxSecurity.executionManifestClaims,
       egressGrantClaims: sandboxSecurity.egressGrantClaims,
       egressGrantToken: sandboxSecurity.egressGrantToken,

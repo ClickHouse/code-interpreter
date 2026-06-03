@@ -7,6 +7,7 @@ import type { SendCommandFn, RedisReply } from 'rate-limit-redis';
 import type { NextFunction, Request, Response } from 'express';
 import type { AuthenticatedRequest } from '../types';
 import { env } from '../config';
+import { getExecutionIdentity } from '../execution-identity';
 import logger from '../logger';
 
 type RedisCommandTarget = {
@@ -90,14 +91,9 @@ export function rateLimitResponseBody(message: string, retryAfter: number): {
 
 export const keyGenerator = (req: Request): string => {
   const authReq = req as AuthenticatedRequest;
-  const principal = authReq.codeApiPrincipal;
-  if (principal?.userId) {
-    const tenantId = keySegment(principal.tenantId, 'legacy');
-    return `${tenantId}:user:${keySegment(principal.userId)}`;
-  }
-  if (authReq.codeApiAuthContext?.userId) {
-    const tenantId = keySegment(authReq.codeApiAuthContext.tenantId, 'legacy');
-    return `${tenantId}:user:${keySegment(authReq.codeApiAuthContext.userId)}`;
+  const identity = getExecutionIdentity(authReq);
+  if (identity.canonicalUserId) {
+    return `${keySegment(identity.storageNamespace, 'legacy')}:user:${keySegment(identity.canonicalUserId)}`;
   }
   return `ip:${keySegment(req.ip)}`;
 };
@@ -129,15 +125,17 @@ const buildRateLimiter = (
       if (options.logRejections) {
         const authReq = req as AuthenticatedRequest;
         const principal = authReq.codeApiPrincipal;
+        const identity = getExecutionIdentity(authReq);
+        const hasIdentity = Boolean(identity.canonicalUserId);
         logger.warn('CodeAPI rate limit rejected', {
           limiter: prefix,
           path: req.originalUrl || req.path,
           retryAfterSeconds: retryAfter,
           limit: rateLimit?.limit ?? max,
           windowMs,
-          principalSource: principal?.principalSource ?? authReq.codeApiAuthContext?.principalSource,
-          tenantHash: hashLabel(principal?.tenantId ?? authReq.codeApiAuthContext?.tenantId),
-          userHash: hashLabel(principal?.userId ?? authReq.codeApiAuthContext?.userId),
+          principalSource: hasIdentity ? identity.principalSource : undefined,
+          tenantHash: hasIdentity ? hashLabel(identity.storageNamespace) : undefined,
+          userHash: hasIdentity ? hashLabel(identity.canonicalUserId) : undefined,
           credentialHash: hashLabel(principal?.credentialId),
         });
       }

@@ -1,6 +1,7 @@
 import type { Job } from 'bullmq';
 import type { Request } from 'express';
 import type { ExecutionManifestClaims } from '../execution-manifest';
+import type { ExecutionIdentity } from '../execution-identity';
 import type { CodeApiPrincipal } from '../auth/principal';
 import { Jobs } from '@/enum/service';
 
@@ -251,6 +252,7 @@ export interface CodeApiAuthContext {
 export interface AuthenticatedRequest extends Request {
   sessionKey?: string;
   planId?: string;
+  executionIdentity?: ExecutionIdentity;
   codeApiAuthContext?: CodeApiAuthContext;
   codeApiPrincipal?: CodeApiPrincipal;
 }
