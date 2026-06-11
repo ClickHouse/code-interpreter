@@ -10,7 +10,7 @@
     "test": "bun test"
   },
   "dependencies": {
-    "express": "^4.22.1",
+    "express": "^4.22.2",
     "nanoid": "^3.3.7",
     "pino": "^10.3.0",
     "prom-client": "^15.1.3",
