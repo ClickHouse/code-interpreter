@@ -21,8 +21,7 @@ minikube start --cpus=4 --memory=8192
 # Point docker to minikube's daemon
 eval $(minikube docker-env)
 
-# Build all images
-cd services/codeapi
+# Build all images, from the codeapi root
 docker build -t codeapi-api:latest -f service/Dockerfile.api service/
 docker build -t codeapi-worker:latest -f service/Dockerfile.worker service/
 docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
@@ -33,7 +32,7 @@ docker build -t codeapi-package-init:latest -f docker/Dockerfile.package-init .
 
 ### 3. Install Dependencies & Deploy
 ```bash
-cd services/codeapi/helm/codeapi
+cd helm/codeapi
 
 # Download chart dependencies (Redis)
 helm dependency update

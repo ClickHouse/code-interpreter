@@ -14,8 +14,8 @@ keywords:
 
 # Maintainers
 maintainers:
-  - name: danny
-    email: danny.avila@clickhouse.com
+  - name: danny-avila
+    url: https://github.com/danny-avila
 
 # Dependencies (we'll use these for Redis and MinIO)
 dependencies:

@@ -101,8 +101,7 @@ List available language runtimes.
 ## Development
 
 ```bash
-# Build and run locally with docker-compose
-cd services/codeapi
+# Build and run locally with docker-compose, from the codeapi root
 docker compose up --build
 
 # Test execution
