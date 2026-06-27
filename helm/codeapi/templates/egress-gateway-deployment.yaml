@@ -20,6 +20,8 @@ spec:
       labels:
         {{- include "codeapi.egressGateway.selectorLabels" . | nindent 8 }}
     spec:
+      # egress-gateway does not call the Kubernetes API; suppress the auto-mounted SA token.
+      automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

@@ -100,6 +100,8 @@ spec:
       labels:
         {{- include "codeapi.serviceWorker.selectorLabels" . | nindent 8 }}
     spec:
+      # service-worker does not call the Kubernetes API; suppress the auto-mounted SA token.
+      automountServiceAccountToken: false
       {{- if or .Values.workerSandbox.serviceAccount.create .Values.workerSandbox.serviceAccount.name }}
       serviceAccountName: {{ $serviceWorkerServiceAccount }}
       {{- end }}

@@ -35,6 +35,8 @@ spec:
       labels:
         {{- include "codeapi.fileServer.selectorLabels" . | nindent 8 }}
     spec:
+      # file-server does not call the Kubernetes API; suppress the auto-mounted SA token.
+      automountServiceAccountToken: false
       {{- if or .Values.fileServer.serviceAccount.create .Values.fileServer.serviceAccount.name }}
       serviceAccountName: {{ .Values.fileServer.serviceAccount.name | default (printf "%s-file-server" (include "codeapi.fullname" .)) }}
       {{- end }}

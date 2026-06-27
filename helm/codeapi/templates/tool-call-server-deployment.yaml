@@ -20,6 +20,8 @@ spec:
       labels:
         {{- include "codeapi.toolCallServer.selectorLabels" . | nindent 8 }}
     spec:
+      # tool-call-server does not call the Kubernetes API; suppress the auto-mounted SA token.
+      automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
