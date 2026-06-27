@@ -214,6 +214,11 @@ spec:
       labels:
         {{- include "codeapi.sandboxRunner.selectorLabels" . | nindent 8 }}
     spec:
+      # Hardened sandbox rejects unexpected CODEAPI_* env. Kubernetes injects
+      # service-link env (<RELEASE>_*_SERVICE_HOST etc.) for every Service in the
+      # namespace; with a codeapi-prefixed release those collide with the guard and
+      # crash the sandbox. The sandbox must not get service-discovery env anyway.
+      enableServiceLinks: false
       {{- if or .Values.workerSandbox.sandboxServiceAccount.create .Values.workerSandbox.sandboxServiceAccount.name }}
       serviceAccountName: {{ $sandboxRunnerServiceAccount }}
       {{- end }}
