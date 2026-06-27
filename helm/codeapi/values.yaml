@@ -192,6 +192,14 @@ workerSandbox:
     affinity: {}
 
   sandboxRunner:
+    # Place the untrusted-code sandbox-runner Deployment, Service, ServiceAccount
+    # and NetworkPolicy in a SEPARATE namespace from the rest of the release (the
+    # service-worker, egress-gateway, api, etc. stay in .Release.Namespace). Empty
+    # ("") = single-namespace behaviour (unchanged). When set, cross-namespace
+    # service URLs are rewritten to FQDNs and the NetworkPolicies gain
+    # namespaceSelector peers. The target namespace must exist (PSA-labelled) and be
+    # whitelisted in the ArgoCD AppProject. See deploy/stg for the staging split.
+    namespaceOverride: ""
     # Defaults to workerSandbox.replicaCount when unset.
     replicaCount: null
     # Restart a sandbox-runner before launcher/VMM host-side fd retention can

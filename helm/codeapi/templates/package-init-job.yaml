@@ -13,6 +13,9 @@ with Python, Node, Bun, and Bash runtimes for the NsJail sandbox.
 apiVersion: batch/v1
 kind: Job
 metadata:
+  {{- with .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+  namespace: {{ . }}
+  {{- end }}
   name: {{ include "codeapi.fullname" . }}-package-init
   labels:
     {{- include "codeapi.labels" . | nindent 4 }}

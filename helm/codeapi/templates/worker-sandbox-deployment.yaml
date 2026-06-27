@@ -72,6 +72,9 @@ apiVersion: v1
 kind: ServiceAccount
 automountServiceAccountToken: {{ .Values.workerSandbox.sandboxServiceAccount.automountServiceAccountToken }}
 metadata:
+  {{- with .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+  namespace: {{ . }}
+  {{- end }}
   name: {{ $sandboxRunnerServiceAccount }}
   labels:
     {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
@@ -110,7 +113,11 @@ spec:
           command: ['sh', '-c', 'until nc -z {{ include "codeapi.redis.host" . }} {{ include "codeapi.redis.port" . }}; do echo waiting for redis; sleep 2; done']
         - name: wait-for-sandbox-runner
           image: busybox:1.36.1
+          {{- if .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+          command: ['sh', '-c', 'until nc -z {{ include "codeapi.fullname" . }}-sandbox-runner.{{ .Values.workerSandbox.sandboxRunner.namespaceOverride }}.svc.cluster.local {{ .Values.workerSandbox.sandbox.port }}; do echo waiting for sandbox-runner; sleep 2; done']
+          {{- else }}
           command: ['sh', '-c', 'until nc -z {{ include "codeapi.fullname" . }}-sandbox-runner {{ .Values.workerSandbox.sandbox.port }}; do echo waiting for sandbox-runner; sleep 2; done']
+          {{- end }}
       containers:
         - name: service-worker
           image: "{{ .Values.workerSandbox.workerImage.repository }}:{{ .Values.workerSandbox.workerImage.tag }}"
@@ -124,7 +131,11 @@ spec:
             - name: CODEAPI_HARDENED_SANDBOX_MODE
               value: {{ .Values.hardenedSandboxMode | quote }}
             - name: SANDBOX_ENDPOINT
+              {{- if .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+              value: "http://{{ include "codeapi.fullname" . }}-sandbox-runner.{{ .Values.workerSandbox.sandboxRunner.namespaceOverride }}.svc.cluster.local:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
+              {{- else }}
               value: "http://{{ include "codeapi.fullname" . }}-sandbox-runner:{{ .Values.workerSandbox.sandbox.port }}/api/v2"
+              {{- end }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: REDIS_HOST
@@ -199,6 +210,9 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  {{- with .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+  namespace: {{ . }}
+  {{- end }}
   name: {{ include "codeapi.fullname" . }}-sandbox-runner
   labels:
     {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}
@@ -256,7 +270,11 @@ spec:
             - name: SANDBOX_RUNNER_FD_LIVENESS_LIMIT
               value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | default 40000 | quote }}
             - name: EGRESS_GATEWAY_URL
+              {{- if .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+              value: "http://{{ include "codeapi.fullname" . }}-egress-gateway.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.egressGateway.service.port }}"
+              {{- else }}
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
+              {{- end }}
             - name: SANDBOX_LOG_LEVEL
               value: "INFO"
             - name: SANDBOX_PACKAGES_DIRECTORY
@@ -294,7 +312,11 @@ spec:
             - name: SANDBOX_ALLOWED_LOCAL_NETWORK_PORT
               value: {{ .Values.egressGateway.service.port | quote }}
             - name: SANDBOX_FORWARD_TARGET
+              {{- if .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+              value: "{{ include "codeapi.fullname" . }}-egress-gateway.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.egressGateway.service.port }}"
+              {{- else }}
               value: "{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
+              {{- end }}
             - name: SANDBOX_REQUIRE_EGRESS_MANIFEST
               value: "true"
             - name: SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY
@@ -411,6 +433,9 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  {{- with .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+  namespace: {{ . }}
+  {{- end }}
   name: {{ include "codeapi.fullname" . }}-sandbox-runner
   labels:
     {{- include "codeapi.sandboxRunner.labels" . | nindent 4 }}

@@ -16,6 +16,9 @@ If using the initJob to populate packages:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  {{- with .Values.workerSandbox.sandboxRunner.namespaceOverride }}
+  namespace: {{ . }}
+  {{- end }}
   name: {{ include "codeapi.fullname" . }}-packages
   labels:
     {{- include "codeapi.labels" . | nindent 4 }}
