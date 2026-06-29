@@ -1,0 +1,88 @@
+name: Build CodeAPI Images
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+    packages: write
+
+concurrency:
+    group: codeapi-images-${{ github.ref_name }}
+    cancel-in-progress: true
+
+env:
+    REGISTRY: ghcr.io
+    IMAGE_PATH: ghcr.io/${{ github.repository }}
+
+jobs:
+    build:
+        name: ${{ matrix.image }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - image: codeapi-api
+                      dockerfile: service/Dockerfile.api
+                      platforms: linux/amd64,linux/arm64
+                      target: production
+                    - image: codeapi-worker
+                      dockerfile: service/Dockerfile.worker
+                      platforms: linux/amd64,linux/arm64
+                      target: production
+                    - image: codeapi-sandbox-runner
+                      dockerfile: api/Dockerfile
+                      platforms: linux/amd64
+                      target: sandbox-runner
+                    - image: codeapi-package-init
+                      dockerfile: docker/Dockerfile.package-init
+                      platforms: linux/amd64
+                      target: ''
+                    - image: codeapi-file-server
+                      dockerfile: service/Dockerfile
+                      platforms: linux/amd64,linux/arm64
+                      target: production
+                    - image: codeapi-tool-call-server
+                      dockerfile: service/Dockerfile.tool-call-server
+                      platforms: linux/amd64,linux/arm64
+                      target: production
+                    - image: codeapi-egress-gateway
+                      dockerfile: service/Dockerfile.egress-gateway
+                      platforms: linux/amd64,linux/arm64
+                      target: production
+
+        steps:
+            - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+            - name: Log in to GHCR
+              uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push image
+              uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+              with:
+                  context: .
+                  file: ${{ matrix.dockerfile }}
+                  target: ${{ matrix.target }}
+                  platforms: ${{ matrix.platforms }}
+                  push: true
+                  tags: |
+                      ${{ env.IMAGE_PATH }}/${{ matrix.image }}:${{ github.sha }}
+                      ${{ env.IMAGE_PATH }}/${{ matrix.image }}:main
+                  labels: |
+                      org.opencontainers.image.source=https://github.com/${{ github.repository }}
+                      org.opencontainers.image.revision=${{ github.sha }}
+                  cache-from: type=gha,scope=${{ matrix.image }}
+                  cache-to: type=gha,mode=max,scope=${{ matrix.image }}
