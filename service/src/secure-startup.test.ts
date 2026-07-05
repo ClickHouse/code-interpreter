@@ -177,10 +177,12 @@ describe('sandbox backend policy', () => {
     expect(() => validateSandboxBackendPolicy()).toThrow('LAMBDA_MICROVM_IMAGE_ARN is required');
   });
 
-  test('rejects non-stateless session modes until orchestration lands', () => {
+  test('accepts affinity and strict session modes on the lambda backend', () => {
     configureValidLambda();
     env.RUNTIME_SESSION_MODE = 'affinity';
-    expect(() => validateSandboxBackendPolicy()).toThrow('session orchestration is not yet available');
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
+    env.RUNTIME_SESSION_MODE = 'strict';
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
   });
 
   test('hardened mode requires an egress connector', () => {

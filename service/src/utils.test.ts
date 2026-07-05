@@ -129,6 +129,22 @@ describe('sandbox error formatting', () => {
     });
   });
 
+  test('maps a busy runtime session (strict mode) to 409', () => {
+    const err = new Error('RUNTIME_SESSION_BUSY: Runtime session rt_abc is busy');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 409,
+      body: { error: 'runtime_session_busy', message: 'Runtime session rt_abc is busy' },
+    });
+  });
+
+  test('maps MicroVM launch failures to 503', () => {
+    const err = new Error('MICROVM_LAUNCH_FAILED: MicroVM did not reach RUNNING within 60000ms');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 503,
+      body: { error: 'microvm_launch_failed', message: 'MicroVM did not reach RUNNING within 60000ms' },
+    });
+  });
+
   test('maps sandbox request guard failures to public bad requests', () => {
     const axiosErr = {
       message: 'Request failed with status code 400',

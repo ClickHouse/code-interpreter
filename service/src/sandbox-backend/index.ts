@@ -31,6 +31,9 @@ function createBackend(): SandboxBackend {
         healthTimeoutMs: env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS,
         launchTps: env.LAMBDA_MICROVM_LAUNCH_TPS,
         jobTimeoutMs: env.JOB_TIMEOUT,
+        idleSeconds: env.LAMBDA_MICROVM_IDLE_SECONDS,
+        suspendedSeconds: env.LAMBDA_MICROVM_SUSPEND_SECONDS,
+        lockWaitMs: env.RUNTIME_SESSION_LOCK_WAIT_MS,
       },
     });
   }

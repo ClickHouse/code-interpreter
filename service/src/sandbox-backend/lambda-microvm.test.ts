@@ -7,6 +7,12 @@ import {
   resetRedisForTests as resetThrottleRedis,
   setRedisForTests as setThrottleRedis,
 } from '../runtime-session/throttle';
+import {
+  acquireRuntimeSessionLock,
+  readRuntimeSessionRecord,
+  resetRedisForTests as resetRegistryRedis,
+  setRedisForTests as setRegistryRedis,
+} from '../runtime-session/registry';
 import { LambdaMicrovmSandboxBackend, normalizeMicrovmEndpoint, type LambdaMicrovmBackendConfig } from './lambda-microvm';
 import { SandboxBackendError } from './types';
 import type { SandboxExecuteContext, SandboxTransportRequest } from './types';
@@ -70,6 +76,7 @@ beforeEach(async () => {
   mock = new RedisMock();
   await mock.flushall();
   setThrottleRedis(mock);
+  setRegistryRedis(mock);
   captured = [];
   healthStatus = 200;
   executeDelayMs = 0;
@@ -77,6 +84,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   resetThrottleRedis();
+  resetRegistryRedis();
 });
 
 function config(overrides: Partial<LambdaMicrovmBackendConfig> = {}): LambdaMicrovmBackendConfig {
@@ -90,6 +98,9 @@ function config(overrides: Partial<LambdaMicrovmBackendConfig> = {}): LambdaMicr
     healthTimeoutMs: 1_000,
     launchTps: 50,
     jobTimeoutMs: 300_000,
+    idleSeconds: 300,
+    suspendedSeconds: 1_800,
+    lockWaitMs: 500,
     ...overrides,
   };
 }
@@ -241,5 +252,110 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     const before = JSON.stringify(req.body);
     await makeBackend(fake).execute(req, context());
     expect(JSON.stringify(req.body)).toBe(before);
+  });
+});
+
+describe('LambdaMicrovmSandboxBackend session execution', () => {
+  function sessionContext(overrides: Partial<SandboxExecuteContext> = {}): SandboxExecuteContext {
+    return context({
+      runtimeSessionId: 'rt_session_1',
+      runtimeSessionMode: 'affinity',
+      tenantId: 'tenant-a',
+      canonicalUserId: 'user-1',
+      ...overrides,
+    });
+  }
+
+  test('launches a session VM with the workspace runHookPayload + idlePolicy and records it', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+
+    const result = await backend.execute(request(), sessionContext());
+    expect(result).toEqual(EXECUTE_RESPONSE);
+
+    const runArgs = fake.callsFor('runMicrovm')[0].args as {
+      runHookPayload?: string;
+      idlePolicy?: { autoResume: boolean; maxIdleSeconds: number };
+      clientToken?: string;
+      maximumDurationSeconds: number;
+    };
+    expect(JSON.parse(runArgs.runHookPayload as string)).toEqual({
+      runtime_session_id: 'rt_session_1',
+      session_workspace: true,
+    });
+    expect(runArgs.idlePolicy?.autoResume).toBe(true);
+    expect(runArgs.clientToken).toBe('sess-rt_session_1-1');
+    expect(runArgs.maximumDurationSeconds).toBe(28_800);
+
+    const record = await readRuntimeSessionRecord('rt_session_1');
+    expect(record?.state).toBe('RUNNING');
+    expect(record?.microvm_id).toBe([...fake.vms.keys()][0]);
+    expect(record?.generation).toBe(1);
+  });
+
+  test('reuses the warm VM on the second execution (no second RunMicrovm)', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+
+    await backend.execute(request(), sessionContext());
+    await backend.execute(request(), sessionContext());
+
+    expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    const executes = captured.filter((c) => c.path === '/api/v2/execute');
+    expect(executes).toHaveLength(2);
+  });
+
+  test('two concurrent executions on one session serialize on the registry lock', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+
+    const [a, b] = await Promise.all([
+      backend.execute(request(), sessionContext()),
+      backend.execute(request(), sessionContext()),
+    ]);
+    expect(a).toEqual(EXECUTE_RESPONSE);
+    expect(b).toEqual(EXECUTE_RESPONSE);
+    /* Serialized launch: exactly one VM created, reused by the other. */
+    expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+  });
+
+  test('strict mode raises RUNTIME_SESSION_BUSY when the lock is held', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, { lockWaitMs: 100 });
+    const held = await acquireRuntimeSessionLock('rt_session_1', 60_000);
+    expect(held).not.toBeNull();
+
+    try {
+      await backend.execute(request(), sessionContext({ runtimeSessionMode: 'strict' }));
+      throw new Error('expected rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SandboxBackendError);
+      expect((error as SandboxBackendError).code).toBe('RUNTIME_SESSION_BUSY');
+    }
+  });
+
+  test('affinity mode falls back to a stateless one-shot when the lock is held', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, { lockWaitMs: 100 });
+    await acquireRuntimeSessionLock('rt_session_1', 60_000);
+
+    const result = await backend.execute(request(), sessionContext({ runtimeSessionMode: 'affinity' }));
+    expect(result).toEqual(EXECUTE_RESPONSE);
+    /* Stateless fallback: launched a one-shot VM and terminated it. */
+    const runArgs = fake.callsFor('runMicrovm')[0].args as { runHookPayload?: string; clientToken: string };
+    expect(runArgs.runHookPayload).toBeUndefined();
+    expect(runArgs.clientToken.startsWith('exec-')).toBe(true);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+  });
+
+  test('stateless mode ignores a runtime session id', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext({ runtimeSessionMode: 'stateless' }));
+    const runArgs = fake.callsFor('runMicrovm')[0].args as { runHookPayload?: string };
+    expect(runArgs.runHookPayload).toBeUndefined();
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
   });
 });

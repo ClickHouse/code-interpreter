@@ -68,11 +68,6 @@ export function validateSandboxBackendPolicy(): void {
   if (env.LAMBDA_MICROVM_IMAGE_ARN.trim().length === 0) {
     throw new SecureStartupConfigError('LAMBDA_MICROVM_IMAGE_ARN is required for the lambda-microvm backend');
   }
-  if (env.RUNTIME_SESSION_MODE !== 'stateless') {
-    throw new SecureStartupConfigError(
-      'Runtime session orchestration is not yet available for the lambda-microvm backend; set CODEAPI_RUNTIME_SESSION_MODE=stateless',
-    );
-  }
   if (env.HARDENED_SANDBOX_MODE && (env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS?.length ?? 0) === 0) {
     throw new SecureStartupConfigError(
       'LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS is required in CODEAPI_HARDENED_SANDBOX_MODE (MicroVMs default to public egress)',

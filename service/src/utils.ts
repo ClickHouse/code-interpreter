@@ -108,6 +108,17 @@ export function sandboxErrorMessageFromAxios(error: AxiosError): string {
 
 export function publicExecutionFailure(error: unknown): { status: number; body: { error: string; message: string } } | null {
   const message = error instanceof Error ? error.message : '';
+
+  /* Lambda MicroVM backend failures are surfaced by the worker as
+   * `<CODE>: <message>`. A busy runtime session in strict mode is a 409;
+   * launch/health failures are transient upstream errors (503). */
+  const backendMatch = message.match(/^(RUNTIME_SESSION_BUSY|MICROVM_[A-Z_]+):\s*(.+)$/);
+  if (backendMatch) {
+    const code = backendMatch[1];
+    const status = code === 'RUNTIME_SESSION_BUSY' ? 409 : 503;
+    return { status, body: { error: code.toLowerCase(), message: backendMatch[2] } };
+  }
+
   const match = message.match(/^Error from sandbox(?:\s+\[([a-z_]+)\])?:\s*(?:\[([a-z_]+)\]\s*)?(.+)$/);
   if (!match) return null;
 

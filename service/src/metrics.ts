@@ -218,6 +218,22 @@ export const microvmThrottleEvents = new Counter({
   labelNames: ['op'] as const,
 });
 
+export const runtimeSessionLockContention = new Counter({
+  name: 'codeapi_runtime_session_lock_contention_total',
+  help: 'Runtime session lock waits that timed out, by mode',
+  labelNames: ['mode'] as const,
+});
+
+export const runtimeSessionFallback = new Counter({
+  name: 'codeapi_runtime_session_fallback_total',
+  help: 'Affinity-mode executions that fell back to a stateless one-shot VM',
+});
+
+export const microvmActiveSessions = new Gauge({
+  name: 'codeapi_microvm_active_sessions',
+  help: 'Live runtime sessions tracked in the registry active set',
+});
+
 // -- Helpers for serving metrics --
 
 export async function metricsHandler(_req: unknown, res: { set: (key: string, value: string) => void; send: (data: string) => void }): Promise<void> {
