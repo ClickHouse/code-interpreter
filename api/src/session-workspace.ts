@@ -82,6 +82,14 @@ export class SessionWorkspace {
     return this.lease;
   }
 
+  /** The pinned UID/GID for this session, so a restored checkpoint's files
+   *  can be chowned to the owner the sandbox jobs run as. Ensures the
+   *  workspace/identity exist first. */
+  async ownership(): Promise<{ dir: string; uid: number; gid: number }> {
+    const lease = await this.acquire();
+    return { dir: lease.dir, uid: lease.identity.uid, gid: lease.identity.gid };
+  }
+
   isSurfaced(relPath: string, hash: string): boolean {
     return this.surfaced.get(relPath) === hash;
   }

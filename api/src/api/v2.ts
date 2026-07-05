@@ -13,6 +13,7 @@ import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
 import { getBoundSessionWorkspace } from '../session-workspace';
+import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
@@ -240,6 +241,8 @@ function manifestErrorStatus(error: ExecutionManifestError): number {
 
 router.use((req: Request, res: Response, next: NextFunction) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  /* Checkpoint restore streams a tar.gz body, not JSON. */
+  if (req.path === '/session/restore') return next();
   if (!req.headers['content-type']?.startsWith('application/json')) {
     return res.status(415).json({ message: 'requests must be of type application/json' });
   }
@@ -442,5 +445,13 @@ router.get('/runtimes', (_req: Request, res: Response) => {
   }));
   return res.status(200).json(runtimes);
 });
+
+/* Session workspace checkpoint / restore — control-plane driven, session-mode
+ * only. GET streams a tar.gz of the whole workspace (captures state the
+ * file-ref path drops: installed packages, chDB dirs, unsupported-extension
+ * files); POST replaces the workspace from one. No body parser on restore:
+ * the handler consumes the raw request stream. */
+router.get('/session/checkpoint', (_req: Request, res: Response) => streamSessionCheckpoint(res));
+router.post('/session/restore', (req: Request, res: Response) => restoreSessionCheckpoint(req, res));
 
 export default router;
