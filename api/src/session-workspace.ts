@@ -1,0 +1,147 @@
+import { config } from './config';
+import { logger } from './logger';
+import {
+  ensureSessionWorkspace,
+  resetSessionWorkspace,
+  sandboxJobUidPool,
+  type SandboxJobIdentity,
+  type SandboxWorkspaceLease,
+} from './workspace-isolation';
+
+/**
+ * Persistent, stateful session workspace for the Lambda MicroVM backend.
+ *
+ * A session-bound VM runs exactly one runtime session, and its executions
+ * serialize on the control-plane lock — so the runner keeps a single
+ * long-lived workspace and a single pinned UID, reused by every `/execute`.
+ * This is what turns the semi-stateless runner stateful: files, installed
+ * packages, and chDB dirs under `/mnt/data` survive between calls instead of
+ * being wiped per job.
+ *
+ * Gated by two independent locks (both required): the image-level
+ * `SANDBOX_SESSION_WORKSPACE_ENABLED` (true only in the Lambda MicroVM runner
+ * target) and a per-launch `/run` runHookPayload opting in. When neither is
+ * active, `getBoundSessionWorkspace()` returns undefined and the runner falls
+ * back to the untouched fresh-per-job path.
+ */
+
+export interface SessionBinding {
+  runtimeSessionId: string;
+}
+
+/** Shape of the `/run` runHookPayload the control plane delivers per VM. */
+interface RunHookSessionPayload {
+  runtime_session_id?: unknown;
+  session_workspace?: unknown;
+}
+
+export function parseSessionBinding(runHookPayload: string | undefined): SessionBinding | undefined {
+  if (!config.session_workspace_enabled) return undefined;
+  if (runHookPayload == null || runHookPayload.length === 0) return undefined;
+  let parsed: RunHookSessionPayload;
+  try {
+    parsed = JSON.parse(runHookPayload) as RunHookSessionPayload;
+  } catch {
+    logger.warn('Ignoring non-JSON /run runHookPayload for session binding');
+    return undefined;
+  }
+  if (parsed.session_workspace !== true) return undefined;
+  if (typeof parsed.runtime_session_id !== 'string' || parsed.runtime_session_id.length === 0) {
+    logger.warn('Session workspace requested without a runtime_session_id — ignoring');
+    return undefined;
+  }
+  return { runtimeSessionId: parsed.runtime_session_id };
+}
+
+export class SessionWorkspace {
+  readonly runtimeSessionId: string;
+  private lease: SandboxWorkspaceLease | undefined;
+  private identity: SandboxJobIdentity | undefined;
+  /** relPath -> signature of every file already surfaced to the client, so a
+   *  later job re-scanning the persistent workspace does not re-upload
+   *  unchanged prior outputs (output diffing). */
+  private readonly surfaced = new Map<string, string>();
+  /** relPath -> storage file id already primed onto disk, so an unchanged
+   *  input delivered again is not re-downloaded (priming dedup). */
+  private readonly primed = new Map<string, string>();
+
+  constructor(binding: SessionBinding) {
+    this.runtimeSessionId = binding.runtimeSessionId;
+  }
+
+  /** Acquires (once) the pinned UID + persistent dir, reused every job. */
+  async acquire(): Promise<SandboxWorkspaceLease> {
+    if (!this.identity) {
+      const identity = sandboxJobUidPool.acquire();
+      if (!identity) {
+        throw new Error('No sandbox UID slot available for session workspace');
+      }
+      this.identity = identity;
+    }
+    this.lease = await ensureSessionWorkspace(this.identity);
+    return this.lease;
+  }
+
+  isSurfaced(relPath: string, hash: string): boolean {
+    return this.surfaced.get(relPath) === hash;
+  }
+
+  markSurfaced(relPath: string, hash: string): void {
+    this.surfaced.set(relPath, hash);
+  }
+
+  forget(relPath: string): void {
+    this.surfaced.delete(relPath);
+  }
+
+  primedInputId(relPath: string): string | undefined {
+    return this.primed.get(relPath);
+  }
+
+  markPrimed(relPath: string, storageFileId: string): void {
+    this.primed.set(relPath, storageFileId);
+  }
+
+  /** Full teardown: wipe the dir, release the pinned UID, clear diff state. */
+  async reset(): Promise<void> {
+    await resetSessionWorkspace();
+    this.surfaced.clear();
+    this.primed.clear();
+    this.lease = undefined;
+    if (this.identity) {
+      sandboxJobUidPool.release(this.identity);
+      this.identity = undefined;
+    }
+  }
+}
+
+let boundSession: SessionWorkspace | undefined;
+
+/** Called by the `/run` lifecycle hook. Binding the same session twice is a
+ *  no-op; a different runtime session id resets the prior one first. */
+export function bindSessionWorkspace(binding: SessionBinding | undefined): SessionWorkspace | undefined {
+  if (!binding) return boundSession;
+  if (boundSession && boundSession.runtimeSessionId === binding.runtimeSessionId) {
+    return boundSession;
+  }
+  if (boundSession) {
+    void boundSession.reset().catch((err) => logger.error({ err }, 'Failed to reset superseded session workspace'));
+  }
+  boundSession = new SessionWorkspace(binding);
+  return boundSession;
+}
+
+export function getBoundSessionWorkspace(): SessionWorkspace | undefined {
+  return boundSession;
+}
+
+/** Called by `/terminate` (and session reset) to release the workspace. */
+export async function unbindSessionWorkspace(): Promise<void> {
+  const current = boundSession;
+  boundSession = undefined;
+  if (current) await current.reset();
+}
+
+export function resetSessionWorkspaceStateForTests(): void {
+  boundSession = undefined;
+}

@@ -163,7 +163,8 @@ FROM sandbox-build AS lambda-microvm-runner
 COPY --from=package-builder /pkgs /pkgs
 
 ENV PORT=8080 \
-    SANDBOX_PACKAGES_DIRECTORY=/pkgs
+    SANDBOX_PACKAGES_DIRECTORY=/pkgs \
+    SANDBOX_SESSION_WORKSPACE_ENABLED=true
 
 EXPOSE 8080/tcp
 ENTRYPOINT ["/sandbox_api/entrypoint.sh"]

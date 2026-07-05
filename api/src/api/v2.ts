@@ -12,6 +12,7 @@ import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
+import { getBoundSessionWorkspace } from '../session-workspace';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
@@ -194,6 +195,7 @@ function getJob(
     egress_grant: egressGrantToken,
     tool_call_socket_enabled: toolCallSocketEnabled,
     is_synthetic: isSynthetic,
+    session: getBoundSessionWorkspace() ?? null,
   });
 }
 

@@ -28,6 +28,7 @@ import {
   type SandboxJobIdentity,
   type SandboxWorkspaceLease,
 } from './workspace-isolation';
+import type { SessionWorkspace } from './session-workspace';
 import {
   DIRKEEP,
   SANDBOX_DIR_MODE,
@@ -680,6 +681,10 @@ export class Job {
   private inputFileHashes = new Map<string, InputFileInfo>();
   private entryPointName: string | undefined;
   private chmoddedDirs = new Set<string>();
+  /* Persistent session workspace (stateful mode). When set, the job reuses
+   * one long-lived workspace + pinned UID across calls instead of a fresh
+   * per-job workspace; undefined = legacy fresh-per-job path (unchanged). */
+  private readonly session: SessionWorkspace | undefined;
 
   constructor(opts: {
     /** Top-level execution session id. Becomes `Job.uuid` and is the id
@@ -698,7 +703,10 @@ export class Job {
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
+    /* Injected when this VM is bound to a stateful runtime session. */
+    session?: SessionWorkspace | null;
   }) {
+    this.session = opts.session ?? undefined;
     this.uuid = opts.session_id ?? nanoid();
     this.outputSessionId = opts.output_session_id ?? this.uuid;
     this.log = rootLogger.child({ job: this.uuid });
@@ -792,8 +800,13 @@ export class Job {
   }
 
   async prime(): Promise<void> {
-    this.jobIdentity = await acquireJobIdentity(this.log);
-    this.workspaceLease = await createSandboxWorkspace(this.jobIdentity);
+    if (this.session) {
+      this.workspaceLease = await this.session.acquire();
+      this.jobIdentity = this.workspaceLease.identity;
+    } else {
+      this.jobIdentity = await acquireJobIdentity(this.log);
+      this.workspaceLease = await createSandboxWorkspace(this.jobIdentity);
+    }
     this.submissionDir = this.workspaceLease.dir;
 
     if (!this.isSynthetic) {
@@ -803,6 +816,7 @@ export class Job {
           workspaceId: this.workspaceLease.workspaceId,
           uid: this.jobIdentity.uid,
           gid: this.jobIdentity.gid,
+          session: this.session ? this.session.runtimeSessionId : undefined,
         },
         'Priming job',
       );
@@ -815,12 +829,44 @@ export class Job {
     const fileOps: Promise<void>[] = [];
     for (const file of this.files) {
       if (file.id) {
-        fileOps.push(this.downloadAndWriteFile(file).then(() => {}));
+        fileOps.push(this.primeInputFile(file));
       } else if (file.content !== undefined) {
         fileOps.push(this.writeFile(file));
       }
     }
     await Promise.all(fileOps);
+  }
+
+  /**
+   * Downloads an input file, or — in session mode when the same storage id is
+   * already present on disk from a prior call — skips the network fetch and
+   * hashes the local copy so modification detection still works.
+   */
+  private async primeInputFile(file: TFile): Promise<void> {
+    if (this.session && file.id && (await this.reusePrimedInput(file))) return;
+    const name = await this.downloadAndWriteFile(file);
+    if (this.session && file.id && name) this.session.markPrimed(name, file.id);
+  }
+
+  private async reusePrimedInput(file: TFile): Promise<boolean> {
+    const session = this.session;
+    if (!session || !file.id) return false;
+    if (session.primedInputId(file.name) !== file.id) return false;
+    const filePath = path.join(this.submissionDir, file.name);
+    try {
+      const st = await fsp.lstat(filePath);
+      if (!st.isFile()) return false;
+      const hash = await this.computeFileHash(filePath, true);
+      this.inputFileHashes.set(file.name, {
+        originalId: file.id,
+        originalSessionId: file.storage_session_id,
+        hash,
+        path: filePath,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private fileEgressBaseUrl(): string {
@@ -1478,16 +1524,30 @@ export class Job {
     }
 
     let size: number;
+    let mtimeMs: number;
     try {
       /* Use lstat to stay consistent with classifyDirent's symlink filter —
        * following a symlink here would resurrect the exact escape vector
        * that the classification step already rejected. */
-      size = (await fsp.lstat(fullPath)).size;
+      const st = await fsp.lstat(fullPath);
+      size = st.size;
+      mtimeMs = st.mtimeMs;
     } catch (err) {
       this.log.debug({ path: relativePath, err }, 'walkDir: unable to stat file');
       return { collected: false, truncated: false, stopLoop: false };
     }
     if (size > this.runtime.max_file_size) {
+      return { collected: false, truncated: false, stopLoop: false };
+    }
+
+    /* Session mode output diffing: a persistent workspace still holds prior
+     * jobs' outputs. Skip any file already surfaced to the client whose
+     * size+mtime are unchanged, so only genuine deltas are re-uploaded. An
+     * input file (tracked in inputFileHashes) is left to the existing
+     * modified/unchanged classification below. */
+    const outputSignature = `${size}:${mtimeMs}`;
+    if (this.session && !this.inputFileHashes.has(relativePath)
+      && this.session.isSurfaced(relativePath, outputSignature)) {
       return { collected: false, truncated: false, stopLoop: false };
     }
 
@@ -1528,6 +1588,7 @@ export class Job {
     }
     this.sessionFiles.push(fileData);
     this.generatedFiles.push({ id: newId, name: relativePath, path: fullPath });
+    if (this.session) this.session.markSurfaced(relativePath, outputSignature);
     return { collected: true, truncated: false, stopLoop: false };
   }
 
@@ -1818,6 +1879,17 @@ export class Job {
     if (!this.isSynthetic) {
       this.log.info('Cleaning up');
     }
+
+    /* Session mode: the workspace and pinned UID belong to the long-lived
+     * session, not this job. Keep both so the next call sees prior files;
+     * teardown happens on the /terminate hook (or explicit session reset). */
+    if (this.session) {
+      this.workspaceLease = undefined;
+      this.submissionDir = '';
+      this.jobIdentity = undefined;
+      return;
+    }
+
     let workspaceRemoved = true;
     const workspaceLease = this.workspaceLease;
     const jobIdentity = this.jobIdentity;

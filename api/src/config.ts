@@ -65,6 +65,12 @@ export const config = {
   run_memory_limit: Number(process.env.SANDBOX_RUN_MEMORY_LIMIT ?? -1),
   max_concurrent_jobs: safeInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS, 8),
   per_job_uids: (process.env.SANDBOX_PER_JOB_UIDS ?? 'true') === 'true',
+  /* Image-level enable for persistent session workspaces (stateful sessions).
+   * Only the Lambda MicroVM runner target sets this true; the K8s
+   * sandbox-runner image leaves it false so it is structurally incapable of
+   * session mode regardless of any /run payload. A VM additionally opts in
+   * per-launch via the /run runHookPayload. */
+  session_workspace_enabled: (process.env.SANDBOX_SESSION_WORKSPACE_ENABLED ?? 'false') === 'true',
   job_uid_base: safeInt(process.env.SANDBOX_JOB_UID_BASE, 200000),
   job_gid_base: safeInt(process.env.SANDBOX_JOB_GID_BASE, 200000),
   job_uid_count: safeInt(

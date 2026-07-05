@@ -1,5 +1,6 @@
 import express, { Router, type Request, type Response } from 'express';
 import { logger } from '../logger';
+import { bindSessionWorkspace, parseSessionBinding, unbindSessionWorkspace } from '../session-workspace';
 
 /**
  * AWS Lambda MicroVM hook endpoints. The platform POSTs to
@@ -46,6 +47,11 @@ export function applyRunHook(body: unknown): MicrovmRunContext {
 
   if (runContext == null) {
     runContext = { microvmId, runHookPayload, receivedAt: Date.now() };
+    const binding = parseSessionBinding(runHookPayload);
+    if (binding) {
+      bindSessionWorkspace(binding);
+      logger.info({ runtimeSessionId: binding.runtimeSessionId }, 'Bound persistent session workspace');
+    }
   } else if (runContext.microvmId != null && microvmId != null && runContext.microvmId !== microvmId) {
     logger.warn(
       { existing: runContext.microvmId, incoming: microvmId },
@@ -78,6 +84,11 @@ lifecycleRouter.post('/run', express.json({ limit: '32kb' }), (req: Request, res
 
 lifecycleRouter.post('/resume', ackHook('resume'));
 lifecycleRouter.post('/suspend', ackHook('suspend'));
-lifecycleRouter.post('/terminate', ackHook('terminate'));
+
+lifecycleRouter.post('/terminate', (_req: Request, res: Response) => {
+  logger.info({ hook: 'terminate' }, 'MicroVM lifecycle hook invoked');
+  void unbindSessionWorkspace().catch((err) => logger.error({ err }, 'Failed to unbind session workspace on terminate'));
+  return res.status(200).json({ hook: 'terminate', status: 'ok' });
+});
 
 export default lifecycleRouter;
