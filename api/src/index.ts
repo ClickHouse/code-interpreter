@@ -7,6 +7,7 @@ import { initializeSandboxWorkspaceIsolation, startWorkspaceReaper } from './wor
 import { httpMetricsMiddleware, metricsHandler } from './metrics';
 import { positiveInt, shutdownTelemetry, traceHttpRequest } from './telemetry';
 import v2Router from './api/v2';
+import lifecycleRouter, { LIFECYCLE_HOOK_BASE_PATH } from './api/lifecycle';
 
 const app = express();
 
@@ -29,6 +30,7 @@ loadPackages(config.packages_directory);
 
 logger.info('Registering routes');
 app.get('/metrics', metricsHandler);
+app.use(LIFECYCLE_HOOK_BASE_PATH, lifecycleRouter);
 app.use('/api/v2', v2Router);
 
 app.get('/', (_req, res) => {

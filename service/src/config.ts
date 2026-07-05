@@ -49,6 +49,12 @@ const defaultMaxFileSize = Number(process.env.MAX_FILE_SIZE) || 25 * 1024 * 1024
 const defaultExecutionManifestTtlSeconds = Math.min(Math.ceil((defaultJobTimeoutMs + 60000) / 1000), 600);
 const EGRESS_GRANT_GRACE_MS = 10 * 60 * 1000;
 
+export function parseArnList(raw: string | undefined): string[] | undefined {
+  if (raw == null) return undefined;
+  const entries = raw.split(',').map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  return entries.length > 0 ? entries : undefined;
+}
+
 export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, jobTimeoutMs: number): number {
   const defaultTtlSeconds = Math.max(1, Math.ceil((jobTimeoutMs + EGRESS_GRANT_GRACE_MS) / 1000));
   if (rawTtlSeconds == null || rawTtlSeconds.trim() === '') {
@@ -165,6 +171,27 @@ export const env = {
     ? process.env.CODEAPI_RUNTIME_SESSION_MODE
     : 'stateless') as 'stateless' | 'affinity' | 'strict',
   RUNTIME_SESSION_LOCK_WAIT_MS: Number(process.env.CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS) || 15_000,
+  // Lambda MicroVM backend. Connector lists are comma-separated ARNs.
+  LAMBDA_MICROVM_IMAGE_ARN: process.env.LAMBDA_MICROVM_IMAGE_ARN ?? '',
+  LAMBDA_MICROVM_IMAGE_VERSION: process.env.LAMBDA_MICROVM_IMAGE_VERSION || undefined,
+  LAMBDA_MICROVM_EXECUTION_ROLE_ARN: process.env.LAMBDA_MICROVM_EXECUTION_ROLE_ARN || undefined,
+  LAMBDA_MICROVM_REGION: process.env.LAMBDA_MICROVM_REGION || undefined,
+  LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS),
+  LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS),
+  LAMBDA_MICROVM_PORT: Number(process.env.LAMBDA_MICROVM_PORT) || 8080,
+  LAMBDA_MICROVM_MAX_DURATION_SECONDS: Math.min(
+    Number(process.env.LAMBDA_MICROVM_MAX_DURATION_SECONDS) || 28_800,
+    28_800,
+  ),
+  LAMBDA_MICROVM_IDLE_SECONDS: Number(process.env.LAMBDA_MICROVM_IDLE_SECONDS) || 300,
+  LAMBDA_MICROVM_SUSPEND_SECONDS: Number(process.env.LAMBDA_MICROVM_SUSPEND_SECONDS) || 1_800,
+  LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: Number(process.env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS) || 300,
+  LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: Number(process.env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS) || 60_000,
+  LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: Number(process.env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS) || 5_000,
+  LAMBDA_MICROVM_LAUNCH_TPS: Number(process.env.LAMBDA_MICROVM_LAUNCH_TPS) || 4,
+  LAMBDA_MICROVM_RESUME_TPS: Number(process.env.LAMBDA_MICROVM_RESUME_TPS) || 4,
+  LAMBDA_MICROVM_SUSPEND_TPS: Number(process.env.LAMBDA_MICROVM_SUSPEND_TPS) || 1,
+  LAMBDA_MICROVM_ALLOW_SHELL: process.env.LAMBDA_MICROVM_ALLOW_SHELL === 'true',
 };
 
 const default_run_memory_limit = 256 * 1024 * 1024;

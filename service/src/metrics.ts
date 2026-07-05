@@ -194,6 +194,30 @@ export const ptcReplayStaleCleanups = new Counter({
   help: 'Stale executions reaped by the periodic cleanup sweep',
 });
 
+export const microvmLaunches = new Counter({
+  name: 'codeapi_microvm_launches_total',
+  help: 'Lambda MicroVM launch attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmLaunchDuration = new Histogram({
+  name: 'codeapi_microvm_launch_duration_seconds',
+  help: 'Time from RunMicrovm to a healthy RUNNING MicroVM',
+  buckets: [0.5, 1, 2, 5, 10, 20, 40, 60],
+});
+
+export const microvmTerminations = new Counter({
+  name: 'codeapi_microvm_terminations_total',
+  help: 'Lambda MicroVM terminations by reason',
+  labelNames: ['reason'] as const,
+});
+
+export const microvmThrottleEvents = new Counter({
+  name: 'codeapi_microvm_throttle_events_total',
+  help: 'Control-plane throttle waits/errors by operation',
+  labelNames: ['op'] as const,
+});
+
 // -- Helpers for serving metrics --
 
 export async function metricsHandler(_req: unknown, res: { set: (key: string, value: string) => void; send: (data: string) => void }): Promise<void> {

@@ -35,3 +35,25 @@ export interface SandboxBackend {
   execute(req: SandboxTransportRequest, ctx: SandboxExecuteContext): Promise<SandboxRawResponse>;
   shutdown?(): Promise<void>;
 }
+
+export type SandboxBackendErrorCode =
+  | 'RUNTIME_SESSION_BUSY'
+  | 'MICROVM_LAUNCH_FAILED'
+  | 'MICROVM_LAUNCH_THROTTLED'
+  | 'MICROVM_UNHEALTHY'
+  | 'MICROVM_FENCED'
+  | 'MICROVM_DEADLINE_EXCEEDED';
+
+/** Lambda-only failure modes; the worker prefixes messages with the code so
+ *  the router can map them (e.g. RUNTIME_SESSION_BUSY -> 409). Axios errors
+ *  from the sandbox POST itself are rethrown raw by every backend. */
+export class SandboxBackendError extends Error {
+  constructor(
+    public readonly code: SandboxBackendErrorCode,
+    message: string,
+    public readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'SandboxBackendError';
+  }
+}

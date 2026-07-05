@@ -11,6 +11,12 @@ const savedEnv = { ...process.env };
 const saved = {
   hardened: env.HARDENED_SANDBOX_MODE,
   sandboxBackend: env.SANDBOX_BACKEND,
+  ptcMode: env.PTC_MODE,
+  runtimeSessionMode: env.RUNTIME_SESSION_MODE,
+  lambdaImageArn: env.LAMBDA_MICROVM_IMAGE_ARN,
+  lambdaEgressConnectors: env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS,
+  lambdaTokenTtl: env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS,
+  lambdaAllowShell: env.LAMBDA_MICROVM_ALLOW_SHELL,
   gatewayUrl: env.EGRESS_GATEWAY_URL,
   grantSecret: env.EGRESS_GRANT_SECRET,
   privateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,
@@ -27,6 +33,12 @@ function restore(): void {
   Object.assign(process.env, savedEnv);
   env.HARDENED_SANDBOX_MODE = saved.hardened;
   env.SANDBOX_BACKEND = saved.sandboxBackend;
+  env.PTC_MODE = saved.ptcMode;
+  env.RUNTIME_SESSION_MODE = saved.runtimeSessionMode;
+  env.LAMBDA_MICROVM_IMAGE_ARN = saved.lambdaImageArn;
+  env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS = saved.lambdaEgressConnectors;
+  env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS = saved.lambdaTokenTtl;
+  env.LAMBDA_MICROVM_ALLOW_SHELL = saved.lambdaAllowShell;
   env.EGRESS_GATEWAY_URL = saved.gatewayUrl;
   env.EGRESS_GRANT_SECRET = saved.grantSecret;
   env.EXECUTION_MANIFEST_PRIVATE_KEY = saved.privateKey;
@@ -125,16 +137,70 @@ describe('hardened CodeAPI startup config', () => {
 });
 
 describe('sandbox backend policy', () => {
+  function configureValidLambda(): void {
+    env.SANDBOX_BACKEND = 'lambda-microvm';
+    env.HARDENED_SANDBOX_MODE = false;
+    env.PTC_MODE = 'replay';
+    env.RUNTIME_SESSION_MODE = 'stateless';
+    env.LAMBDA_MICROVM_IMAGE_ARN = 'arn:aws:lambda:us-east-2:1:microvm-image:codeapi';
+    env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS = undefined;
+    env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS = 300;
+    env.LAMBDA_MICROVM_ALLOW_SHELL = false;
+  }
+
   test('accepts the default http backend', () => {
     env.SANDBOX_BACKEND = 'http';
+    env.RUNTIME_SESSION_MODE = 'stateless';
     expect(() => validateSandboxBackendPolicy()).not.toThrow();
   });
 
-  test('rejects lambda-microvm regardless of hardened mode', () => {
-    env.SANDBOX_BACKEND = 'lambda-microvm';
-    env.HARDENED_SANDBOX_MODE = false;
-    expect(() => validateSandboxBackendPolicy()).toThrow('lambda-microvm is not yet available');
+  test('accepts a fully configured stateless lambda backend', () => {
+    configureValidLambda();
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
+  });
+
+  test('strict runtime sessions require the lambda backend', () => {
+    env.SANDBOX_BACKEND = 'http';
+    env.RUNTIME_SESSION_MODE = 'strict';
+    expect(() => validateSandboxBackendPolicy()).toThrow('requires the lambda-microvm backend');
+  });
+
+  test('rejects blocking PTC on the lambda backend', () => {
+    configureValidLambda();
+    env.PTC_MODE = 'blocking';
+    expect(() => validateSandboxBackendPolicy()).toThrow('PTC replay is the only supported PTC mode');
+  });
+
+  test('requires the image ARN', () => {
+    configureValidLambda();
+    env.LAMBDA_MICROVM_IMAGE_ARN = '';
+    expect(() => validateSandboxBackendPolicy()).toThrow('LAMBDA_MICROVM_IMAGE_ARN is required');
+  });
+
+  test('rejects non-stateless session modes until orchestration lands', () => {
+    configureValidLambda();
+    env.RUNTIME_SESSION_MODE = 'affinity';
+    expect(() => validateSandboxBackendPolicy()).toThrow('session orchestration is not yet available');
+  });
+
+  test('hardened mode requires an egress connector', () => {
+    configureValidLambda();
     env.HARDENED_SANDBOX_MODE = true;
-    expect(() => validateSandboxBackendPolicy()).toThrow('lambda-microvm is not yet available');
+    expect(() => validateSandboxBackendPolicy()).toThrow('LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS is required');
+    env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS = ['arn:aws:lambda:us-east-2:1:network-connector:vpc-egress'];
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
+  });
+
+  test('caps ingress token TTL and blocks shell ingress in hardened mode', () => {
+    configureValidLambda();
+    env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS = 901;
+    expect(() => validateSandboxBackendPolicy()).toThrow('must be 900 or less');
+
+    configureValidLambda();
+    env.LAMBDA_MICROVM_ALLOW_SHELL = true;
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
+    env.HARDENED_SANDBOX_MODE = true;
+    env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS = ['arn:aws:lambda:us-east-2:1:network-connector:vpc-egress'];
+    expect(() => validateSandboxBackendPolicy()).toThrow('LAMBDA_MICROVM_ALLOW_SHELL');
   });
 });

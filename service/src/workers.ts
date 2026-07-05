@@ -10,7 +10,7 @@ import { summarizeSandboxResponse, summarizeText } from './execution-log';
 import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgressGrant } from './egress-gateway-client';
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
-import { getSandboxBackend } from './sandbox-backend';
+import { getSandboxBackend, SandboxBackendError } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
 import { withSpan, withTraceContext } from './telemetry';
 import logger from './logger';
@@ -146,7 +146,9 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     const errorDetails = getAxiosErrorDetails(error);
     logger.error('Error processing job', errorDetails);
 
-    if (isAbortError(error)) {
+    if (error instanceof SandboxBackendError) {
+      throw new Error(`${error.code}: ${error.message}`);
+    } else if (isAbortError(error)) {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
     } else if (axios.isAxiosError(error)) {
       /** Preserve error message from sandbox */

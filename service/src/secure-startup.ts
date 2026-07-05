@@ -53,10 +53,39 @@ export function validateWorkerHardenedConfig(): void {
  * unconditionally: a misconfigured backend must never half-start.
  */
 export function validateSandboxBackendPolicy(): void {
+  if (env.RUNTIME_SESSION_MODE === 'strict' && env.SANDBOX_BACKEND === 'http') {
+    throw new SecureStartupConfigError(
+      'CODEAPI_RUNTIME_SESSION_MODE=strict requires the lambda-microvm backend',
+    );
+  }
   if (env.SANDBOX_BACKEND !== 'lambda-microvm') return;
-  throw new SecureStartupConfigError(
-    'CODEAPI_SANDBOX_BACKEND=lambda-microvm is not yet available; unset it or use "http"',
-  );
+
+  if (env.PTC_MODE === 'blocking') {
+    throw new SecureStartupConfigError(
+      'PTC replay is the only supported PTC mode for the lambda-microvm backend (unset PTC_MODE=blocking)',
+    );
+  }
+  if (env.LAMBDA_MICROVM_IMAGE_ARN.trim().length === 0) {
+    throw new SecureStartupConfigError('LAMBDA_MICROVM_IMAGE_ARN is required for the lambda-microvm backend');
+  }
+  if (env.RUNTIME_SESSION_MODE !== 'stateless') {
+    throw new SecureStartupConfigError(
+      'Runtime session orchestration is not yet available for the lambda-microvm backend; set CODEAPI_RUNTIME_SESSION_MODE=stateless',
+    );
+  }
+  if (env.HARDENED_SANDBOX_MODE && (env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS?.length ?? 0) === 0) {
+    throw new SecureStartupConfigError(
+      'LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS is required in CODEAPI_HARDENED_SANDBOX_MODE (MicroVMs default to public egress)',
+    );
+  }
+  if (env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS > 900) {
+    throw new SecureStartupConfigError('LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS must be 900 or less');
+  }
+  if (env.LAMBDA_MICROVM_ALLOW_SHELL && (env.HARDENED_SANDBOX_MODE || process.env.NODE_ENV === 'production')) {
+    throw new SecureStartupConfigError(
+      'LAMBDA_MICROVM_ALLOW_SHELL must not be enabled in production or hardened mode',
+    );
+  }
 }
 
 export function validateEgressGatewayHardenedConfig(): void {

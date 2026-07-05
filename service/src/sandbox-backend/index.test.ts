@@ -19,9 +19,12 @@ describe('getSandboxBackend', () => {
     expect(getSandboxBackend()).toBe(backend);
   });
 
-  test('rejects lambda-microvm until the backend lands', () => {
+  test('selects the lambda-microvm backend when configured', async () => {
     env.SANDBOX_BACKEND = 'lambda-microvm';
-    expect(() => getSandboxBackend()).toThrow('lambda-microvm is not yet available');
+    const backend = getSandboxBackend();
+    const { LambdaMicrovmSandboxBackend } = await import('./lambda-microvm');
+    expect(backend).toBeInstanceOf(LambdaMicrovmSandboxBackend);
+    expect(backend.name).toBe('lambda-microvm');
   });
 
   test('test seam replaces the active backend', () => {
