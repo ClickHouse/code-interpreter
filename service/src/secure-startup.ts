@@ -48,6 +48,17 @@ export function validateWorkerHardenedConfig(): void {
   requireValue('CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY', env.EXECUTION_MANIFEST_PRIVATE_KEY);
 }
 
+/**
+ * Backend-selection policy. Unlike the hardened-mode validators, this runs
+ * unconditionally: a misconfigured backend must never half-start.
+ */
+export function validateSandboxBackendPolicy(): void {
+  if (env.SANDBOX_BACKEND !== 'lambda-microvm') return;
+  throw new SecureStartupConfigError(
+    'CODEAPI_SANDBOX_BACKEND=lambda-microvm is not yet available; unset it or use "http"',
+  );
+}
+
 export function validateEgressGatewayHardenedConfig(): void {
   if (!env.HARDENED_SANDBOX_MODE) return;
   rejectValue('CODEAPI_SYNTHETIC_ACCESS_TOKEN', process.env.CODEAPI_SYNTHETIC_ACCESS_TOKEN);

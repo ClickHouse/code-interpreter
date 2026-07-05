@@ -3,12 +3,14 @@ import { env } from './config';
 import {
   validateApiHardenedConfig,
   validateEgressGatewayHardenedConfig,
+  validateSandboxBackendPolicy,
   validateWorkerHardenedConfig,
 } from './secure-startup';
 
 const savedEnv = { ...process.env };
 const saved = {
   hardened: env.HARDENED_SANDBOX_MODE,
+  sandboxBackend: env.SANDBOX_BACKEND,
   gatewayUrl: env.EGRESS_GATEWAY_URL,
   grantSecret: env.EGRESS_GRANT_SECRET,
   privateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,
@@ -24,6 +26,7 @@ function restore(): void {
   }
   Object.assign(process.env, savedEnv);
   env.HARDENED_SANDBOX_MODE = saved.hardened;
+  env.SANDBOX_BACKEND = saved.sandboxBackend;
   env.EGRESS_GATEWAY_URL = saved.gatewayUrl;
   env.EGRESS_GRANT_SECRET = saved.grantSecret;
   env.EXECUTION_MANIFEST_PRIVATE_KEY = saved.privateKey;
@@ -118,5 +121,20 @@ describe('hardened CodeAPI startup config', () => {
     env.EGRESS_GRANT_SECRET = 'strong-egress-grant-secret-32-bytes';
     env.EGRESS_LEDGER_REQUIRED = false;
     expect(() => validateEgressGatewayHardenedConfig()).toThrow('CODEAPI_EGRESS_LEDGER_REQUIRED');
+  });
+});
+
+describe('sandbox backend policy', () => {
+  test('accepts the default http backend', () => {
+    env.SANDBOX_BACKEND = 'http';
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
+  });
+
+  test('rejects lambda-microvm regardless of hardened mode', () => {
+    env.SANDBOX_BACKEND = 'lambda-microvm';
+    env.HARDENED_SANDBOX_MODE = false;
+    expect(() => validateSandboxBackendPolicy()).toThrow('lambda-microvm is not yet available');
+    env.HARDENED_SANDBOX_MODE = true;
+    expect(() => validateSandboxBackendPolicy()).toThrow('lambda-microvm is not yet available');
   });
 });

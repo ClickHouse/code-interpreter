@@ -142,6 +142,16 @@ export const env = {
    */
   PTC_MODE: (process.env.PTC_MODE === 'blocking' ? 'blocking' : 'replay') as 'replay' | 'blocking',
   PTC_DEBUG: process.env.PTC_DEBUG === 'true',
+  /**
+   * Sandbox execution backend.
+   * - `http` (default): POST signed execute requests to SANDBOX_ENDPOINT
+   *   (current Kubernetes/libkrun sandbox-runner).
+   * - `lambda-microvm`: AWS Lambda MicroVM backend. Startup policy rejects
+   *   this value until the backend implementation lands.
+   */
+  SANDBOX_BACKEND: (process.env.CODEAPI_SANDBOX_BACKEND === 'lambda-microvm'
+    ? 'lambda-microvm'
+    : 'http') as 'http' | 'lambda-microvm',
 };
 
 const default_run_memory_limit = 256 * 1024 * 1024;

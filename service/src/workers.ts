@@ -3,25 +3,20 @@ import { Worker } from 'bullmq';
 import type * as t from './types';
 import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails, sandboxErrorMessageFromAxios } from './utils';
 import { jobProcessingDuration, jobsCompleted, jobsFailed, activeJobs, workerRunning } from './metrics';
-import { Jobs, Queues } from './enum';
+import { Queues } from './enum';
 import { connection } from './queue';
 import { env } from './config';
 import { summarizeSandboxResponse, summarizeText } from './execution-log';
 import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgressGrant } from './egress-gateway-client';
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
+import { getSandboxBackend } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
-import { injectTraceHeaders, withSpan, withTraceContext } from './telemetry';
+import { withSpan, withTraceContext } from './telemetry';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
 const WORKER_ID = `${INSTANCE_ID}-${process.pid}`;
-
-type SandboxLogResponse = t.ExecuteResponse & {
-  session_id: string;
-  files?: t.FileRefs;
-  run?: t.ExecuteResponse['run'];
-};
 
 function isAbortError(error: unknown): boolean {
   return axios.isAxiosError(error) && (error.name === 'AbortError' || error.code === 'ERR_CANCELED');
@@ -81,32 +76,28 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     });
     egressGrantTokenForRestore = egressGrantToken;
 
-    const response = await withSpan('codeapi.sandbox.execute', {
-      'http.request.method': 'POST',
-      'url.path': `/${Jobs.execute}`,
-      'codeapi.language': language,
-    }, () => axios.post<SandboxLogResponse>(
-        `${env.SANDBOX_ENDPOINT}/${Jobs.execute}`,
-        sandboxRequest.body,
-        {
-          headers: injectTraceHeaders(sandboxRequest.headers),
-          signal: controller.signal,
-        }
-      ), 'CLIENT');
-
-    if (response.status !== 200) {
-      throw new Error('Error from sandbox');
-    }
+    const responseRaw = await getSandboxBackend().execute(
+      { body: sandboxRequest.body, headers: sandboxRequest.headers },
+      {
+        executionId: job.data.executionId ?? '',
+        language,
+        isSynthetic: isSyntheticJob,
+        signal: controller.signal,
+        tenantId: job.data.tenantId,
+        canonicalUserId: job.data.canonicalUserId,
+        runtimeSessionMode: 'stateless',
+      },
+    );
 
     const responseData = egressGrantTokenForRestore
       ? await restoreGatewaySandboxResult({
         grantId: egressGrantId,
         egressGrantToken: egressGrantTokenForRestore,
-        result: response.data,
+        result: responseRaw,
         isSynthetic: isSyntheticJob,
         signal: controller.signal,
       })
-      : response.data;
+      : responseRaw;
 
     if (!isSyntheticJob) {
       logger.info('Sandbox response', summarizeSandboxResponse(responseData));
