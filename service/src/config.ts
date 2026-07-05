@@ -152,6 +152,19 @@ export const env = {
   SANDBOX_BACKEND: (process.env.CODEAPI_SANDBOX_BACKEND === 'lambda-microvm'
     ? 'lambda-microvm'
     : 'http') as 'http' | 'lambda-microvm',
+  /**
+   * Runtime session affinity for stateful sandbox backends.
+   * - `stateless` (default): no runtime sessions; `runtime_session_hint` ignored.
+   * - `affinity`: best-effort session reuse; contention falls back to a
+   *   stateless one-shot execution (correct because payloads always carry
+   *   file refs — warmth is only an optimization).
+   * - `strict`: sessions required; contention surfaces as HTTP 409.
+   */
+  RUNTIME_SESSION_MODE: (process.env.CODEAPI_RUNTIME_SESSION_MODE === 'affinity'
+    || process.env.CODEAPI_RUNTIME_SESSION_MODE === 'strict'
+    ? process.env.CODEAPI_RUNTIME_SESSION_MODE
+    : 'stateless') as 'stateless' | 'affinity' | 'strict',
+  RUNTIME_SESSION_LOCK_WAIT_MS: Number(process.env.CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS) || 15_000,
 };
 
 const default_run_memory_limit = 256 * 1024 * 1024;

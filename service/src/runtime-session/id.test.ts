@@ -1,0 +1,68 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  RUNTIME_SESSION_HINT_MAX_LENGTH,
+  RuntimeSessionHintError,
+  deriveRuntimeSessionId,
+  resolveRuntimeSessionIdForRequest,
+  validateRuntimeSessionHint,
+} from './id';
+
+const BASE = { storageNamespace: 'tenant-a', canonicalUserId: 'user-1' };
+
+describe('deriveRuntimeSessionId', () => {
+  test('is deterministic and shaped rt_<40 hex>', () => {
+    const first = deriveRuntimeSessionId({ ...BASE, hint: 'conv-1' });
+    const second = deriveRuntimeSessionId({ ...BASE, hint: 'conv-1' });
+    expect(first).toBe(second);
+    expect(first).toMatch(/^rt_[0-9a-f]{40}$/);
+  });
+
+  test('separates tenants, users, and hints', () => {
+    const base = deriveRuntimeSessionId({ ...BASE, hint: 'conv-1' });
+    expect(deriveRuntimeSessionId({ storageNamespace: 'tenant-b', canonicalUserId: 'user-1', hint: 'conv-1' })).not.toBe(base);
+    expect(deriveRuntimeSessionId({ storageNamespace: 'tenant-a', canonicalUserId: 'user-2', hint: 'conv-1' })).not.toBe(base);
+    expect(deriveRuntimeSessionId({ ...BASE, hint: 'conv-2' })).not.toBe(base);
+  });
+
+  test('absent hint maps to a stable per-user default session', () => {
+    expect(deriveRuntimeSessionId(BASE)).toBe(deriveRuntimeSessionId({ ...BASE, hint: undefined }));
+    expect(deriveRuntimeSessionId(BASE)).not.toBe(deriveRuntimeSessionId({ ...BASE, hint: 'conv-1' }));
+  });
+
+  test('field boundaries cannot be forged across namespace/user/hint', () => {
+    const a = deriveRuntimeSessionId({ storageNamespace: 'ten', canonicalUserId: 'ant-user', hint: 'h' });
+    const b = deriveRuntimeSessionId({ storageNamespace: 'ten-ant', canonicalUserId: 'user', hint: 'h' });
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('validateRuntimeSessionHint', () => {
+  test('passes through valid hints and treats absent/empty as undefined', () => {
+    expect(validateRuntimeSessionHint('conv_123.a:b-c')).toBe('conv_123.a:b-c');
+    expect(validateRuntimeSessionHint(undefined)).toBeUndefined();
+    expect(validateRuntimeSessionHint(null)).toBeUndefined();
+    expect(validateRuntimeSessionHint('')).toBeUndefined();
+  });
+
+  test('rejects non-strings, oversize, and forbidden characters', () => {
+    expect(() => validateRuntimeSessionHint(42)).toThrow(RuntimeSessionHintError);
+    expect(() => validateRuntimeSessionHint({})).toThrow(RuntimeSessionHintError);
+    expect(() => validateRuntimeSessionHint('x'.repeat(RUNTIME_SESSION_HINT_MAX_LENGTH + 1))).toThrow('at most');
+    expect(() => validateRuntimeSessionHint('has space')).toThrow('may only contain');
+    expect(() => validateRuntimeSessionHint('emoji🙂')).toThrow('may only contain');
+    expect(validateRuntimeSessionHint('x'.repeat(RUNTIME_SESSION_HINT_MAX_LENGTH))).toHaveLength(RUNTIME_SESSION_HINT_MAX_LENGTH);
+  });
+});
+
+describe('resolveRuntimeSessionIdForRequest', () => {
+  test('stateless mode never derives an id, even with a hint', () => {
+    expect(resolveRuntimeSessionIdForRequest({ mode: 'stateless', ...BASE, hint: 'conv-1' })).toBeUndefined();
+  });
+
+  test('affinity and strict modes derive the same id for the same inputs', () => {
+    const affinity = resolveRuntimeSessionIdForRequest({ mode: 'affinity', ...BASE, hint: 'conv-1' });
+    const strict = resolveRuntimeSessionIdForRequest({ mode: 'strict', ...BASE, hint: 'conv-1' });
+    expect(affinity).toBeDefined();
+    expect(affinity).toBe(strict as string);
+  });
+});

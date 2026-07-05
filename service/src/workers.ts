@@ -85,7 +85,8 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         signal: controller.signal,
         tenantId: job.data.tenantId,
         canonicalUserId: job.data.canonicalUserId,
-        runtimeSessionMode: 'stateless',
+        runtimeSessionId: job.data.runtimeSessionId,
+        runtimeSessionMode: env.RUNTIME_SESSION_MODE,
       },
     );
 

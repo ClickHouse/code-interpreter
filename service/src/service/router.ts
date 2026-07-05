@@ -18,6 +18,7 @@ import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
 import { getExecutionIdentity } from '../execution-identity';
+import { resolveRuntimeSessionIdForRequest, validateRuntimeSessionHint, RuntimeSessionHintError } from '../runtime-session/id';
 import { jobsSubmitted } from '../metrics';
 import { captureTraceCarrier, withSpan } from '../telemetry';
 import { Jobs, Languages } from '../enum';
@@ -133,6 +134,21 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     return res.status(400).json({ error: `Unsupported language: ${rawLang}` });
   }
 
+  let runtimeSessionId: string | undefined;
+  try {
+    runtimeSessionId = resolveRuntimeSessionIdForRequest({
+      mode: env.RUNTIME_SESSION_MODE,
+      storageNamespace: identity.storageNamespace,
+      canonicalUserId: identity.canonicalUserId,
+      hint: validateRuntimeSessionHint(body.runtime_session_hint),
+    });
+  } catch (error) {
+    if (error instanceof RuntimeSessionHintError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
@@ -219,6 +235,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         executionId: execution_id,
         tenantId: identity.storageNamespace,
         canonicalUserId: identity.canonicalUserId,
+        ...(runtimeSessionId != null ? { runtimeSessionId } : {}),
         executionManifestClaims: sandboxSecurity.executionManifestClaims,
         egressGrantClaims: sandboxSecurity.egressGrantClaims,
         egressGrantToken: sandboxSecurity.egressGrantToken,

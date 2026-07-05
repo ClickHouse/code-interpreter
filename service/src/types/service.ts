@@ -128,6 +128,13 @@ export interface RequestBody {
   args?: string[];
   user_id?: string;
   files?: RequestFile[];
+  /**
+   * Optional stable identity hint (e.g. conversation id) for stateful
+   * runtime sessions. Never a security boundary: the server derives the
+   * final runtime session id as hash(tenant, user, hint). Ignored when
+   * CODEAPI_RUNTIME_SESSION_MODE is `stateless`.
+   */
+  runtime_session_hint?: string;
 }
 
 export type CreatePayload = { req: AuthenticatedRequest, session_id: string; isPyPlot?: boolean };
@@ -227,6 +234,8 @@ export type JobData = {
   executionId?: string;
   tenantId?: string;
   canonicalUserId?: string;
+  /** Server-derived runtime session identity (absent ⇒ stateless execution). */
+  runtimeSessionId?: string;
   executionManifestClaims?: ExecutionManifestClaims;
   /** Raw grant claims retained only for service-worker dispatch so grant
    * expiry is anchored to sandbox start, not BullMQ enqueue time. */
