@@ -234,6 +234,27 @@ export const microvmActiveSessions = new Gauge({
   help: 'Live runtime sessions tracked in the registry active set',
 });
 
+export const microvmCheckpoints = new Counter({
+  name: 'codeapi_microvm_checkpoints_total',
+  help: 'Session workspace checkpoint attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmRestores = new Counter({
+  name: 'codeapi_microvm_restores_total',
+  help: 'Session workspace restore attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmCheckpointBytes = new Histogram({
+  name: 'codeapi_microvm_checkpoint_bytes',
+  help: 'Size of stored session workspace checkpoints',
+  buckets: [
+    1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024,
+    256 * 1024 * 1024, 512 * 1024 * 1024,
+  ],
+});
+
 // -- Helpers for serving metrics --
 
 export async function metricsHandler(_req: unknown, res: { set: (key: string, value: string) => void; send: (data: string) => void }): Promise<void> {

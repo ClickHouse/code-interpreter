@@ -37,6 +37,7 @@ export interface RuntimeSessionRecord {
   last_seen_at: number;
   hard_deadline_at?: number;
   workspace_checkpoint?: string;
+  checkpointed_at?: number;
   last_error?: string;
 }
 

@@ -1,6 +1,7 @@
 import type { SandboxBackend } from './types';
 import { LambdaMicrovmSandboxBackend } from './lambda-microvm';
 import { HttpSandboxBackend } from './http';
+import { MinioCheckpointStore } from '../runtime-session/checkpoint-store';
 import { env } from '../config';
 
 export type { SandboxBackend, SandboxExecuteContext, SandboxRawResponse, SandboxTransportRequest } from './types';
@@ -34,7 +35,17 @@ function createBackend(): SandboxBackend {
         idleSeconds: env.LAMBDA_MICROVM_IDLE_SECONDS,
         suspendedSeconds: env.LAMBDA_MICROVM_SUSPEND_SECONDS,
         lockWaitMs: env.RUNTIME_SESSION_LOCK_WAIT_MS,
+        checkpointsEnabled: env.SESSION_CHECKPOINTS,
+        checkpoint: {
+          port: env.LAMBDA_MICROVM_PORT,
+          authTokenTtlSeconds: env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS,
+          maxBytes: env.CHECKPOINT_MAX_BYTES,
+          timeoutMs: env.CHECKPOINT_TIMEOUT_MS,
+        },
       },
+      checkpointStore: env.SESSION_CHECKPOINTS && env.RUNTIME_SESSION_MODE !== 'stateless'
+        ? new MinioCheckpointStore()
+        : undefined,
     });
   }
   return new HttpSandboxBackend();

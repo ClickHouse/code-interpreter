@@ -12,7 +12,9 @@ import {
   readRuntimeSessionRecord,
   resetRedisForTests as resetRegistryRedis,
   setRedisForTests as setRegistryRedis,
+  writeRuntimeSessionRecord,
 } from '../runtime-session/registry';
+import { MemoryCheckpointStore, checkpointObjectKey } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmSandboxBackend, normalizeMicrovmEndpoint, type LambdaMicrovmBackendConfig } from './lambda-microvm';
 import { SandboxBackendError } from './types';
 import type { SandboxExecuteContext, SandboxTransportRequest } from './types';
@@ -25,6 +27,7 @@ let captured: CapturedRequest[] = [];
 let healthStatus = 200;
 let executeDelayMs = 0;
 let mock: InstanceType<typeof RedisMock>;
+const checkpointBlob = 'FAKE_TAR_GZ_BYTES';
 
 const EXECUTE_RESPONSE = {
   session_id: 'sess_exec_1',
@@ -58,6 +61,15 @@ beforeAll(() => {
           await new Promise((resolve) => setTimeout(resolve, executeDelayMs));
         }
         return new Response(JSON.stringify(EXECUTE_RESPONSE), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (path === '/api/v2/session/checkpoint') {
+        return new Response(checkpointBlob, { status: 200, headers: { 'Content-Type': 'application/x-gtar' } });
+      }
+      if (path === '/api/v2/session/restore') {
+        return new Response(JSON.stringify({ status: 'restored' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -101,15 +113,22 @@ function config(overrides: Partial<LambdaMicrovmBackendConfig> = {}): LambdaMicr
     idleSeconds: 300,
     suspendedSeconds: 1_800,
     lockWaitMs: 500,
+    checkpointsEnabled: false,
+    checkpoint: { port: 8080, authTokenTtlSeconds: 300, maxBytes: 512 * 1024 * 1024, timeoutMs: 30_000 },
     ...overrides,
   };
 }
 
-function makeBackend(fake: FakeLambdaMicrovmClient, cfg?: Partial<LambdaMicrovmBackendConfig>): LambdaMicrovmSandboxBackend {
+function makeBackend(
+  fake: FakeLambdaMicrovmClient,
+  cfg?: Partial<LambdaMicrovmBackendConfig>,
+  checkpointStore?: MemoryCheckpointStore,
+): LambdaMicrovmSandboxBackend {
   return new LambdaMicrovmSandboxBackend({
     clientFactory: () => Promise.resolve(fake),
     config: config(cfg),
     pollIntervalMs: 5,
+    checkpointStore,
   });
 }
 
@@ -357,5 +376,91 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(runArgs.runHookPayload).toBeUndefined();
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
     expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+});
+
+describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
+  function sessionContext(overrides: Partial<SandboxExecuteContext> = {}): SandboxExecuteContext {
+    return context({
+      runtimeSessionId: 'rt_ckpt_1',
+      runtimeSessionMode: 'affinity',
+      tenantId: 'tenant-a',
+      canonicalUserId: 'user-1',
+      ...overrides,
+    });
+  }
+  const cfgOn: Partial<LambdaMicrovmBackendConfig> = { checkpointsEnabled: true };
+
+  test('checkpoints the workspace after a session exec and records the pointer', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, cfgOn, store);
+
+    await backend.execute(request(), sessionContext());
+
+    const checkpoints = captured.filter((c) => c.path === '/api/v2/session/checkpoint');
+    expect(checkpoints).toHaveLength(1);
+    expect(store.objects.get('rt_ckpt_1')?.toString()).toBe(checkpointBlob);
+    const record = await readRuntimeSessionRecord('rt_ckpt_1');
+    expect(record?.workspace_checkpoint).toBe(checkpointObjectKey('rt_ckpt_1'));
+    expect(record?.checkpointed_at).toBeGreaterThan(0);
+  });
+
+  test('a relaunched VM restores the checkpoint before the first exec', async () => {
+    const store = new MemoryCheckpointStore();
+    await store.put('rt_ckpt_1', Buffer.from('PRIOR_WORKSPACE'));
+    /* Seed a terminated prior session so findOrLaunch relaunches. */
+    const seedToken = await acquireRuntimeSessionLock('rt_ckpt_1', 60_000);
+    await writeRuntimeSessionRecord({
+      runtime_session_id: 'rt_ckpt_1', tenant_id: 'tenant-a', canonical_user_id: 'user-1',
+      state: 'TERMINATED', generation: 3, last_seen_at: 1, workspace_checkpoint: checkpointObjectKey('rt_ckpt_1'),
+    }, seedToken as string);
+    const { releaseRuntimeSessionLock } = await import('../runtime-session/registry');
+    await releaseRuntimeSessionLock('rt_ckpt_1', seedToken as string);
+
+    const fake = fakeClient();
+    const backend = makeBackend(fake, cfgOn, store);
+    const result = await backend.execute(request(), sessionContext());
+    expect(result).toEqual(EXECUTE_RESPONSE);
+
+    const paths = captured.map((c) => c.path);
+    /* restore precedes execute on the fresh VM. */
+    expect(paths.indexOf('/api/v2/session/restore')).toBeGreaterThanOrEqual(0);
+    expect(paths.indexOf('/api/v2/session/restore')).toBeLessThan(paths.indexOf('/api/v2/execute'));
+    expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+  });
+
+  test('reuse (warm VM) does not restore — no prior expiry', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, cfgOn, store);
+
+    await backend.execute(request(), sessionContext());
+    captured = [];
+    await backend.execute(request(), sessionContext());
+
+    expect(captured.filter((c) => c.path === '/api/v2/session/restore')).toHaveLength(0);
+    expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+  });
+
+  test('disabled checkpoints skip both checkpoint and restore', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, { checkpointsEnabled: false }, store);
+    await backend.execute(request(), sessionContext());
+    expect(captured.filter((c) => c.path.startsWith('/api/v2/session/'))).toHaveLength(0);
+    expect(store.objects.size).toBe(0);
+  });
+
+  test('a failed checkpoint is non-fatal — the exec still succeeds', async () => {
+    const fake = fakeClient();
+    const failing: MemoryCheckpointStore = new MemoryCheckpointStore();
+    failing.put = () => Promise.reject(new Error('S3 down'));
+    const backend = makeBackend(fake, cfgOn, failing);
+    const result = await backend.execute(request(), sessionContext());
+    expect(result).toEqual(EXECUTE_RESPONSE);
+    const record = await readRuntimeSessionRecord('rt_ckpt_1');
+    expect(record?.state).toBe('RUNNING');
+    expect(record?.workspace_checkpoint).toBeUndefined();
   });
 });

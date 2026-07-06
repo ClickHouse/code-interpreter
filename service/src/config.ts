@@ -192,6 +192,13 @@ export const env = {
   LAMBDA_MICROVM_RESUME_TPS: Number(process.env.LAMBDA_MICROVM_RESUME_TPS) || 4,
   LAMBDA_MICROVM_SUSPEND_TPS: Number(process.env.LAMBDA_MICROVM_SUSPEND_TPS) || 1,
   LAMBDA_MICROVM_ALLOW_SHELL: process.env.LAMBDA_MICROVM_ALLOW_SHELL === 'true',
+  /* Session workspace checkpoints (effective only in affinity/strict modes).
+   * On by default so VM expiry/eviction recovery is automatic; the byte cap
+   * bounds tar size pulled from the VM and stored to S3. */
+  SESSION_CHECKPOINTS: process.env.CODEAPI_SESSION_CHECKPOINTS !== 'false',
+  CHECKPOINT_MAX_BYTES: Number(process.env.CODEAPI_CHECKPOINT_MAX_BYTES) || 512 * 1024 * 1024,
+  CHECKPOINT_TIMEOUT_MS: Number(process.env.CODEAPI_CHECKPOINT_TIMEOUT_MS) || 60_000,
+  CHECKPOINT_PREFIX: process.env.CODEAPI_CHECKPOINT_PREFIX ?? 'rtsx-checkpoints/',
 };
 
 const default_run_memory_limit = 256 * 1024 * 1024;

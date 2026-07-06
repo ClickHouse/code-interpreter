@@ -3,8 +3,11 @@ import { nanoid } from 'nanoid';
 import type { LambdaMicrovmClient, MicrovmDescription, MicrovmIdlePolicy } from '../runtime-session/lambda-client';
 import type { SandboxBackend, SandboxExecuteContext, SandboxRawResponse, SandboxTransportRequest } from './types';
 import type { RuntimeSessionRecord } from '../runtime-session/registry';
+import type { CheckpointConfig } from '../runtime-session/checkpoint';
+import type { CheckpointStore } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmApiError } from '../runtime-session/lambda-client';
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
+import { checkpointSession, restoreSession } from '../runtime-session/checkpoint';
 import {
   allocateRuntimeSessionGeneration,
   readRuntimeSessionRecord,
@@ -49,12 +52,18 @@ export interface LambdaMicrovmBackendConfig {
   idleSeconds: number;
   suspendedSeconds: number;
   lockWaitMs: number;
+  /* Auto-checkpoint. When disabled, session VMs still reuse a warm workspace
+   * but expiry recovery falls back to file refs (no cross-VM restore). */
+  checkpointsEnabled: boolean;
+  checkpoint: CheckpointConfig;
 }
 
 interface LambdaMicrovmBackendDeps {
   clientFactory: () => Promise<LambdaMicrovmClient>;
   config: LambdaMicrovmBackendConfig;
   pollIntervalMs?: number;
+  /** Injected in session+checkpoint mode; undefined disables checkpoints. */
+  checkpointStore?: CheckpointStore;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,11 +100,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
   private readonly config: LambdaMicrovmBackendConfig;
   private readonly clientFactory: () => Promise<LambdaMicrovmClient>;
   private readonly pollIntervalMs: number;
+  private readonly checkpointStore: CheckpointStore | undefined;
 
   constructor(deps: LambdaMicrovmBackendDeps) {
     this.clientFactory = deps.clientFactory;
     this.config = deps.config;
     this.pollIntervalMs = deps.pollIntervalMs ?? 500;
+    this.checkpointStore = deps.checkpointStore;
+  }
+
+  private checkpointsActive(): boolean {
+    return this.config.checkpointsEnabled && this.checkpointStore !== undefined;
   }
 
   private client(): Promise<LambdaMicrovmClient> {
@@ -164,8 +179,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * generation, deadline, and image fields. */
       const now = Date.now();
       const settled = await readRuntimeSessionRecord(runtimeSessionId);
-      if (settled) {
-        await writeRuntimeSessionRecord({ ...settled, state: 'RUNNING', last_seen_at: now }, lockToken);
+      const nextRecord = settled
+        ? await this.checkpointUnderLock(client, settled, runtimeSessionId, now, lockToken)
+        : undefined;
+      if (nextRecord) {
+        await writeRuntimeSessionRecord(nextRecord, lockToken);
       }
       await touchRuntimeSessionActive(runtimeSessionId, now);
       return result;
@@ -237,7 +255,54 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       await this.terminate(client, vm.microvmId, 'error');
       throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after launch`);
     }
+
+    /* Fresh VM for an existing session: restore its predecessor's workspace
+     * before the first execute, so an 8h rollover / eviction is invisible.
+     * A prior record (or a checkpoint pointer) means the session existed. */
+    if (this.checkpointStore && this.checkpointsActive() && (record?.workspace_checkpoint || record != null)) {
+      await restoreSession({
+        client,
+        store: this.checkpointStore,
+        runtimeSessionId,
+        microvmId: vm.microvmId,
+        endpointBase: normalizeMicrovmEndpoint(vm.endpoint ?? ''),
+        config: this.config.checkpoint,
+      });
+    }
     return vm;
+  }
+
+  /**
+   * Pulls a checkpoint from the still-warm VM while the exec lock is held and
+   * stores it, returning the record to persist (with the checkpoint pointer)
+   * or the liveness-only update if checkpoints are off/failed. Never throws —
+   * a missed checkpoint degrades to file-ref recovery.
+   */
+  private async checkpointUnderLock(
+    client: LambdaMicrovmClient,
+    record: RuntimeSessionRecord,
+    runtimeSessionId: string,
+    now: number,
+    lockToken: string,
+  ): Promise<RuntimeSessionRecord> {
+    const base: RuntimeSessionRecord = { ...record, state: 'RUNNING', last_seen_at: now };
+    if (!this.checkpointStore || !this.checkpointsActive() || !record.microvm_id || !record.endpoint) {
+      return base;
+    }
+    const result = await checkpointSession({
+      client,
+      store: this.checkpointStore,
+      runtimeSessionId,
+      config: this.config.checkpoint,
+      normalizeEndpoint: normalizeMicrovmEndpoint,
+      lockToken,
+    });
+    /* checkpointSession wrote the pointer under our lock on success; re-read
+     * so we don't clobber it with our stale `base`. */
+    if (result === 'stored') {
+      return (await readRuntimeSessionRecord(runtimeSessionId)) ?? base;
+    }
+    return base;
   }
 
   private async proxyExecute(
