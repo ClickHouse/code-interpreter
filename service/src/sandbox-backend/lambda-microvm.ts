@@ -29,11 +29,13 @@ import { SandboxBackendError } from './types';
 import { Jobs } from '../enum';
 import logger from '../logger';
 
-/** Payload delivered to the MicroVM /run hook to activate the runner's
- *  persistent session workspace (see api/src/session-workspace.ts). */
-function sessionRunHookPayload(runtimeSessionId: string): string {
-  return JSON.stringify({ runtime_session_id: runtimeSessionId, session_workspace: true });
-}
+/** Header that opts a proxied /execute into the runner's persistent session
+ *  workspace (see api/src/session-workspace.ts). Session mode is delivered
+ *  per-request, not via a /run lifecycle hook — Lambda's build hooks require
+ *  the snapshot-compatible base container image to route, and enabling any
+ *  runtime hook forces the /ready build hook (which never reaches a stock
+ *  container's listener), so hookless + per-request keeps image builds sound. */
+const RUNTIME_SESSION_ID_HEADER = 'X-Runtime-Session-Id';
 
 export interface LambdaMicrovmBackendConfig {
   imageArn: string;
@@ -78,7 +80,6 @@ export function normalizeMicrovmEndpoint(endpoint: string): string {
 
 interface LaunchOptions {
   clientToken: string;
-  runHookPayload?: string;
   idlePolicy?: MicrovmIdlePolicy;
   maxDurationSeconds: number;
 }
@@ -89,8 +90,9 @@ interface LaunchOptions {
  * - **stateless** (no runtime session): one VM per execution — run, execute,
  *   terminate. Correct and simple; the default.
  * - **session** (affinity/strict): find-or-launch one warm VM per
- *   `runtime_session_id` via the registry, deliver the /run payload that
- *   activates the runner's persistent workspace, and reuse it across calls.
+ *   `runtime_session_id` via the registry, stamp that id on every proxied
+ *   /execute (the header that activates the runner's persistent workspace),
+ *   and reuse the VM across calls.
  *   AWS `idlePolicy` auto-suspends the VM when idle and auto-resumes it on the
  *   next request, so there is no explicit resume in the execute path.
  */
@@ -173,7 +175,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
       const vm = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
-      const result = await this.proxyExecute(client, vm, req, ctx);
+      const result = await this.proxyExecute(client, vm, req, ctx, runtimeSessionId);
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
@@ -227,7 +229,6 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     const launchedAt = Date.now();
     const vm = await this.launch(client, ctx, {
       clientToken: `sess-${runtimeSessionId}-${generation}`,
-      runHookPayload: sessionRunHookPayload(runtimeSessionId),
       idlePolicy: {
         maxIdleSeconds: this.config.idleSeconds,
         suspendedSeconds: this.config.suspendedSeconds,
@@ -310,6 +311,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     vm: MicrovmDescription,
     req: SandboxTransportRequest,
     ctx: SandboxExecuteContext,
+    runtimeSessionId?: string,
   ): Promise<SandboxRawResponse> {
     const base = normalizeMicrovmEndpoint(vm.endpoint ?? '');
     const token = await client.createMicrovmAuthToken({
@@ -318,6 +320,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       ttlSeconds: this.config.authTokenTtlSeconds,
     });
     await this.assertHealthy(base, token.token, ctx);
+
+    /* Session mode is opted into per-request via this header (not a /run
+     * lifecycle hook): stock container images can't route Lambda's build
+     * hooks, so the runner reads its runtime session id straight off the
+     * proxied execute. Header-only — never the manifest-signed body. */
+    const sessionHeader = runtimeSessionId
+      ? { [RUNTIME_SESSION_ID_HEADER]: runtimeSessionId }
+      : undefined;
 
     return withSpan('codeapi.sandbox.execute', {
       'http.request.method': 'POST',
@@ -332,6 +342,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           headers: {
             ...injectTraceHeaders(req.headers),
             [token.headerName]: token.token,
+            ...sessionHeader,
           },
           signal: ctx.signal,
         },
@@ -372,7 +383,6 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         ingressConnectorArns: this.config.ingressConnectorArns,
         egressConnectorArns: this.config.egressConnectorArns,
         maximumDurationSeconds: opts.maxDurationSeconds,
-        runHookPayload: opts.runHookPayload,
         idlePolicy: opts.idlePolicy,
         clientToken: opts.clientToken,
       });

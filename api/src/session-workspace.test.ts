@@ -8,6 +8,7 @@ import {
   bindSessionWorkspace,
   getBoundSessionWorkspace,
   parseSessionBinding,
+  parseSessionBindingFromHeader,
   resetSessionWorkspaceStateForTests,
   unbindSessionWorkspace,
 } from './session-workspace';
@@ -37,6 +38,28 @@ describe('parseSessionBinding (gating)', () => {
     expect(parseSessionBinding(JSON.stringify({ runtimeSessionId: 'rt_1' }))).toBeUndefined();
     expect(parseSessionBinding(JSON.stringify({ session_workspace: true }))).toBeUndefined();
     expect(parseSessionBinding(JSON.stringify({ session_workspace: true, runtime_session_id: '' }))).toBeUndefined();
+  });
+});
+
+describe('parseSessionBindingFromHeader (per-request opt-in)', () => {
+  test('returns undefined when the image-level flag is off', () => {
+    config.session_workspace_enabled = false;
+    expect(parseSessionBindingFromHeader('rt_abc123')).toBeUndefined();
+  });
+
+  test('binds a well-formed id when enabled (presence of the header is the opt-in)', () => {
+    config.session_workspace_enabled = true;
+    expect(parseSessionBindingFromHeader('rt_abc123')).toEqual({ runtimeSessionId: 'rt_abc123' });
+    expect(parseSessionBindingFromHeader('  rt_abc123  ')).toEqual({ runtimeSessionId: 'rt_abc123' });
+  });
+
+  test('rejects missing, empty, repeated, or malformed headers', () => {
+    config.session_workspace_enabled = true;
+    expect(parseSessionBindingFromHeader(undefined)).toBeUndefined();
+    expect(parseSessionBindingFromHeader('')).toBeUndefined();
+    expect(parseSessionBindingFromHeader(['rt_a', 'rt_b'])).toBeUndefined();
+    expect(parseSessionBindingFromHeader('rt bad space')).toBeUndefined();
+    expect(parseSessionBindingFromHeader('a'.repeat(129))).toBeUndefined();
   });
 
   test('tolerates absent and non-JSON payloads', () => {

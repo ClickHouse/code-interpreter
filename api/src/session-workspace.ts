@@ -20,10 +20,23 @@ import {
  *
  * Gated by two independent locks (both required): the image-level
  * `SANDBOX_SESSION_WORKSPACE_ENABLED` (true only in the Lambda MicroVM runner
- * target) and a per-launch `/run` runHookPayload opting in. When neither is
- * active, `getBoundSessionWorkspace()` returns undefined and the runner falls
- * back to the untouched fresh-per-job path.
+ * target) and a per-request opt-in. The control plane opts a VM into session
+ * mode by stamping the derived runtime session id on every `/execute` via the
+ * `X-Runtime-Session-Id` header (see `parseSessionBindingFromHeader`). When
+ * neither lock is active, `getBoundSessionWorkspace()` returns undefined and
+ * the runner falls back to the untouched fresh-per-job path.
+ *
+ * The header, not a `/run` lifecycle hook, is the delivery mechanism: Lambda's
+ * image build hooks require the snapshot-compatible Lambda base container image
+ * to route, and enabling any runtime hook forces the `/ready` build hook, which
+ * never reaches a stock container's listener. Per-request signaling keeps image
+ * builds hookless (reliable) and needs no snapshot handshake.
  */
+
+/** Wire contract with the Lambda backend (`service/src/sandbox-backend`). */
+export const RUNTIME_SESSION_ID_HEADER = 'x-runtime-session-id';
+
+const RUNTIME_SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface SessionBinding {
   runtimeSessionId: string;
@@ -51,6 +64,23 @@ export function parseSessionBinding(runHookPayload: string | undefined): Session
     return undefined;
   }
   return { runtimeSessionId: parsed.runtime_session_id };
+}
+
+/** Per-request session opt-in from the `X-Runtime-Session-Id` header. Presence
+ *  of a well-formed id is the opt-in; the header is only honored on the Lambda
+ *  MicroVM runner target (`session_workspace_enabled`). Header values arrive as
+ *  `string | string[]` from Node — a repeated header is malformed, so reject. */
+export function parseSessionBindingFromHeader(
+  headerValue: string | string[] | undefined,
+): SessionBinding | undefined {
+  if (!config.session_workspace_enabled) return undefined;
+  if (typeof headerValue !== 'string') return undefined;
+  const runtimeSessionId = headerValue.trim();
+  if (!RUNTIME_SESSION_ID_PATTERN.test(runtimeSessionId)) {
+    if (runtimeSessionId.length > 0) logger.warn('Ignoring malformed X-Runtime-Session-Id header');
+    return undefined;
+  }
+  return { runtimeSessionId };
 }
 
 export class SessionWorkspace {

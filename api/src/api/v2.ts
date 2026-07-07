@@ -12,7 +12,12 @@ import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
-import { getBoundSessionWorkspace } from '../session-workspace';
+import {
+  RUNTIME_SESSION_ID_HEADER,
+  bindSessionWorkspace,
+  getBoundSessionWorkspace,
+  parseSessionBindingFromHeader,
+} from '../session-workspace';
 import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
 
 const router = express.Router();
@@ -132,6 +137,7 @@ function getJob(
   egressGrantToken?: string,
   toolCallSocketEnabled = false,
   isSynthetic = false,
+  runtimeSessionHeader?: string | string[],
 ): Job {
   const {
     session_id, language, version, args, stdin, files,
@@ -172,6 +178,9 @@ function getJob(
   }
 
   validateConstraints(body, rt);
+
+  const binding = parseSessionBindingFromHeader(runtimeSessionHeader);
+  if (binding) bindSessionWorkspace(binding);
 
   return new Job({
     session_id: session_id ?? null,
@@ -327,6 +336,7 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
         tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
         toolCallSocketEnabled,
         verifiedManifest?.principal_source === SYNTHETIC_PRINCIPAL_SOURCE,
+        req.headers[RUNTIME_SESSION_ID_HEADER],
       );
       metricsLanguage = job.runtime.language;
       markActiveExecution();

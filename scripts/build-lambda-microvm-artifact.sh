@@ -79,15 +79,19 @@ Next (spike item 2):
     --code-artifact "uri=$key" \\
     --base-image-arn arn:aws:lambda:\${AWS_REGION}:aws:microvm-image:al2023-1 \\
     --build-role-arn <build-role-with-s3+ecr-read> \\
-    --hook-port 8080 \\
+    --additional-os-capabilities '["ALL"]' \\
     --region \${AWS_REGION}
 
 Notes:
 - env vars (SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY, SANDBOX_REQUIRE_EGRESS_MANIFEST,
   EGRESS_GATEWAY_URL, SANDBOX_ALLOWED_LOCAL_NETWORK_PORT) are image-build-time
   config: pass them via --environment-variables on create/update-microvm-image.
-- /ready + /run/resume/suspend/terminate hooks are served on port 8080 at
-  /aws/lambda-microvms/runtime/v1/*.
+- Build the image HOOKLESS (no --hooks). Lambda's image build hooks only route
+  on the snapshot-compatible Lambda base container image, and enabling any
+  runtime hook forces the /ready build hook, which never reaches a stock
+  container's listener (builds then fail at the ready timeout). Session mode is
+  delivered per-request via the X-Runtime-Session-Id header instead; idle
+  suspend/resume is handled by RunMicrovm's native idlePolicy.
 EOF
 }
 

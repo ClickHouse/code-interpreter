@@ -285,7 +285,7 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     });
   }
 
-  test('launches a session VM with the workspace runHookPayload + idlePolicy and records it', async () => {
+  test('launches a hookless session VM (idlePolicy, no runHookPayload) and stamps the workspace header on execute', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
 
@@ -298,13 +298,15 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
       clientToken?: string;
       maximumDurationSeconds: number;
     };
-    expect(JSON.parse(runArgs.runHookPayload as string)).toEqual({
-      runtime_session_id: 'rt_session_1',
-      session_workspace: true,
-    });
+    /* Session mode is delivered per-request via the header, never a /run hook
+     * (image builds stay hookless), so RunMicrovm carries no runHookPayload. */
+    expect(runArgs.runHookPayload).toBeUndefined();
     expect(runArgs.idlePolicy?.autoResume).toBe(true);
     expect(runArgs.clientToken).toBe('sess-rt_session_1-1');
     expect(runArgs.maximumDurationSeconds).toBe(28_800);
+
+    const executeReq = captured.find((c) => c.path === '/api/v2/execute');
+    expect(executeReq?.headers['x-runtime-session-id']).toBe('rt_session_1');
 
     const record = await readRuntimeSessionRecord('rt_session_1');
     expect(record?.state).toBe('RUNNING');
