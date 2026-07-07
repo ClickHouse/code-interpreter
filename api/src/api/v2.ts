@@ -468,19 +468,30 @@ router.get('/runtimes', (_req: Request, res: Response) => {
 /* Bind the session from the header before checkpoint/restore. These run BEFORE
  * the first /execute on a relaunched VM, so in the hookless design nothing else
  * has bound the workspace yet; without this the handlers 409 and a real restore
- * silently continues with an empty workspace (checkpoint state lost on expiry). */
-function bindSessionFromHeader(req: Request): void {
+ * silently continues with an empty workspace (checkpoint state lost on expiry).
+ * Returns false (→ fail closed) when this request carries no valid header, so a
+ * headerless/malformed request never operates on a stale prior session. */
+function bindSessionFromHeader(req: Request): boolean {
   const binding = parseSessionBindingFromHeader(req.headers[RUNTIME_SESSION_ID_HEADER]);
-  if (binding) bindSessionWorkspace(binding);
+  if (!binding) return false;
+  bindSessionWorkspace(binding);
+  return true;
 }
 
-router.get('/session/checkpoint', (req: Request, res: Response) => {
-  bindSessionFromHeader(req);
-  return streamSessionCheckpoint(res);
+/* Express 4 (pinned) does NOT auto-forward rejected route-handler promises, so
+ * `.catch(next)` is required or a rejection (e.g. session.ownership()) hangs the
+ * request and surfaces as an unhandled rejection instead of a 5xx. */
+router.get('/session/checkpoint', (req: Request, res: Response, next: NextFunction) => {
+  if (!bindSessionFromHeader(req)) {
+    return res.status(409).json({ message: 'Missing runtime session header' });
+  }
+  return streamSessionCheckpoint(res).catch(next);
 });
-router.post('/session/restore', (req: Request, res: Response) => {
-  bindSessionFromHeader(req);
-  return restoreSessionCheckpoint(req, res);
+router.post('/session/restore', (req: Request, res: Response, next: NextFunction) => {
+  if (!bindSessionFromHeader(req)) {
+    return res.status(409).json({ message: 'Missing runtime session header' });
+  }
+  return restoreSessionCheckpoint(req, res).catch(next);
 });
 
 export default router;

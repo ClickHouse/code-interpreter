@@ -26,6 +26,7 @@ let server: ReturnType<typeof Bun.serve>;
 let captured: CapturedRequest[] = [];
 let healthStatus = 200;
 let executeDelayMs = 0;
+let executeStatus = 200;
 let mock: InstanceType<typeof RedisMock>;
 const checkpointBlob = 'FAKE_TAR_GZ_BYTES';
 
@@ -61,7 +62,7 @@ beforeAll(() => {
           await new Promise((resolve) => setTimeout(resolve, executeDelayMs));
         }
         return new Response(JSON.stringify(EXECUTE_RESPONSE), {
-          status: 200,
+          status: executeStatus,
           headers: { 'Content-Type': 'application/json' },
         });
       }
@@ -92,6 +93,7 @@ beforeEach(async () => {
   captured = [];
   healthStatus = 200;
   executeDelayMs = 0;
+  executeStatus = 200;
 });
 
 afterEach(() => {
@@ -325,6 +327,20 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
     const executes = captured.filter((c) => c.path === '/api/v2/execute');
     expect(executes).toHaveLength(2);
+  });
+
+  test('a runner non-2xx keeps the warm VM (does not tear down the session)', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    executeStatus = 500;
+    /* The runner responded (500) — the VM is alive, only the request failed —
+     * so the session must NOT be terminated (regression: the error-classifier
+     * previously tore down any error that wasn't literally "Error from sandbox"). */
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow();
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    const record = await readRuntimeSessionRecord('rt_session_1');
+    expect(record?.state).toBe('RUNNING');
   });
 
   test('two concurrent executions on one session serialize on the registry lock', async () => {

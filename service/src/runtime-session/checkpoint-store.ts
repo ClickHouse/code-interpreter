@@ -63,7 +63,14 @@ export class MinioCheckpointStore implements CheckpointStore {
     }
     const stream = await this.client.getObject(this.bucket, key);
     const chunks: Buffer[] = [];
+    let total = 0;
     for await (const chunk of stream) {
+      /* Cap during download too: the object can grow between statObject and here
+       * (a concurrent put), and the stat size alone wouldn't catch it. */
+      total += (chunk as Buffer).length;
+      if (total > maxBytes) {
+        throw new CheckpointTooLargeError(`checkpoint exceeded maxBytes ${maxBytes}B during download`);
+      }
       chunks.push(chunk as Buffer);
     }
     return Buffer.concat(chunks);

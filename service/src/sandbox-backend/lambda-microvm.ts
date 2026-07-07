@@ -219,7 +219,15 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     try {
       return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId);
     } catch (error) {
-      const sandboxResponded = error instanceof Error && error.message === 'Error from sandbox';
+      /* Keep the warm VM only when the runner actually responded — a non-2xx
+       * makes axios throw an AxiosError carrying `.response`, so the VM is alive
+       * and just the request failed. No response (connection/timeout/abort) or a
+       * failed health check means the VM is unreachable/dirty: terminate it and
+       * drop the record so the next call relaunches + restores. (`Error from
+       * sandbox` covers proxyExecute's manual 2xx-but-not-200 throw.) */
+      const sandboxResponded =
+        (axios.isAxiosError(error) && error.response != null) ||
+        (error instanceof Error && error.message === 'Error from sandbox');
       if (ctx.signal.aborted || !sandboxResponded) {
         await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
@@ -236,10 +244,19 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     lockToken: string,
   ): Promise<MicrovmDescription> {
     const deadlineHeadroomMs = this.config.jobTimeoutMs + 30_000;
+    /* A record whose image/version/port no longer match the current config was
+     * launched by an older deploy — relaunch on the current config rather than
+     * reuse it (a changed port would otherwise health-check the wrong port and
+     * fail as UNHEALTHY instead of cleanly relaunching). */
+    const configMatches = record
+      && record.image_arn === this.config.imageArn
+      && record.image_version === this.config.imageVersion
+      && record.port === this.config.port;
     const reusable = record
       && record.state === 'RUNNING'
       && record.microvm_id
       && record.endpoint
+      && configMatches
       && (record.hard_deadline_at == null || record.hard_deadline_at - Date.now() > deadlineHeadroomMs);
     if (reusable && record) {
       /* Reuse the warm VM. If AWS auto-suspended it, the proxy request
