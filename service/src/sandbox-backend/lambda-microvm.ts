@@ -12,6 +12,7 @@ import {
   allocateRuntimeSessionGeneration,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
+  removeRuntimeSession,
   touchRuntimeSessionActive,
   waitForRuntimeSessionLock,
   writeRuntimeSessionRecord,
@@ -175,7 +176,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
       const vm = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
-      const result = await this.proxyExecute(client, vm, req, ctx, runtimeSessionId);
+      const result = await this.executeOnSessionVm(client, vm, req, ctx, runtimeSessionId, lockToken);
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
@@ -191,6 +192,39 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       return result;
     } finally {
       await releaseRuntimeSessionLock(runtimeSessionId, lockToken);
+    }
+  }
+
+  /**
+   * Proxies the execute to a session VM and, on a failure that means the VM
+   * must not be reused, terminates it and drops the registry record so the next
+   * call relaunches + restores rather than reusing a dead-or-dirty VM:
+   *  - abort (JOB_TIMEOUT): the runner keeps NsJail running until the child
+   *    exits even after the socket closes, so a later request reusing this VM
+   *    could mutate the workspace concurrently with the timed-out run.
+   *  - VM unreachable (health/connection failure, e.g. idlePolicy auto-terminated
+   *    a suspended VM): the RUNNING record would otherwise keep pointing at a
+   *    dead VM until the hard deadline, and every request would reuse it.
+   * A plain non-200 from a live runner (`Error from sandbox`) leaves the warm VM
+   * and its record intact — the VM is healthy, only the request failed.
+   */
+  private async executeOnSessionVm(
+    client: LambdaMicrovmClient,
+    vm: MicrovmDescription,
+    req: SandboxTransportRequest,
+    ctx: SandboxExecuteContext,
+    runtimeSessionId: string,
+    lockToken: string,
+  ): Promise<SandboxRawResponse> {
+    try {
+      return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId);
+    } catch (error) {
+      const sandboxResponded = error instanceof Error && error.message === 'Error from sandbox';
+      if (ctx.signal.aborted || !sandboxResponded) {
+        await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
+        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+      }
+      throw error;
     }
   }
 

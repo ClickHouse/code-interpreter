@@ -30,9 +30,15 @@ export interface CheckpointConfig {
   timeoutMs: number;
 }
 
+/* Opts the runner into session mode for checkpoint/restore. These run before
+ * the first /execute on a relaunched VM, so the runner has nothing bound yet in
+ * the hookless design; without this header the handler 409s. Case-insensitive,
+ * matches the runner's `x-runtime-session-id`. */
+const RUNTIME_SESSION_ID_HEADER = 'X-Runtime-Session-Id';
+
 export async function pullCheckpoint(
   client: LambdaMicrovmClient,
-  args: { microvmId: string; endpointBase: string },
+  args: { microvmId: string; endpointBase: string; runtimeSessionId: string },
   config: CheckpointConfig,
 ): Promise<Buffer> {
   const token = await client.createMicrovmAuthToken({
@@ -41,7 +47,10 @@ export async function pullCheckpoint(
     ttlSeconds: config.authTokenTtlSeconds,
   });
   const response = await axios.get<ArrayBuffer>(`${args.endpointBase}/api/v2/session/checkpoint`, {
-    headers: { [token.headerName]: token.token },
+    headers: {
+      [token.headerName]: token.token,
+      [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
+    },
     responseType: 'arraybuffer',
     maxContentLength: config.maxBytes,
     timeout: config.timeoutMs,
@@ -51,7 +60,7 @@ export async function pullCheckpoint(
 
 export async function pushRestore(
   client: LambdaMicrovmClient,
-  args: { microvmId: string; endpointBase: string },
+  args: { microvmId: string; endpointBase: string; runtimeSessionId: string },
   data: Buffer,
   config: CheckpointConfig,
 ): Promise<void> {
@@ -63,6 +72,7 @@ export async function pushRestore(
   await axios.post(`${args.endpointBase}/api/v2/session/restore`, data, {
     headers: {
       [token.headerName]: token.token,
+      [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
       'Content-Type': 'application/x-gtar',
     },
     maxBodyLength: config.maxBytes,
@@ -101,6 +111,7 @@ export async function checkpointSession(args: {
     const data = await pullCheckpoint(args.client, {
       microvmId: record.microvm_id,
       endpointBase: args.normalizeEndpoint(record.endpoint),
+      runtimeSessionId: args.runtimeSessionId,
     }, args.config);
     /* Fence BEFORE writing the object store. The checkpoint key is
      * deterministic per session (last-writer-wins), so a caller whose lock
@@ -141,9 +152,11 @@ export async function restoreSession(args: {
   endpointBase: string;
   config: CheckpointConfig;
 }): Promise<'restored' | 'absent' | 'failed'> {
+  /* The store enforces `maxBytes` before buffering (stats S3 object size first),
+   * so an oversized/stray checkpoint throws here instead of OOM'ing the worker. */
   let data: Buffer | null;
   try {
-    data = await args.store.get(args.runtimeSessionId);
+    data = await args.store.get(args.runtimeSessionId, args.config.maxBytes);
   } catch (error) {
     microvmRestores.inc({ outcome: 'failed' });
     logger.warn('Checkpoint fetch failed; continuing with a fresh workspace', {
@@ -156,20 +169,8 @@ export async function restoreSession(args: {
     microvmRestores.inc({ outcome: 'absent' });
     return 'absent';
   }
-  /* Guard against an oversized/stray checkpoint before buffering it into the
-   * restore request. The put side caps size, but a checkpoint written under a
-   * looser prior config (or externally) could otherwise exhaust the process. */
-  if (data.length > args.config.maxBytes) {
-    microvmRestores.inc({ outcome: 'failed' });
-    logger.warn('Checkpoint exceeds maxBytes; continuing with a fresh workspace', {
-      runtimeSessionId: args.runtimeSessionId,
-      bytes: data.length,
-      maxBytes: args.config.maxBytes,
-    });
-    return 'failed';
-  }
   try {
-    await pushRestore(args.client, { microvmId: args.microvmId, endpointBase: args.endpointBase }, data, args.config);
+    await pushRestore(args.client, { microvmId: args.microvmId, endpointBase: args.endpointBase, runtimeSessionId: args.runtimeSessionId }, data, args.config);
     microvmRestores.inc({ outcome: 'restored' });
     logger.info('Session workspace restored from checkpoint', {
       runtimeSessionId: args.runtimeSessionId,

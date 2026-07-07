@@ -10,8 +10,13 @@ import { env } from '../config';
  */
 export interface CheckpointStore {
   put(runtimeSessionId: string, data: Buffer): Promise<void>;
-  get(runtimeSessionId: string): Promise<Buffer | null>;
+  /** `maxBytes` is enforced BEFORE the object is buffered into memory (stat the
+   *  object first for S3-backed stores) so a stray oversized checkpoint can't
+   *  OOM the worker. Throws {@link CheckpointTooLargeError} when exceeded. */
+  get(runtimeSessionId: string, maxBytes: number): Promise<Buffer | null>;
 }
+
+export class CheckpointTooLargeError extends Error {}
 
 export function checkpointObjectKey(runtimeSessionId: string): string {
   return `${env.CHECKPOINT_PREFIX}${runtimeSessionId}.tar.gz`;
@@ -41,19 +46,27 @@ export class MinioCheckpointStore implements CheckpointStore {
     });
   }
 
-  async get(runtimeSessionId: string): Promise<Buffer | null> {
+  async get(runtimeSessionId: string, maxBytes: number): Promise<Buffer | null> {
+    const key = checkpointObjectKey(runtimeSessionId);
+    let size: number;
     try {
-      const stream = await this.client.getObject(this.bucket, checkpointObjectKey(runtimeSessionId));
-      const chunks: Buffer[] = [];
-      for await (const chunk of stream) {
-        chunks.push(chunk as Buffer);
-      }
-      return Buffer.concat(chunks);
+      const stat = await this.client.statObject(this.bucket, key);
+      size = stat.size;
     } catch (error) {
       const code = (error as { code?: string })?.code;
       if (code === 'NoSuchKey' || code === 'NotFound') return null;
       throw error;
     }
+    /* Reject before downloading — never buffer an arbitrarily large object. */
+    if (size > maxBytes) {
+      throw new CheckpointTooLargeError(`checkpoint ${size}B exceeds maxBytes ${maxBytes}B`);
+    }
+    const stream = await this.client.getObject(this.bucket, key);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks);
   }
 }
 
@@ -65,8 +78,12 @@ export class MemoryCheckpointStore implements CheckpointStore {
     this.objects.set(runtimeSessionId, Buffer.from(data));
   }
 
-  async get(runtimeSessionId: string): Promise<Buffer | null> {
+  async get(runtimeSessionId: string, maxBytes: number): Promise<Buffer | null> {
     const data = this.objects.get(runtimeSessionId);
-    return data ? Buffer.from(data) : null;
+    if (!data) return null;
+    if (data.length > maxBytes) {
+      throw new CheckpointTooLargeError(`checkpoint ${data.length}B exceeds maxBytes ${maxBytes}B`);
+    }
+    return Buffer.from(data);
   }
 }

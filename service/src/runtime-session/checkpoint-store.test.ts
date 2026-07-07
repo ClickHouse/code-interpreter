@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { MemoryCheckpointStore, checkpointObjectKey } from './checkpoint-store';
+import { MemoryCheckpointStore, CheckpointTooLargeError, checkpointObjectKey } from './checkpoint-store';
+
+const BIG = 1_000_000;
 
 describe('checkpoint store', () => {
   test('object key is deterministic per runtime session under the prefix', () => {
@@ -13,22 +15,28 @@ describe('checkpoint store', () => {
     const original = Buffer.from('workspace-bytes');
     await store.put('rt_1', original);
 
-    const fetched = await store.get('rt_1');
+    const fetched = await store.get('rt_1', BIG);
     expect(fetched?.toString()).toBe('workspace-bytes');
     /* stored copy is independent of the caller's buffer */
     original.fill(0);
-    expect((await store.get('rt_1'))?.toString()).toBe('workspace-bytes');
+    expect((await store.get('rt_1', BIG))?.toString()).toBe('workspace-bytes');
   });
 
   test('absent checkpoint returns null', async () => {
     const store = new MemoryCheckpointStore();
-    expect(await store.get('rt_missing')).toBeNull();
+    expect(await store.get('rt_missing', BIG)).toBeNull();
   });
 
   test('last-writer-wins on the same key', async () => {
     const store = new MemoryCheckpointStore();
     await store.put('rt_1', Buffer.from('v1'));
     await store.put('rt_1', Buffer.from('v2'));
-    expect((await store.get('rt_1'))?.toString()).toBe('v2');
+    expect((await store.get('rt_1', BIG))?.toString()).toBe('v2');
+  });
+
+  test('rejects a checkpoint larger than maxBytes', async () => {
+    const store = new MemoryCheckpointStore();
+    await store.put('rt_big', Buffer.alloc(2048));
+    await expect(store.get('rt_big', 1024)).rejects.toBeInstanceOf(CheckpointTooLargeError);
   });
 });

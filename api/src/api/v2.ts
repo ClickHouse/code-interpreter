@@ -465,7 +465,22 @@ router.get('/runtimes', (_req: Request, res: Response) => {
  * file-ref path drops: installed packages, chDB dirs, unsupported-extension
  * files); POST replaces the workspace from one. No body parser on restore:
  * the handler consumes the raw request stream. */
-router.get('/session/checkpoint', (_req: Request, res: Response) => streamSessionCheckpoint(res));
-router.post('/session/restore', (req: Request, res: Response) => restoreSessionCheckpoint(req, res));
+/* Bind the session from the header before checkpoint/restore. These run BEFORE
+ * the first /execute on a relaunched VM, so in the hookless design nothing else
+ * has bound the workspace yet; without this the handlers 409 and a real restore
+ * silently continues with an empty workspace (checkpoint state lost on expiry). */
+function bindSessionFromHeader(req: Request): void {
+  const binding = parseSessionBindingFromHeader(req.headers[RUNTIME_SESSION_ID_HEADER]);
+  if (binding) bindSessionWorkspace(binding);
+}
+
+router.get('/session/checkpoint', (req: Request, res: Response) => {
+  bindSessionFromHeader(req);
+  return streamSessionCheckpoint(res);
+});
+router.post('/session/restore', (req: Request, res: Response) => {
+  bindSessionFromHeader(req);
+  return restoreSessionCheckpoint(req, res);
+});
 
 export default router;

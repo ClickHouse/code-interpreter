@@ -56,6 +56,21 @@ if (!artifactUri || !buildRoleArn) {
   process.exit(2);
 }
 
+/* Runner env is baked at image-build time (RunMicrovm does not inject it later),
+ * so the runner needs its file-server / egress-gateway / manifest config HERE or
+ * it builds invalid `/sessions/...` URLs and can't fetch inputs or upload
+ * outputs. The helper can't know your deployment's URLs, so pass them via
+ * --env-json '{"FILE_SERVER_URL":"...","EGRESS_GATEWAY_URL":"...", ...}' (or the
+ * MICROVM_IMAGE_ENV_JSON env). Typical keys: FILE_SERVER_URL, EGRESS_GATEWAY_URL,
+ * SANDBOX_ALLOWED_LOCAL_NETWORK_PORT, SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY,
+ * SANDBOX_REQUIRE_EGRESS_MANIFEST, REQUIRE_EXECUTION_MANIFEST. */
+function parseEnvJson(): Record<string, string> {
+  const raw = arg('--env-json', 'MICROVM_IMAGE_ENV_JSON');
+  if (!raw) return {};
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  return Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k, String(v)]));
+}
+
 /* Hard-won working image config (see docs/lambda-microvm/README.md):
  *  - additionalOsCapabilities ["ALL"]: nsjail needs CAP_SYS_ADMIN for its /proc
  *    mount inside the guest, else EPERM.
@@ -69,7 +84,7 @@ const shared = {
   cpuConfigurations: [{ architecture: 'ARM_64' as const }],
   resources: [{ minimumMemoryInMiB: memory }],
   additionalOsCapabilities: ['ALL' as const],
-  environmentVariables: { SANDBOX_USE_CGROUPV2: 'false' },
+  environmentVariables: { SANDBOX_USE_CGROUPV2: 'false', ...parseEnvJson() },
 };
 
 const client = new LambdaMicrovmsClient({ region, retryMode: 'adaptive', maxAttempts: 3 });

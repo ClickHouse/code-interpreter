@@ -676,6 +676,11 @@ export class Job {
   private workspaceLease: SandboxWorkspaceLease | undefined;
   private jobIdentity: SandboxJobIdentity | undefined;
   private generatedFiles: GeneratedFile[] = [];
+  /** Session output-diffing: fileId → {name, signature} pending a surfaced-mark.
+   *  Recorded during the workspace scan but only committed to `session.surfaced`
+   *  AFTER the file uploads, so a dropped upload doesn't permanently suppress an
+   *  unchanged file on the next turn. */
+  private pendingSurfaced = new Map<string, { name: string; signature: string }>();
   private sessionFiles: FileRef[] = [];
   private inheritedRefs: FileRef[] = [];
   private inputFileHashes = new Map<string, InputFileInfo>();
@@ -1588,7 +1593,10 @@ export class Job {
     }
     this.sessionFiles.push(fileData);
     this.generatedFiles.push({ id: newId, name: relativePath, path: fullPath });
-    if (this.session) this.session.markSurfaced(relativePath, outputSignature);
+    /* Defer the surfaced-mark until the upload succeeds (flushed in
+     * uploadGeneratedFiles) — marking here would suppress the file forever if
+     * its upload later fails and the route prunes it from the response. */
+    if (this.session) this.pendingSurfaced.set(newId, { name: relativePath, signature: outputSignature });
     return { collected: true, truncated: false, stopLoop: false };
   }
 
@@ -1753,6 +1761,15 @@ export class Job {
     );
     for (const id of results) {
       if (id) uploaded.add(id);
+    }
+
+    /* Commit the surfaced-mark only for files that actually uploaded, so a
+     * dropped upload leaves the file eligible to surface again next turn. */
+    if (this.session) {
+      for (const id of uploaded) {
+        const pending = this.pendingSurfaced.get(id);
+        if (pending) this.session.markSurfaced(pending.name, pending.signature);
+      }
     }
 
     if (uploaded.size < this.generatedFiles.length) {

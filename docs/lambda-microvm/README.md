@@ -122,13 +122,21 @@ AWS_PROFILE=... bun scripts/create-microvm-image.ts \
   --name codeapi-session \
   --artifact s3://<artifact-bucket>/runner/runner-<tag>.zip \
   --build-role $(terraform -chdir=../docs/lambda-microvm/terraform output -raw build_role_arn) \
-  --region us-east-1
+  --region us-east-1 \
+  --env-json '{"FILE_SERVER_URL":"https://files.internal","EGRESS_GATEWAY_URL":"https://egress.internal"}'
 # → prints LAMBDA_MICROVM_IMAGE_ARN when CREATED (~3-5 min)
 ```
 
 The helper builds hookless with `additionalOsCapabilities:["ALL"]` and
 `SANDBOX_USE_CGROUPV2=false` baked in — the working config (see
-[Runbook gotchas](#runbook-gotchas)). To ship new runner code later, re-run
+[Runbook gotchas](#runbook-gotchas)). **Runner env is baked at image-build
+time** (RunMicrovm does not inject it later), so pass your deployment's
+file-server / egress / manifest config via `--env-json` (or `MICROVM_IMAGE_ENV_JSON`)
+— typically `FILE_SERVER_URL`, `EGRESS_GATEWAY_URL`,
+`SANDBOX_ALLOWED_LOCAL_NETWORK_PORT`, `SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY`,
+`SANDBOX_REQUIRE_EGRESS_MANIFEST`, `REQUIRE_EXECUTION_MANIFEST`. Without the
+file/egress URLs the runner builds invalid `/sessions/...` URLs and can't fetch
+inputs or upload outputs. To ship new runner code later, re-run
 `build … push zip upload` and call the helper with `--update`.
 
 ### 4. Configure the CodeAPI service

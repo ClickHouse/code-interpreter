@@ -402,6 +402,9 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
 
     const checkpoints = captured.filter((c) => c.path === '/api/v2/session/checkpoint');
     expect(checkpoints).toHaveLength(1);
+    /* The runner binds session mode from this header (hookless): without it the
+     * checkpoint/restore handlers 409 and state is lost across expiry. */
+    expect(checkpoints[0].headers['x-runtime-session-id']).toBe('rt_ckpt_1');
     expect(store.objects.get('rt_ckpt_1')?.toString()).toBe(checkpointBlob);
     const record = await readRuntimeSessionRecord('rt_ckpt_1');
     expect(record?.workspace_checkpoint).toBe(checkpointObjectKey('rt_ckpt_1'));
@@ -429,6 +432,8 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     /* restore precedes execute on the fresh VM. */
     expect(paths.indexOf('/api/v2/session/restore')).toBeGreaterThanOrEqual(0);
     expect(paths.indexOf('/api/v2/session/restore')).toBeLessThan(paths.indexOf('/api/v2/execute'));
+    const restoreReq = captured.find((c) => c.path === '/api/v2/session/restore');
+    expect(restoreReq?.headers['x-runtime-session-id']).toBe('rt_ckpt_1');
     expect(fake.callsFor('runMicrovm')).toHaveLength(1);
   });
 
