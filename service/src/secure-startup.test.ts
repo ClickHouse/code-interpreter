@@ -146,6 +146,11 @@ describe('sandbox backend policy', () => {
     env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS = undefined;
     env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS = 300;
     env.LAMBDA_MICROVM_ALLOW_SHELL = false;
+    /* Object storage for the (default-on) session checkpoints. */
+    process.env.MINIO_ENDPOINT = 'minio';
+    process.env.MINIO_ACCESS_KEY = 'access';
+    process.env.MINIO_SECRET_KEY = 'secret';
+    process.env.CODEAPI_CHECKPOINT_BUCKET = 'codeapi-checkpoints';
   }
 
   test('accepts the default http backend', () => {
@@ -182,6 +187,16 @@ describe('sandbox backend policy', () => {
     env.RUNTIME_SESSION_MODE = 'affinity';
     expect(() => validateSandboxBackendPolicy()).not.toThrow();
     env.RUNTIME_SESSION_MODE = 'strict';
+    expect(() => validateSandboxBackendPolicy()).not.toThrow();
+  });
+
+  test('rejects session checkpoints without object storage configured', () => {
+    configureValidLambda();
+    env.RUNTIME_SESSION_MODE = 'affinity';
+    delete process.env.MINIO_ACCESS_KEY;
+    expect(() => validateSandboxBackendPolicy()).toThrow('object storage is not configured');
+    /* stateless never touches the store, so it stays valid without MinIO */
+    env.RUNTIME_SESSION_MODE = 'stateless';
     expect(() => validateSandboxBackendPolicy()).not.toThrow();
   });
 

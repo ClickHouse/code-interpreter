@@ -122,4 +122,22 @@ describe('SessionWorkspace state', () => {
       await fsp.rm(root, { recursive: true, force: true });
     }
   });
+
+  test('snapshotMeta/loadMeta round-trips priming + output-diff state into a fresh workspace', () => {
+    const source = new SessionWorkspace({ runtimeSessionId: 'rt_1' });
+    source.markSurfaced('out.csv', '10:100');
+    source.markPrimed('in.csv', 'file_abc');
+    source.markPrimed('skill.py', 'file_ro', true);
+
+    /* A relaunched VM starts with an empty workspace and loads the checkpoint's
+     * sidecar — without this it would re-download every input, overwriting a
+     * restored in-place-modified file with the original. */
+    const relaunched = new SessionWorkspace({ runtimeSessionId: 'rt_1' });
+    relaunched.loadMeta(source.snapshotMeta());
+
+    expect(relaunched.primedInputId('in.csv')).toBe('file_abc');
+    expect(relaunched.isSurfaced('out.csv', '10:100')).toBe(true);
+    /* read-only flag survives the round-trip, so it still re-downloads */
+    expect(relaunched.primedInputId('skill.py')).toBeUndefined();
+  });
 });

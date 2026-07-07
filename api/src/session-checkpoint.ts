@@ -5,7 +5,8 @@ import type { Request, Response } from 'express';
 import { pipeline } from 'stream/promises';
 import { logger } from './logger';
 import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID } from './workspace-isolation';
-import { getBoundSessionWorkspace } from './session-workspace';
+import type { SessionMetaSnapshot, SessionWorkspace } from './session-workspace';
+import { SESSION_META_FILE, getBoundSessionWorkspace } from './session-workspace';
 
 /**
  * Session workspace checkpoint / restore.
@@ -31,7 +32,14 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     res.status(409).json({ message: 'No session workspace is bound' });
     return;
   }
-  await session.ownership();
+  const { dir } = await session.ownership();
+
+  /* Carry the priming/output-diff state into the archive so a relaunched VM
+   * rebuilds it (see restoreSessionCheckpoint). Written under the held session
+   * lock, so no concurrent user code sees it, and removed from the live
+   * workspace once tar has read it. */
+  const metaPath = path.join(dir, SESSION_META_FILE);
+  await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()));
 
   res.status(200);
   res.setHeader('Content-Type', CHECKPOINT_CONTENT_TYPE);
@@ -47,6 +55,8 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     logger.error({ err: error }, 'Failed to stream session checkpoint');
     if (!res.headersSent) res.status(500).json({ message: 'checkpoint failed' });
     else res.destroy();
+  } finally {
+    await fsp.rm(metaPath, { force: true }).catch(() => {});
   }
 }
 
@@ -65,10 +75,12 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
   await fsp.mkdir(dir, { recursive: true });
 
   /* Archives are created with relative `session/...` members (see the create
-   * side), so extraction stays within the workspace root without needing
-   * GNU-only flags. Production hardening: verify/scan the archive before
-   * trusting a restore from shared storage. */
-  const tar = spawn('tar', ['-xzf', '-', '-C', SANDBOX_WORKSPACE_ROOT], {
+   * side). Strip that leading component and extract straight into the session
+   * `dir`, so a poisoned archive member (`../x`, `ws_other/x`, `rootfile`) can
+   * never escape the workspace into shared runner space — every member lands
+   * under `dir`. Production hardening: verify/scan the archive before trusting a
+   * restore from shared storage. */
+  const tar = spawn('tar', ['-xzf', '-', '--strip-components=1', '-C', dir], {
     stdio: ['pipe', 'ignore', 'pipe'],
   });
   tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'restore tar'));
@@ -77,6 +89,7 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
     const code: number = await new Promise((resolve) => tar.on('close', resolve));
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
     await chownRecursive(dir, uid, gid);
+    await applyRestoredMeta(session, dir);
     res.status(200).json({ status: 'restored', dir: path.basename(dir) });
   } catch (error) {
     logger.error({ err: error }, 'Failed to restore session checkpoint');
@@ -87,6 +100,24 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
     await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     await fsp.mkdir(dir, { recursive: true }).catch(() => {});
     if (!res.headersSent) res.status(500).json({ message: 'restore failed' });
+  }
+}
+
+/** Applies the restored priming/output-diff sidecar to the bound session and
+ *  removes it from disk so user code never sees it. Absent (older checkpoint)
+ *  or malformed metadata is non-fatal — the session just re-primes/re-surfaces
+ *  as if warmth were lost. */
+async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promise<void> {
+  const metaPath = path.join(dir, SESSION_META_FILE);
+  try {
+    const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as SessionMetaSnapshot;
+    if (Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
+      session.loadMeta(parsed);
+    }
+  } catch (error) {
+    logger.debug({ err: error }, 'No session meta sidecar to restore');
+  } finally {
+    await fsp.rm(metaPath, { force: true }).catch(() => {});
   }
 }
 

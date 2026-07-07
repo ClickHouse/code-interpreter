@@ -1,8 +1,9 @@
 import axios from 'axios';
-import type { LambdaMicrovmClient } from './lambda-client';
+import type { MicrovmAuthToken } from './lambda-client';
 import type { CheckpointStore } from './checkpoint-store';
 import {
   acquireRuntimeSessionLock,
+  allocateCheckpointSequence,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
   writeRuntimeSessionRecord,
@@ -50,15 +51,10 @@ export interface CheckpointConfig {
 const RUNTIME_SESSION_ID_HEADER = 'X-Runtime-Session-Id';
 
 export async function pullCheckpoint(
-  client: LambdaMicrovmClient,
-  args: { microvmId: string; endpointBase: string; runtimeSessionId: string },
+  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; runtimeSessionId: string },
   config: CheckpointConfig,
 ): Promise<Buffer> {
-  const token = await client.createMicrovmAuthToken({
-    microvmId: args.microvmId,
-    port: config.port,
-    ttlSeconds: config.authTokenTtlSeconds,
-  });
+  const token = await args.mintToken();
   const response = await axios.get<ArrayBuffer>(`${args.endpointBase}/api/v2/session/checkpoint`, {
     headers: {
       [token.headerName]: token.token,
@@ -72,16 +68,11 @@ export async function pullCheckpoint(
 }
 
 export async function pushRestore(
-  client: LambdaMicrovmClient,
-  args: { microvmId: string; endpointBase: string; runtimeSessionId: string },
+  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; runtimeSessionId: string },
   data: Buffer,
   config: CheckpointConfig,
 ): Promise<void> {
-  const token = await client.createMicrovmAuthToken({
-    microvmId: args.microvmId,
-    port: config.port,
-    ttlSeconds: config.authTokenTtlSeconds,
-  });
+  const token = await args.mintToken();
   await axios.post(`${args.endpointBase}/api/v2/session/restore`, data, {
     headers: {
       [token.headerName]: token.token,
@@ -102,7 +93,7 @@ export async function pushRestore(
  * post-checkpoint will cover this one.
  */
 export async function checkpointSession(args: {
-  client: LambdaMicrovmClient;
+  mintToken: (microvmId: string) => Promise<MicrovmAuthToken>;
   store: CheckpointStore;
   runtimeSessionId: string;
   config: CheckpointConfig;
@@ -121,18 +112,20 @@ export async function checkpointSession(args: {
       microvmCheckpoints.inc({ outcome: 'skipped_state' });
       return 'skipped_state';
     }
-    const data = await pullCheckpoint(args.client, {
-      microvmId: record.microvm_id,
+    const microvmId = record.microvm_id;
+    const data = await pullCheckpoint({
+      mintToken: () => args.mintToken(microvmId),
       endpointBase: args.normalizeEndpoint(record.endpoint),
       runtimeSessionId: args.runtimeSessionId,
     }, args.config);
-    /* Fence BEFORE writing the object store. The checkpoint key is
-     * deterministic per session (last-writer-wins), so a caller whose lock
-     * expired must not clobber a newer blob. The fenced record write is the
-     * ownership check: if it reports we were fenced, skip the store entirely. */
+    /* Each checkpoint writes a distinct, strictly increasing object key, so a
+     * put that stalled past the lock and lands late writes an OLDER key and can
+     * never overwrite the newer one restore reads. Fence the pointer write
+     * first: if it reports we were fenced, skip the store entirely. */
+    const sequence = await allocateCheckpointSequence(args.runtimeSessionId);
     const persisted = await writeRuntimeSessionRecord({
       ...record,
-      workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId),
+      workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, sequence),
       checkpointed_at: Date.now(),
     }, lockToken);
     if (!persisted) {
@@ -140,10 +133,9 @@ export async function checkpointSession(args: {
       return 'skipped_busy';
     }
     /* Bound the object-store write by the checkpoint timeout too — otherwise a
-     * stalled S3/MinIO put holds the session lock past JOB_TIMEOUT (and, if it
-     * outlives the lock TTL, could clobber a newer checkpoint). */
+     * stalled S3/MinIO put holds the session lock past JOB_TIMEOUT. */
     await withTimeout(
-      args.store.put(args.runtimeSessionId, data),
+      args.store.put(args.runtimeSessionId, sequence, data),
       args.config.timeoutMs,
       'checkpoint store.put',
     );
@@ -165,7 +157,7 @@ export async function checkpointSession(args: {
 
 /** Relaunch restore: caller holds the session lock and the VM is RUNNING. */
 export async function restoreSession(args: {
-  client: LambdaMicrovmClient;
+  mintToken: (microvmId: string) => Promise<MicrovmAuthToken>;
   store: CheckpointStore;
   runtimeSessionId: string;
   microvmId: string;
@@ -173,10 +165,16 @@ export async function restoreSession(args: {
   config: CheckpointConfig;
 }): Promise<'restored' | 'absent' | 'failed'> {
   /* The store enforces `maxBytes` before buffering (stats S3 object size first),
-   * so an oversized/stray checkpoint throws here instead of OOM'ing the worker. */
+   * so an oversized/stray checkpoint throws here instead of OOM'ing the worker.
+   * Bound the fetch too — a stalled S3/MinIO get would otherwise hold the
+   * session lock through the whole relaunch and time the request out. */
   let data: Buffer | null;
   try {
-    data = await args.store.get(args.runtimeSessionId, args.config.maxBytes);
+    data = await withTimeout(
+      args.store.get(args.runtimeSessionId, args.config.maxBytes),
+      args.config.timeoutMs,
+      'checkpoint store.get',
+    );
   } catch (error) {
     microvmRestores.inc({ outcome: 'failed' });
     logger.warn('Checkpoint fetch failed; continuing with a fresh workspace', {
@@ -190,7 +188,11 @@ export async function restoreSession(args: {
     return 'absent';
   }
   try {
-    await pushRestore(args.client, { microvmId: args.microvmId, endpointBase: args.endpointBase, runtimeSessionId: args.runtimeSessionId }, data, args.config);
+    await pushRestore({
+      mintToken: () => args.mintToken(args.microvmId),
+      endpointBase: args.endpointBase,
+      runtimeSessionId: args.runtimeSessionId,
+    }, data, args.config);
     microvmRestores.inc({ outcome: 'restored' });
     logger.info('Session workspace restored from checkpoint', {
       runtimeSessionId: args.runtimeSessionId,

@@ -290,6 +290,16 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       return { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint };
     }
 
+    /* We're relaunching. If the recorded VM is a live-but-non-reusable one
+     * (config/version/port drift, or deadline too close for this job) it would
+     * otherwise leak — running/suspended and billing until idle/max-duration
+     * expiry — once we overwrite the record below. Terminate it first. Skip
+     * when likelyIdleTerminated: AWS already killed it, so that's positive
+     * evidence it's gone and terminate would be a wasted not-found call. */
+    if (record?.microvm_id && !likelyIdleTerminated) {
+      await this.terminate(client, record.microvm_id, 'superseded').catch(() => {});
+    }
+
     const generation = await allocateRuntimeSessionGeneration(runtimeSessionId);
     const pendingOk = await writeRuntimeSessionRecord({
       runtime_session_id: runtimeSessionId,
@@ -342,7 +352,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * just no-ops one stat). */
     if (this.checkpointStore && this.checkpointsActive()) {
       await restoreSession({
-        client,
+        mintToken: (microvmId) => this.mintAuthToken(client, microvmId),
         store: this.checkpointStore,
         runtimeSessionId,
         microvmId: vm.microvmId,
@@ -371,7 +381,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       return base;
     }
     const result = await checkpointSession({
-      client,
+      mintToken: (microvmId) => this.mintAuthToken(client, microvmId),
       store: this.checkpointStore,
       runtimeSessionId,
       config: this.config.checkpoint,
@@ -388,7 +398,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
 
   /** Mints a proxy auth token under the shared per-second token budget, so
    *  concurrent warm-session executes queue instead of bursting past AWS's
-   *  CreateMicrovmAuthToken TPS limit (mirrors launch's `run` budget). */
+   *  CreateMicrovmAuthToken TPS limit (mirrors launch's `run` budget). Maps
+   *  control-plane failures to SandboxBackendError so they never escape raw:
+   *  `throttled` poisons the bucket for backoff, and `not_found` (the VM was
+   *  evicted/terminated) surfaces as MICROVM_UNHEALTHY so the caller tears down
+   *  the stale record and relaunches instead of retrying a dead VM. */
   private async mintAuthToken(client: LambdaMicrovmClient, microvmId: string): Promise<MicrovmAuthToken> {
     try {
       await acquireOpBudget('token', {
@@ -402,11 +416,26 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       }
       throw error;
     }
-    return client.createMicrovmAuthToken({
-      microvmId,
-      port: this.config.port,
-      ttlSeconds: this.config.authTokenTtlSeconds,
-    });
+    try {
+      return await client.createMicrovmAuthToken({
+        microvmId,
+        port: this.config.port,
+        ttlSeconds: this.config.authTokenTtlSeconds,
+      });
+    } catch (error) {
+      if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
+        await poisonOpBucket('token');
+        microvmThrottleEvents.inc({ op: 'token' });
+        throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
+      }
+      if (error instanceof LambdaMicrovmApiError && error.kind === 'not_found') {
+        throw new SandboxBackendError('MICROVM_UNHEALTHY', error.message, error);
+      }
+      if (error instanceof LambdaMicrovmApiError) {
+        throw new SandboxBackendError('MICROVM_LAUNCH_FAILED', error.message, error);
+      }
+      throw error;
+    }
   }
 
   private async proxyExecute(

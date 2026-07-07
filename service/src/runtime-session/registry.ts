@@ -44,6 +44,7 @@ export interface RuntimeSessionRecord {
 const SESS_PREFIX = 'rtsx:sess:';
 const LOCK_PREFIX = 'rtsx:lock:';
 const GEN_PREFIX = 'rtsx:gen:';
+const CKPT_SEQ_PREFIX = 'rtsx:ckptseq:';
 const ACTIVE_ZSET = 'rtsx:active';
 
 /** The session lock is held across the WHOLE `executeSession` critical path, so
@@ -199,6 +200,17 @@ export async function allocateRuntimeSessionGeneration(runtimeSessionId: string)
   const generation = await redis.incr(key);
   await redis.expire(key, RUNTIME_SESSION_RECORD_TTL_SECONDS);
   return generation;
+}
+
+/** Per-checkpoint monotonic sequence. Each successful checkpoint writes a
+ *  distinct, strictly increasing object key so a put that timed out and lands
+ *  late can never overwrite a newer checkpoint (restore always reads the max
+ *  sequence). Bumps on every checkpoint, unlike the per-relaunch generation. */
+export async function allocateCheckpointSequence(runtimeSessionId: string): Promise<number> {
+  const key = `${CKPT_SEQ_PREFIX}${runtimeSessionId}`;
+  const sequence = await redis.incr(key);
+  await redis.expire(key, RUNTIME_SESSION_RECORD_TTL_SECONDS);
+  return sequence;
 }
 
 export async function touchRuntimeSessionActive(runtimeSessionId: string, lastSeenAtMs: number): Promise<void> {

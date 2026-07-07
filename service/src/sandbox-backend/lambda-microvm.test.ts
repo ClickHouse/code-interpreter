@@ -412,6 +412,32 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
     expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
   });
+
+  test('a reused VM whose token mint returns not_found is torn down and the record dropped', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    /* The VM was evicted between calls: CreateMicrovmAuthToken now 404s. That
+     * escapes raw today; it must surface as MICROVM_UNHEALTHY so the dead VM is
+     * terminated and its record dropped, and the next call relaunches. */
+    fake.failNext('createMicrovmAuthToken', new LambdaMicrovmApiError('not_found', 'CreateMicrovmAuthToken', 'gone'));
+    await expect(backend.execute(request(), sessionContext())).rejects.toBeInstanceOf(SandboxBackendError);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
+  test('terminates a superseded (config-drifted) VM before relaunching', async () => {
+    const fake = fakeClient();
+    await makeBackend(fake).execute(request(), sessionContext());
+    const oldVmId = [...fake.vms.keys()][0];
+    /* A deploy bumps the image version: the recorded VM no longer matches config,
+     * so it must be terminated (not left running/billing) before the replacement
+     * launches. */
+    await makeBackend(fake, { imageVersion: '4' }).execute(request(), sessionContext());
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+    const terminated = fake.callsFor('terminateMicrovm').map((c) => (c.args as { microvmId: string }).microvmId);
+    expect(terminated).toContain(oldVmId);
+  });
 });
 
 describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
@@ -438,20 +464,20 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     /* The runner binds session mode from this header (hookless): without it the
      * checkpoint/restore handlers 409 and state is lost across expiry. */
     expect(checkpoints[0].headers['x-runtime-session-id']).toBe('rt_ckpt_1');
-    expect(store.objects.get('rt_ckpt_1')?.toString()).toBe(checkpointBlob);
+    expect((await store.get('rt_ckpt_1', 1_000_000))?.toString()).toBe(checkpointBlob);
     const record = await readRuntimeSessionRecord('rt_ckpt_1');
-    expect(record?.workspace_checkpoint).toBe(checkpointObjectKey('rt_ckpt_1'));
+    expect(record?.workspace_checkpoint).toBe(checkpointObjectKey('rt_ckpt_1', 1));
     expect(record?.checkpointed_at).toBeGreaterThan(0);
   });
 
   test('a relaunched VM restores the checkpoint before the first exec', async () => {
     const store = new MemoryCheckpointStore();
-    await store.put('rt_ckpt_1', Buffer.from('PRIOR_WORKSPACE'));
+    await store.put('rt_ckpt_1', 1, Buffer.from('PRIOR_WORKSPACE'));
     /* Seed a terminated prior session so findOrLaunch relaunches. */
     const seedToken = await acquireRuntimeSessionLock('rt_ckpt_1', 60_000);
     await writeRuntimeSessionRecord({
       runtime_session_id: 'rt_ckpt_1', tenant_id: 'tenant-a', canonical_user_id: 'user-1',
-      state: 'TERMINATED', generation: 3, last_seen_at: 1, workspace_checkpoint: checkpointObjectKey('rt_ckpt_1'),
+      state: 'TERMINATED', generation: 3, last_seen_at: 1, workspace_checkpoint: checkpointObjectKey('rt_ckpt_1', 1),
     }, seedToken as string);
     const { releaseRuntimeSessionLock } = await import('../runtime-session/registry');
     await releaseRuntimeSessionLock('rt_ckpt_1', seedToken as string);

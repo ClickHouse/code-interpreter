@@ -91,6 +91,25 @@ export function validateSandboxBackendPolicy(): void {
       'LAMBDA_MICROVM_ALLOW_SHELL must not be enabled in production or hardened mode',
     );
   }
+  /* Checkpoints without object storage configured: MinioCheckpointStore silently
+   * falls back to localhost:9000/test-bucket/empty creds, so warm reuse works
+   * but every checkpoint + restore fails against the dummy store and workspace
+   * state is lost on the first relaunch. Fail fast instead (mirrors the factory
+   * gate that constructs the store). */
+  if (env.SESSION_CHECKPOINTS && env.RUNTIME_SESSION_MODE !== 'stateless') {
+    const missing = ['MINIO_ENDPOINT', 'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY'].filter(
+      (name) => !nonEmpty(process.env[name]),
+    );
+    if (!nonEmpty(process.env.CODEAPI_CHECKPOINT_BUCKET) && !nonEmpty(process.env.MINIO_BUCKET)) {
+      missing.push('CODEAPI_CHECKPOINT_BUCKET (or MINIO_BUCKET)');
+    }
+    if (missing.length > 0) {
+      throw new SecureStartupConfigError(
+        'Session checkpoints are enabled but object storage is not configured: '
+          + `${missing.join(', ')}. Set them or disable CODEAPI_SESSION_CHECKPOINTS.`,
+      );
+    }
+  }
 }
 
 export function validateEgressGatewayHardenedConfig(): void {

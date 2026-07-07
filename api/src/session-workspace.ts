@@ -36,6 +36,17 @@ import {
 /** Wire contract with the Lambda backend (`service/src/sandbox-backend`). */
 export const RUNTIME_SESSION_ID_HEADER = 'x-runtime-session-id';
 
+/** Sidecar file the checkpoint tar carries so a relaunched VM rebuilds the
+ *  in-memory priming/output-diff state a warm VM would have kept. Written into
+ *  the workspace only while the session lock is held (no concurrent user code),
+ *  and removed from disk again before any execute runs. */
+export const SESSION_META_FILE = '.codeapi-session-meta.json';
+
+export interface SessionMetaSnapshot {
+  primed: Array<[string, { id: string; readOnly: boolean }]>;
+  surfaced: Array<[string, string]>;
+}
+
 const RUNTIME_SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface SessionBinding {
@@ -144,6 +155,24 @@ export class SessionWorkspace {
 
   markPrimed(relPath: string, storageFileId: string, readOnly = false): void {
     this.primed.set(relPath, { id: storageFileId, readOnly });
+  }
+
+  /** Serializes the priming + output-diff state into the checkpoint so a
+   *  relaunched VM restores it (see {@link SESSION_META_FILE}). */
+  snapshotMeta(): SessionMetaSnapshot {
+    return {
+      primed: [...this.primed.entries()],
+      surfaced: [...this.surfaced.entries()],
+    };
+  }
+
+  /** Rebuilds priming + output-diff state from a restored checkpoint sidecar.
+   *  Without it a relaunched VM would re-download every input ref, overwriting a
+   *  restored in-place-modified input with its original, and re-upload every
+   *  restored file as a new output. */
+  loadMeta(snapshot: SessionMetaSnapshot): void {
+    for (const [relPath, entry] of snapshot.primed) this.primed.set(relPath, entry);
+    for (const [relPath, hash] of snapshot.surfaced) this.surfaced.set(relPath, hash);
   }
 
   /** Full teardown: wipe the dir, release the pinned UID, clear diff state. */
