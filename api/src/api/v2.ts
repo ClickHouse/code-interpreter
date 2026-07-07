@@ -15,7 +15,6 @@ import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
 import {
   RUNTIME_SESSION_ID_HEADER,
   bindSessionWorkspace,
-  getBoundSessionWorkspace,
   parseSessionBindingFromHeader,
 } from '../session-workspace';
 import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
@@ -179,8 +178,13 @@ function getJob(
 
   validateConstraints(body, rt);
 
+  /* Session mode is per-request opt-in: only run in the persistent workspace
+   * when THIS request carried a valid X-Runtime-Session-Id. A headerless or
+   * malformed-header request must NOT inherit a previously bound session, or it
+   * would reuse that session's files/UID (defense-in-depth — the backend always
+   * sends the header for a session VM, so this only guards stray requests). */
   const binding = parseSessionBindingFromHeader(runtimeSessionHeader);
-  if (binding) bindSessionWorkspace(binding);
+  const session = binding ? bindSessionWorkspace(binding) ?? null : null;
 
   return new Job({
     session_id: session_id ?? null,
@@ -205,7 +209,7 @@ function getJob(
     egress_grant: egressGrantToken,
     tool_call_socket_enabled: toolCallSocketEnabled,
     is_synthetic: isSynthetic,
-    session: getBoundSessionWorkspace() ?? null,
+    session,
   });
 }
 

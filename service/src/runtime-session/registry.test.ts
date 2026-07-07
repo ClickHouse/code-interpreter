@@ -84,6 +84,11 @@ describe('fenced record writes', () => {
     expect(await readRuntimeSessionRecord('rt_abc123')).toEqual(rec);
   });
 
+  test('reads a corrupt record as missing instead of throwing', async () => {
+    await mock.set('rtsx:sess:rt_bad', '{not valid json');
+    expect(await readRuntimeSessionRecord('rt_bad')).toBeNull();
+  });
+
   test('write is fenced after the lock is lost', async () => {
     const token = (await acquireRuntimeSessionLock('rt_abc123')) as string;
     await releaseRuntimeSessionLock('rt_abc123', token);

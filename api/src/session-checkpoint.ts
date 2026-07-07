@@ -85,10 +85,18 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
 }
 
 async function chownRecursive(dir: string, uid: number, gid: number): Promise<void> {
-  await fsp.chown(dir, uid, gid).catch(() => {});
+  await fsp.lchown(dir, uid, gid).catch(() => {});
   const entries = await fsp.readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
+    /* A restored checkpoint is untrusted content: never follow symlinks. A
+     * `session/x -> /etc/passwd` entry would otherwise have `chown` re-own the
+     * target outside the workspace. `lchown` the link itself and never recurse
+     * through it (Dirent reports the link type, so `isDirectory()` is false). */
+    if (entry.isSymbolicLink()) {
+      await fsp.lchown(full, uid, gid).catch(() => {});
+      continue;
+    }
     await fsp.chown(full, uid, gid).catch(() => {});
     if (entry.isDirectory()) await chownRecursive(full, uid, gid);
   }

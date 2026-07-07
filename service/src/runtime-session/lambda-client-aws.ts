@@ -46,8 +46,15 @@ function toDescription(response: {
   startedAt?: Date;
   stateReason?: string;
 }): MicrovmDescription {
+  /* Every command (Run/Get/Suspend/Resume/Terminate) returns the VM id. A
+   * missing id means a partial/garbled response; fail fast rather than hand
+   * back `''`, which downstream getMicrovm('')/terminateMicrovm('') would act
+   * on — leaking the just-created VM as orphaned and billable. */
+  if (response.microvmId == null || response.microvmId === '') {
+    throw new Error('Lambda MicroVM response omitted microvmId');
+  }
   return {
-    microvmId: response.microvmId ?? '',
+    microvmId: response.microvmId,
     state: (response.state ?? 'PENDING') as MicrovmLifecycleState,
     endpoint: response.endpoint,
     imageArn: response.imageArn,

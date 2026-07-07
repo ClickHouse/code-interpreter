@@ -1,4 +1,5 @@
 import { env } from './config';
+import logger from './logger';
 import { INTERNAL_SERVICE_TOKEN_ENV } from './internal-service-auth';
 
 export class SecureStartupConfigError extends Error {
@@ -56,6 +57,15 @@ export function validateSandboxBackendPolicy(): void {
   if (env.RUNTIME_SESSION_MODE === 'strict' && env.SANDBOX_BACKEND === 'http') {
     throw new SecureStartupConfigError(
       'CODEAPI_RUNTIME_SESSION_MODE=strict requires the lambda-microvm backend',
+    );
+  }
+  /* affinity+http is the documented graceful fallback (runs stateless), but a
+   * silent no-op hides a likely misconfiguration — surface it loudly. */
+  if (env.RUNTIME_SESSION_MODE === 'affinity' && env.SANDBOX_BACKEND === 'http') {
+    logger.warn(
+      'CODEAPI_RUNTIME_SESSION_MODE=affinity has no effect with the http backend: '
+        + 'requests run stateless (no session reuse or checkpoint/restore). '
+        + 'Use CODEAPI_SANDBOX_BACKEND=lambda-microvm for stateful sessions.',
     );
   }
   if (env.SANDBOX_BACKEND !== 'lambda-microvm') return;

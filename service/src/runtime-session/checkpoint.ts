@@ -102,13 +102,21 @@ export async function checkpointSession(args: {
       microvmId: record.microvm_id,
       endpointBase: args.normalizeEndpoint(record.endpoint),
     }, args.config);
-    await args.store.put(args.runtimeSessionId, data);
-    microvmCheckpointBytes.observe(data.length);
-    await writeRuntimeSessionRecord({
+    /* Fence BEFORE writing the object store. The checkpoint key is
+     * deterministic per session (last-writer-wins), so a caller whose lock
+     * expired must not clobber a newer blob. The fenced record write is the
+     * ownership check: if it reports we were fenced, skip the store entirely. */
+    const persisted = await writeRuntimeSessionRecord({
       ...record,
       workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId),
       checkpointed_at: Date.now(),
     }, lockToken);
+    if (!persisted) {
+      microvmCheckpoints.inc({ outcome: 'skipped_busy' });
+      return 'skipped_busy';
+    }
+    await args.store.put(args.runtimeSessionId, data);
+    microvmCheckpointBytes.observe(data.length);
     microvmCheckpoints.inc({ outcome: 'stored' });
     return 'stored';
   } catch (error) {
@@ -147,6 +155,18 @@ export async function restoreSession(args: {
   if (!data) {
     microvmRestores.inc({ outcome: 'absent' });
     return 'absent';
+  }
+  /* Guard against an oversized/stray checkpoint before buffering it into the
+   * restore request. The put side caps size, but a checkpoint written under a
+   * looser prior config (or externally) could otherwise exhaust the process. */
+  if (data.length > args.config.maxBytes) {
+    microvmRestores.inc({ outcome: 'failed' });
+    logger.warn('Checkpoint exceeds maxBytes; continuing with a fresh workspace', {
+      runtimeSessionId: args.runtimeSessionId,
+      bytes: data.length,
+      maxBytes: args.config.maxBytes,
+    });
+    return 'failed';
   }
   try {
     await pushRestore(args.client, { microvmId: args.microvmId, endpointBase: args.endpointBase }, data, args.config);

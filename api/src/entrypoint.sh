@@ -3,14 +3,22 @@ set -e
 
 echo "Starting NsJail sandbox API..."
 
-# Raise the RLIMIT_NOFILE hard cap so per-job nsjail can set its own soft
+# Raise the RLIMIT_NOFILE limits so per-job nsjail can set its own soft
 # limit (SANDBOX_MAX_OPEN_FILES) without EPERM. The AWS Lambda MicroVM base
 # image ships a 1024 hard cap, below the sandbox default of 2048; nsjail
 # runs the child with keep_caps:false, so the hard limit must already be
-# high before the API starts. No-op where the limit is already higher
-# (e.g. Docker's ~1M default) or where CAP_SYS_RESOURCE is unavailable.
-ulimit -Hn 65536 2>/dev/null || true
-ulimit -Sn 65536 2>/dev/null || true
+# high before the API starts. Only ever RAISE, never lower: `ulimit -n`
+# clamps downward too, so an unconditional set would shrink Docker's ~1M
+# default (and any SANDBOX_MAX_OPEN_FILES above 65536) instead of no-op'ing.
+raise_nofile() {
+  local kind="$1" want=65536 cur
+  cur="$(ulimit "$kind" 2>/dev/null || echo unlimited)"
+  if [ "$cur" != "unlimited" ] && [ "$cur" -lt "$want" ] 2>/dev/null; then
+    ulimit "$kind" "$want" 2>/dev/null || true
+  fi
+}
+raise_nofile -Hn   # hard first, so the soft raise below is permitted
+raise_nofile -Sn
 
 SANDBOX_USE_CGROUPV2="${SANDBOX_USE_CGROUPV2:-true}"
 SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP="${SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP:-true}"

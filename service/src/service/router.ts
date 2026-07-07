@@ -136,11 +136,17 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
 
   let runtimeSessionId: string | undefined;
   try {
+    /* In stateless mode the hint is ignored entirely, so don't validate it —
+     * a malformed hint that will never be used must not 400 the request. */
+    const hint =
+      env.RUNTIME_SESSION_MODE === 'stateless'
+        ? undefined
+        : validateRuntimeSessionHint(body.runtime_session_hint);
     runtimeSessionId = resolveRuntimeSessionIdForRequest({
       mode: env.RUNTIME_SESSION_MODE,
       storageNamespace: identity.storageNamespace,
       canonicalUserId: identity.canonicalUserId,
-      hint: validateRuntimeSessionHint(body.runtime_session_hint),
+      hint,
     });
   } catch (error) {
     if (error instanceof RuntimeSessionHintError) {

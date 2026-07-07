@@ -46,11 +46,18 @@ const LOCK_PREFIX = 'rtsx:lock:';
 const GEN_PREFIX = 'rtsx:gen:';
 const ACTIVE_ZSET = 'rtsx:active';
 
-/** Launch budget placeholder until the Lambda backend config lands; the lock
- * must outlive lock-wait + launch + execute so a live holder is never fenced
- * mid-operation. */
-const LAUNCH_BUDGET_MS = 60_000;
-export const RUNTIME_SESSION_LOCK_TTL_MS = env.JOB_TIMEOUT + LAUNCH_BUDGET_MS + 60_000;
+/** The session lock is held across the whole `executeSession` critical path —
+ * launch + health + execute + post-run checkpoint — so its TTL must outlive the
+ * sum of those configurable budgets, else a live holder is fenced mid-operation
+ * and a second worker can acquire the same session concurrently. Derive it from
+ * the actual budgets (not a fixed placeholder) so raising any one of them keeps
+ * the lock safe, plus headroom for lock-wait + scheduling jitter. */
+export const RUNTIME_SESSION_LOCK_TTL_MS =
+  env.JOB_TIMEOUT +
+  env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS +
+  env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS +
+  env.CHECKPOINT_TIMEOUT_MS +
+  60_000;
 
 const MAX_MICROVM_DURATION_SECONDS = 28_800;
 export const RUNTIME_SESSION_RECORD_TTL_SECONDS = MAX_MICROVM_DURATION_SECONDS + 600;
@@ -151,7 +158,15 @@ export async function releaseRuntimeSessionLock(runtimeSessionId: string, token:
 
 export async function readRuntimeSessionRecord(runtimeSessionId: string): Promise<RuntimeSessionRecord | null> {
   const data = await redis.get(`${SESS_PREFIX}${runtimeSessionId}`);
-  return data != null ? (JSON.parse(data) as RuntimeSessionRecord) : null;
+  if (data == null) return null;
+  /* Treat a corrupt/incompatible record as missing so a single bad key can't
+   * wedge every request for the session until it is manually deleted. */
+  try {
+    return JSON.parse(data) as RuntimeSessionRecord;
+  } catch (err) {
+    logger.warn('Discarding malformed runtime session record', { runtimeSessionId, err });
+    return null;
+  }
 }
 
 /** Fenced write: persists the record only while `lockToken` still holds the
