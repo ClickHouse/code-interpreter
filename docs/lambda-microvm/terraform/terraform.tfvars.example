@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars and edit.
+
+region      = "us-east-1"
+name_prefix = "codeapi-microvm"
+
+# Must match the --name you pass to create-microvm-image (pre-creates the build
+# log group at /aws/lambda-microvms/<image_name>).
+image_name = "codeapi-session"
+
+# Runner container image base. true = build role can pull from a private ECR repo
+# in this account (the default runner Dockerfile does). false for public bases.
+private_ecr = true
+
+# Checkpoints are a resumable cache; keep the window short.
+checkpoint_retention_days = 14
+log_retention_days        = 30
+
+# Prefer attaching checkpoint_access_policy_arn to your CodeAPI task role.
+# Only set true if you must hand static keys to a non-role deployment.
+create_checkpoint_access_user = false
+
+tags = {
+  team = "code-interpreter"
+  env  = "dev"
+}
