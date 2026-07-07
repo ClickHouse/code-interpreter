@@ -58,16 +58,16 @@ verifier through environment variables on the api component, e.g.:
 
 ```yaml
 api:
-  extraEnv:
-    - name: CODEAPI_AUTH_PROVIDER
-      value: librechat-jwt
-    - name: CODEAPI_JWT_PUBLIC_KEY     # single PEM/base64-DER verifier key
-      valueFrom:
-        secretKeyRef:
-          name: codeapi-jwt-verifier
-          key: public-key
-    - name: CODEAPI_JWT_KID
-      value: my-key-id
+    extraEnv:
+        - name: CODEAPI_AUTH_PROVIDER
+          value: librechat-jwt
+        - name: CODEAPI_JWT_PUBLIC_KEY # single PEM/base64-DER verifier key
+          valueFrom:
+              secretKeyRef:
+                  name: codeapi-jwt-verifier
+                  key: public-key
+        - name: CODEAPI_JWT_KID
+          value: my-key-id
 ```
 
 `CODEAPI_JWT_PUBLIC_KEYS_DIR` (a mounted directory of PEM files) and
@@ -78,14 +78,35 @@ For development only, `LOCAL_MODE=true` bypasses authentication — see
 **TLS to Redis.** Set `REDIS_TLS=true` via `extraEnv` on each component when
 your Redis (e.g. a managed cache) requires TLS.
 
+**Redis Cluster mode (GCP Memorystore cluster, AWS ElastiCache cluster).** Set
+`redis.cluster.enabled=true` and provide the comma-separated startup nodes in
+`redis.cluster.nodes`. The chart will set `USE_REDIS_CLUSTER=true` and populate
+`REDIS_HOST` with the node list on every component. For TLS with a CA certificate
+(recommended for GCP Memorystore), also set:
+
+```yaml
+redis:
+    tls:
+        enabled: true
+        caSecretName: my-memorystore-secret # Secret that holds the CA cert
+        caKey: ca # Key inside the Secret
+        caMountPath: /etc/redis-tls/ca.crt # Mount path in each pod
+    useAlternativeDnsLookup: true # Required for GCP Memorystore cluster
+```
+
+The CA certificate is mounted from the Secret into every component pod and
+passed to ioredis via `REDIS_CA`. No sidecar is needed.
+
 ## Quick Start (Local Development)
 
 ### 1. Start Minikube
+
 ```bash
 minikube start --cpus=4 --memory=8192
 ```
 
 ### 2. Build Images Inside Minikube
+
 ```bash
 # Point docker to minikube's daemon
 eval $(minikube docker-env)
@@ -100,6 +121,7 @@ docker build -t codeapi-package-init:latest -f docker/Dockerfile.package-init .
 ```
 
 ### 3. Install Dependencies & Deploy
+
 ```bash
 cd helm/codeapi
 
@@ -151,6 +173,7 @@ kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
 
 ### 5. Access the API
+
 ```bash
 # Port forward (in another terminal)
 kubectl port-forward svc/codeapi-api 3112:3112
@@ -164,6 +187,7 @@ curl http://localhost:3112/v1/health
 ## Commands Reference
 
 ### Startup
+
 ```bash
 # Start minikube
 minikube start
@@ -176,6 +200,7 @@ kubectl port-forward svc/codeapi-api 3112:3112
 ```
 
 ### Check Status
+
 ```bash
 # View all pods
 kubectl get pods
@@ -190,6 +215,7 @@ kubectl describe pod <pod-name>
 ```
 
 ### Scaling
+
 ```bash
 # Scale the sandbox execution tier
 kubectl scale deployment/codeapi-sandbox-runner --replicas=10
@@ -200,6 +226,7 @@ helm upgrade codeapi ./helm/codeapi -f ./helm/codeapi/values-local.yaml \
 ```
 
 ### Update After Code Changes
+
 ```bash
 # Rebuild images (must be in minikube docker env)
 eval $(minikube docker-env)
@@ -212,6 +239,7 @@ kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
 
 ### Teardown
+
 ```bash
 # Uninstall the Helm release (removes all K8s resources)
 helm uninstall codeapi
@@ -228,12 +256,14 @@ minikube delete
 ## Testing
 
 ### Health Check
+
 ```bash
 curl http://localhost:3112/v1/health
 # Expected: OK
 ```
 
 ### Execute Python Code
+
 ```bash
 curl -X POST http://localhost:3112/v1/exec \
   -H "Content-Type: application/json" \
@@ -242,6 +272,7 @@ curl -X POST http://localhost:3112/v1/exec \
 ```
 
 ### Verify Horizontal Scaling
+
 ```bash
 # Check which service-worker processed the job
 kubectl logs deployment/codeapi-service-worker --tail=5
@@ -299,6 +330,7 @@ kubectl logs deployment/codeapi-service-worker --tail=5
 ## Troubleshooting
 
 ### Pod stuck in `ErrImageNeverPull`
+
 ```bash
 # Images must be built inside minikube's docker
 eval $(minikube docker-env)
@@ -307,6 +339,7 @@ kubectl rollout restart deployment/<deployment-name>
 ```
 
 ### Pod stuck in `CrashLoopBackOff`
+
 ```bash
 # Check logs
 kubectl logs <pod-name> --previous
@@ -314,6 +347,7 @@ kubectl describe pod <pod-name>
 ```
 
 ### "runtime is unknown" error
+
 ```bash
 # Language packages PVC is empty. Check if the init job ran:
 kubectl get jobs -l app.kubernetes.io/component=package-init
@@ -327,12 +361,14 @@ kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
 
 ### Connection refused on port 3112
+
 ```bash
 # Make sure port-forward is running
 kubectl port-forward svc/codeapi-api 3112:3112
 ```
 
 ### MinIO `ImagePullBackOff` (production values)
+
 ```bash
 # The Bitnami MinIO chart may reference unavailable image tags.
 # For local dev, values-local.yaml uses minio.useSimple=true which
