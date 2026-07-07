@@ -194,6 +194,10 @@ export const env = {
   LAMBDA_MICROVM_LAUNCH_TPS: Number(process.env.LAMBDA_MICROVM_LAUNCH_TPS) || 4,
   LAMBDA_MICROVM_RESUME_TPS: Number(process.env.LAMBDA_MICROVM_RESUME_TPS) || 4,
   LAMBDA_MICROVM_SUSPEND_TPS: Number(process.env.LAMBDA_MICROVM_SUSPEND_TPS) || 1,
+  /* CreateMicrovmAuthToken is minted per execute + per checkpoint; share a
+   * fleet-wide budget so concurrent warm-session executes queue instead of
+   * bursting past the AWS TPS limit. */
+  LAMBDA_MICROVM_TOKEN_TPS: Number(process.env.LAMBDA_MICROVM_TOKEN_TPS) || 8,
   LAMBDA_MICROVM_ALLOW_SHELL: process.env.LAMBDA_MICROVM_ALLOW_SHELL === 'true',
   /* Session workspace checkpoints (effective only in affinity/strict modes).
    * On by default so VM expiry/eviction recovery is automatic; the byte cap

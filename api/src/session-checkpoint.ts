@@ -80,6 +80,12 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
     res.status(200).json({ status: 'restored', dir: path.basename(dir) });
   } catch (error) {
     logger.error({ err: error }, 'Failed to restore session checkpoint');
+    /* A corrupt archive or cut-off upload can leave partially-extracted members
+     * behind. The control plane treats restore failure as non-fatal and runs the
+     * job anyway, so wipe the workspace to a clean slate — otherwise the job runs
+     * against a mix of stale checkpoint files instead of an empty workspace. */
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    await fsp.mkdir(dir, { recursive: true }).catch(() => {});
     if (!res.headersSent) res.status(500).json({ message: 'restore failed' });
   }
 }

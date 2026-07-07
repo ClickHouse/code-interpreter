@@ -111,6 +111,7 @@ function config(overrides: Partial<LambdaMicrovmBackendConfig> = {}): LambdaMicr
     launchTimeoutMs: 2_000,
     healthTimeoutMs: 1_000,
     launchTps: 50,
+    tokenTps: 50,
     jobTimeoutMs: 300_000,
     idleSeconds: 300,
     suspendedSeconds: 1_800,

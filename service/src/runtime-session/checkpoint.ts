@@ -11,6 +11,19 @@ import { checkpointObjectKey } from './checkpoint-store';
 import { microvmCheckpoints, microvmRestores, microvmCheckpointBytes } from '../metrics';
 import logger from '../logger';
 
+/** Reject if `promise` doesn't settle within `ms`. The underlying op is not
+ *  cancelled (the object-store client has no abort hook), but the caller stops
+ *  waiting so a stalled write can't hold the session lock indefinitely. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 /**
  * Auto-checkpoint orchestration. The workspace only mutates during an
  * execute, and executes serialize on the session lock — so a lock-guarded
@@ -126,7 +139,14 @@ export async function checkpointSession(args: {
       microvmCheckpoints.inc({ outcome: 'skipped_busy' });
       return 'skipped_busy';
     }
-    await args.store.put(args.runtimeSessionId, data);
+    /* Bound the object-store write by the checkpoint timeout too — otherwise a
+     * stalled S3/MinIO put holds the session lock past JOB_TIMEOUT (and, if it
+     * outlives the lock TTL, could clobber a newer checkpoint). */
+    await withTimeout(
+      args.store.put(args.runtimeSessionId, data),
+      args.config.timeoutMs,
+      'checkpoint store.put',
+    );
     microvmCheckpointBytes.observe(data.length);
     microvmCheckpoints.inc({ outcome: 'stored' });
     return 'stored';

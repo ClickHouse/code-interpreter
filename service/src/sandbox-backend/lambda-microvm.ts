@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { nanoid } from 'nanoid';
-import type { LambdaMicrovmClient, MicrovmDescription, MicrovmIdlePolicy } from '../runtime-session/lambda-client';
+import type { LambdaMicrovmClient, MicrovmAuthToken, MicrovmDescription, MicrovmIdlePolicy } from '../runtime-session/lambda-client';
 import type { SandboxBackend, SandboxExecuteContext, SandboxRawResponse, SandboxTransportRequest } from './types';
 import type { RuntimeSessionRecord } from '../runtime-session/registry';
 import type { CheckpointConfig } from '../runtime-session/checkpoint';
@@ -51,6 +51,7 @@ export interface LambdaMicrovmBackendConfig {
   launchTimeoutMs: number;
   healthTimeoutMs: number;
   launchTps: number;
+  tokenTps: number;
   jobTimeoutMs: number;
   /* Session-mode (find-or-launch) tuning. */
   idleSeconds: number;
@@ -236,14 +237,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       /* Recycle the VM ONLY on positive evidence it's unreachable or dirty:
        *  - abort: the runner keeps NsJail running after the socket closes, so a
        *    reuse could mutate the workspace concurrently.
-       *  - a transport-level axios failure (no `.response`): health/execute
-       *    couldn't reach the VM (connection refused/timeout).
+       *  - a transport-level axios failure (no `.response`): the execute couldn't
+       *    reach the VM (connection refused/timeout).
+       *  - a failed health check: assertHealthy wraps the connection/timeout/non-200
+       *    into MICROVM_UNHEALTHY, so it isn't a top-level AxiosError.
        * Everything else keeps the warm VM: a non-2xx sandbox response (AxiosError
-       * WITH `.response` — the VM is alive, only the request failed) and, crucially,
-       * a pre-request control-plane failure like a throttled CreateMicrovmAuthToken
+       * WITH `.response` — the VM is alive, only the request failed) and a
+       * pre-request control-plane failure like a throttled CreateMicrovmAuthToken
        * (not an axios error at all) — the VM was never touched. */
       const transportFailure = axios.isAxiosError(error) && error.response == null;
-      if (ctx.signal.aborted || transportFailure) {
+      const unhealthy = error instanceof SandboxBackendError && error.code === 'MICROVM_UNHEALTHY';
+      if (ctx.signal.aborted || transportFailure || unhealthy) {
         await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
       }
@@ -330,10 +334,13 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after launch`);
     }
 
-    /* Fresh VM for an existing session: restore its predecessor's workspace
-     * before the first execute, so an 8h rollover / eviction is invisible.
-     * A prior record (or a checkpoint pointer) means the session existed. */
-    if (this.checkpointStore && this.checkpointsActive() && (record?.workspace_checkpoint || record != null)) {
+    /* Fresh VM: restore the predecessor's workspace before the first execute so
+     * an 8h rollover / eviction is invisible. Attempt whenever checkpoints are
+     * active, NOT only when a Redis record exists — the checkpoint lives under a
+     * deterministic S3 key that can outlive/repair a lost record, and
+     * restoreSession treats a missing object as `absent` (a truly new session
+     * just no-ops one stat). */
+    if (this.checkpointStore && this.checkpointsActive()) {
       await restoreSession({
         client,
         store: this.checkpointStore,
@@ -379,6 +386,29 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     return base;
   }
 
+  /** Mints a proxy auth token under the shared per-second token budget, so
+   *  concurrent warm-session executes queue instead of bursting past AWS's
+   *  CreateMicrovmAuthToken TPS limit (mirrors launch's `run` budget). */
+  private async mintAuthToken(client: LambdaMicrovmClient, microvmId: string): Promise<MicrovmAuthToken> {
+    try {
+      await acquireOpBudget('token', {
+        limitPerSecond: this.config.tokenTps,
+        budgetMs: this.config.launchTimeoutMs,
+      });
+    } catch (error) {
+      if (error instanceof MicrovmOpThrottledError) {
+        microvmThrottleEvents.inc({ op: 'token' });
+        throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
+      }
+      throw error;
+    }
+    return client.createMicrovmAuthToken({
+      microvmId,
+      port: this.config.port,
+      ttlSeconds: this.config.authTokenTtlSeconds,
+    });
+  }
+
   private async proxyExecute(
     client: LambdaMicrovmClient,
     vm: MicrovmDescription,
@@ -387,11 +417,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     runtimeSessionId?: string,
   ): Promise<SandboxRawResponse> {
     const base = normalizeMicrovmEndpoint(vm.endpoint ?? '');
-    const token = await client.createMicrovmAuthToken({
-      microvmId: vm.microvmId,
-      port: this.config.port,
-      ttlSeconds: this.config.authTokenTtlSeconds,
-    });
+    const token = await this.mintAuthToken(client, vm.microvmId);
     await this.assertHealthy(base, token.token, ctx);
 
     /* Session mode is opted into per-request via this header (not a /run

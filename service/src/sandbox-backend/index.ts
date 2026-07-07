@@ -32,6 +32,7 @@ function createBackend(): SandboxBackend {
         launchTimeoutMs: env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS,
         healthTimeoutMs: env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS,
         launchTps: env.LAMBDA_MICROVM_LAUNCH_TPS,
+        tokenTps: env.LAMBDA_MICROVM_TOKEN_TPS,
         jobTimeoutMs: env.JOB_TIMEOUT,
         idleSeconds: env.LAMBDA_MICROVM_IDLE_SECONDS,
         suspendedSeconds: env.LAMBDA_MICROVM_SUSPEND_SECONDS,
