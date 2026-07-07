@@ -74,8 +74,10 @@ variable "create_checkpoint_access_user" {
   description = <<-EOT
     Create an IAM user + access key with read/write on the checkpoint bucket, for
     the CodeAPI service's MinIO-compatible checkpoint client (MINIO_ACCESS_KEY /
-    MINIO_SECRET_KEY). Prefer attaching the checkpoint policy to your CodeAPI task
-    role instead when running on ECS/EKS; set this false in that case.
+    MINIO_SECRET_KEY). This is currently the ONLY working path: the checkpoint
+    client reads static keys and does not load task-role/IRSA credentials, so
+    attaching `checkpoint_access_policy_arn` to a task role alone does not work
+    yet. Set true unless you supply MINIO_ACCESS_KEY/SECRET some other way.
   EOT
   type        = bool
   default     = false

@@ -14,8 +14,10 @@ locals {
 # S3: code-artifact bucket (the zip that create-microvm-image reads)
 # --------------------------------------------------------------------------
 resource "aws_s3_bucket" "artifact" {
-  count         = var.create_artifact_bucket ? 1 : 0
-  bucket        = "${var.name_prefix}-artifacts-${local.account_id}"
+  count = var.create_artifact_bucket ? 1 : 0
+  # Region in the name: S3 bucket names are globally unique, so applying this
+  # module in a second region with the same name_prefix would otherwise collide.
+  bucket        = "${var.name_prefix}-artifacts-${var.region}-${local.account_id}"
   force_destroy = true
   tags          = local.base_tags
 }
@@ -51,7 +53,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifact" {
 # resumable cache rather than a system of record.
 # --------------------------------------------------------------------------
 resource "aws_s3_bucket" "checkpoint" {
-  bucket        = "${var.name_prefix}-checkpoints-${local.account_id}"
+  bucket        = "${var.name_prefix}-checkpoints-${var.region}-${local.account_id}"
   force_destroy = true
   tags          = local.base_tags
 }

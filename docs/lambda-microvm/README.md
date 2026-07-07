@@ -249,9 +249,12 @@ then do hooks route. See [Runbook gotchas](#runbook-gotchas).
 
 **Checkpoint store.** The checkpoint client is MinIO-compatible. For local dev,
 point `MINIO_*` at a local MinIO. For prod, point it at real S3 (endpoint
-`s3.<region>.amazonaws.com`, `MINIO_USE_SSL=true`). Prefer granting the
-checkpoint policy (Terraform output `checkpoint_access_policy_arn`) to your
-CodeAPI task role over minting static keys.
+`s3.<region>.amazonaws.com`, `MINIO_PORT=443`, `MINIO_USE_SSL=true`). The client
+authenticates with static `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` only — it does
+**not** yet load task-role/IRSA credentials — so set
+`create_checkpoint_access_user = true` and use its keys. Attaching
+`checkpoint_access_policy_arn` to a task role alone will not work until the
+checkpoint client grows IRSA-aware credential loading (a tracked follow-up).
 
 **Egress posture.** For dev, the Lambda-managed `INTERNET_EGRESS` connector gives
 default public egress. For hardened prod, set

@@ -31,7 +31,13 @@ output "runtime_log_group" {
 }
 
 output "checkpoint_access_policy_arn" {
-  description = "Attach to your CodeAPI task role for checkpoint S3 access (preferred over the IAM user)."
+  description = <<-EOT
+    IAM policy for checkpoint S3 access. NOTE: the checkpoint client reads static
+    MINIO_ACCESS_KEY/SECRET and does not yet load task-role/IRSA credentials, so
+    attaching this to a task role alone does not grant access today — use
+    create_checkpoint_access_user (static keys). This output is for when
+    IRSA-capable credential loading lands in the checkpoint client.
+  EOT
   value       = aws_iam_policy.checkpoint_access.arn
 }
 
