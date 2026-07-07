@@ -91,9 +91,11 @@ export class SessionWorkspace {
    *  later job re-scanning the persistent workspace does not re-upload
    *  unchanged prior outputs (output diffing). */
   private readonly surfaced = new Map<string, string>();
-  /** relPath -> storage file id already primed onto disk, so an unchanged
-   *  input delivered again is not re-downloaded (priming dedup). */
-  private readonly primed = new Map<string, string>();
+  /** relPath -> {id, readOnly} already primed onto disk, so an unchanged input
+   *  delivered again is not re-downloaded (priming dedup). `readOnly` inputs are
+   *  never reused (a sandbox can unlink+replace a 0444 file via the writable
+   *  parent dir), so they re-download to restore pristine content + protection. */
+  private readonly primed = new Map<string, { id: string; readOnly: boolean }>();
 
   constructor(binding: SessionBinding) {
     this.runtimeSessionId = binding.runtimeSessionId;
@@ -132,12 +134,16 @@ export class SessionWorkspace {
     this.surfaced.delete(relPath);
   }
 
+  /** The primed storage id for `relPath`, or undefined. `readOnly` primes are
+   *  reported as not-primed so the caller always re-downloads them. */
   primedInputId(relPath: string): string | undefined {
-    return this.primed.get(relPath);
+    const entry = this.primed.get(relPath);
+    if (!entry || entry.readOnly) return undefined;
+    return entry.id;
   }
 
-  markPrimed(relPath: string, storageFileId: string): void {
-    this.primed.set(relPath, storageFileId);
+  markPrimed(relPath: string, storageFileId: string, readOnly = false): void {
+    this.primed.set(relPath, { id: storageFileId, readOnly });
   }
 
   /** Full teardown: wipe the dir, release the pinned UID, clear diff state. */

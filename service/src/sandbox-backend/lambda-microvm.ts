@@ -42,6 +42,7 @@ export interface LambdaMicrovmBackendConfig {
   imageArn: string;
   imageVersion?: string;
   executionRoleArn?: string;
+  logGroup?: string;
   ingressConnectorArns?: string[];
   egressConnectorArns?: string[];
   port: number;
@@ -161,6 +162,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     runtimeSessionId: string,
   ): Promise<SandboxRawResponse> {
+    /* Approximate the JOB_TIMEOUT budget consumed so we don't push the result
+     * past the router's `waitUntilFinished(JOB_TIMEOUT)` with an optional
+     * checkpoint (below). Captured before the lock wait so lock-wait + launch +
+     * execute all count. */
+    const startedAt = Date.now();
     const lockToken = await waitForRuntimeSessionLock(runtimeSessionId, { waitMs: this.config.lockWaitMs });
     if (!lockToken) {
       runtimeSessionLockContention.inc({ mode: ctx.runtimeSessionMode });
@@ -181,9 +187,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
       const now = Date.now();
+      /* The post-run checkpoint is an optional cache write. Skip it when the job
+       * budget won't fit a full checkpoint, so a run that already succeeded
+       * isn't timed out at the router by the checkpoint's latency — the next
+       * relaunch restores the prior checkpoint, one exec staler. */
+      const remainingBudgetMs = this.config.jobTimeoutMs - (now - startedAt);
+      const canCheckpoint = !ctx.signal.aborted && remainingBudgetMs > this.config.checkpoint.timeoutMs;
       const settled = await readRuntimeSessionRecord(runtimeSessionId);
       const nextRecord = settled
-        ? await this.checkpointUnderLock(client, settled, runtimeSessionId, now, lockToken)
+        ? canCheckpoint
+          ? await this.checkpointUnderLock(client, settled, runtimeSessionId, now, lockToken)
+          : { ...settled, state: 'RUNNING' as const, last_seen_at: now }
         : undefined;
       if (nextRecord) {
         await writeRuntimeSessionRecord(nextRecord, lockToken);
@@ -219,16 +233,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     try {
       return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId);
     } catch (error) {
-      /* Keep the warm VM only when the runner actually responded — a non-2xx
-       * makes axios throw an AxiosError carrying `.response`, so the VM is alive
-       * and just the request failed. No response (connection/timeout/abort) or a
-       * failed health check means the VM is unreachable/dirty: terminate it and
-       * drop the record so the next call relaunches + restores. (`Error from
-       * sandbox` covers proxyExecute's manual 2xx-but-not-200 throw.) */
-      const sandboxResponded =
-        (axios.isAxiosError(error) && error.response != null) ||
-        (error instanceof Error && error.message === 'Error from sandbox');
-      if (ctx.signal.aborted || !sandboxResponded) {
+      /* Recycle the VM ONLY on positive evidence it's unreachable or dirty:
+       *  - abort: the runner keeps NsJail running after the socket closes, so a
+       *    reuse could mutate the workspace concurrently.
+       *  - a transport-level axios failure (no `.response`): health/execute
+       *    couldn't reach the VM (connection refused/timeout).
+       * Everything else keeps the warm VM: a non-2xx sandbox response (AxiosError
+       * WITH `.response` — the VM is alive, only the request failed) and, crucially,
+       * a pre-request control-plane failure like a throttled CreateMicrovmAuthToken
+       * (not an axios error at all) — the VM was never touched. */
+      const transportFailure = axios.isAxiosError(error) && error.response == null;
+      if (ctx.signal.aborted || transportFailure) {
         await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
       }
@@ -252,11 +267,18 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       && record.image_arn === this.config.imageArn
       && record.image_version === this.config.imageVersion
       && record.port === this.config.port;
+    /* Past idle+suspended, AWS auto-terminates the suspended VM while the record
+     * still reads RUNNING until the 8h hard deadline. Treat that as non-reusable
+     * so the first request after idle expiry relaunches + restores, instead of
+     * reusing a dead endpoint, failing the health check, and returning 503. */
+    const idleTerminationMs = (this.config.idleSeconds + this.config.suspendedSeconds) * 1_000;
+    const likelyIdleTerminated = record != null && Date.now() - record.last_seen_at > idleTerminationMs;
     const reusable = record
       && record.state === 'RUNNING'
       && record.microvm_id
       && record.endpoint
       && configMatches
+      && !likelyIdleTerminated
       && (record.hard_deadline_at == null || record.hard_deadline_at - Date.now() > deadlineHeadroomMs);
     if (reusable && record) {
       /* Reuse the warm VM. If AWS auto-suspended it, the proxy request
@@ -431,6 +453,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         imageIdentifier: this.config.imageArn,
         imageVersion: this.config.imageVersion,
         executionRoleArn: this.config.executionRoleArn,
+        logGroup: this.config.logGroup,
         ingressConnectorArns: this.config.ingressConnectorArns,
         egressConnectorArns: this.config.egressConnectorArns,
         maximumDurationSeconds: opts.maxDurationSeconds,

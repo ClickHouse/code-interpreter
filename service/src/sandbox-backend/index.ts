@@ -23,6 +23,7 @@ function createBackend(): SandboxBackend {
         imageArn: env.LAMBDA_MICROVM_IMAGE_ARN,
         imageVersion: env.LAMBDA_MICROVM_IMAGE_VERSION,
         executionRoleArn: env.LAMBDA_MICROVM_EXECUTION_ROLE_ARN,
+        logGroup: env.LAMBDA_MICROVM_LOG_GROUP,
         ingressConnectorArns: env.LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS,
         egressConnectorArns: env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS,
         port: env.LAMBDA_MICROVM_PORT,

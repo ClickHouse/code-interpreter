@@ -109,6 +109,7 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
           autoResumeEnabled: args.idlePolicy.autoResume,
         }
         : undefined,
+      logging: args.logGroup ? { cloudWatch: { logGroup: args.logGroup } } : undefined,
       runHookPayload: args.runHookPayload,
       clientToken: args.clientToken,
     }));

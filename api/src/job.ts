@@ -850,7 +850,12 @@ export class Job {
   private async primeInputFile(file: TFile): Promise<void> {
     if (this.session && file.id && (await this.reusePrimedInput(file))) return;
     const name = await this.downloadAndWriteFile(file);
-    if (this.session && file.id && name) this.session.markPrimed(name, file.id);
+    if (this.session && file.id && name) {
+      /* Record read-only so the next turn re-downloads it (primedInputId reports
+       * read-only primes as not-primed) — a reused on-disk copy could have been
+       * tampered via the writable parent dir. */
+      this.session.markPrimed(name, file.id, this.inputFileHashes.get(name)?.readOnly === true);
+    }
   }
 
   private async reusePrimedInput(file: TFile): Promise<boolean> {
@@ -1529,14 +1534,12 @@ export class Job {
     }
 
     let size: number;
-    let mtimeMs: number;
     try {
       /* Use lstat to stay consistent with classifyDirent's symlink filter —
        * following a symlink here would resurrect the exact escape vector
        * that the classification step already rejected. */
       const st = await fsp.lstat(fullPath);
       size = st.size;
-      mtimeMs = st.mtimeMs;
     } catch (err) {
       this.log.debug({ path: relativePath, err }, 'walkDir: unable to stat file');
       return { collected: false, truncated: false, stopLoop: false };
@@ -1545,29 +1548,33 @@ export class Job {
       return { collected: false, truncated: false, stopLoop: false };
     }
 
-    /* Session mode output diffing: a persistent workspace still holds prior
-     * jobs' outputs. Skip any file already surfaced to the client whose
-     * size+mtime are unchanged, so only genuine deltas are re-uploaded. An
-     * input file (tracked in inputFileHashes) is left to the existing
-     * modified/unchanged classification below. */
-    const outputSignature = `${size}:${mtimeMs}`;
-    if (this.session && !this.inputFileHashes.has(relativePath)
-      && this.session.isSurfaced(relativePath, outputSignature)) {
-      return { collected: false, truncated: false, stopLoop: false };
-    }
-
+    /* Session mode output diffing + input-modification detection. Hash by
+     * CONTENT (not size+mtime): a program can rewrite a surfaced output with
+     * different bytes while preserving size+mtime (os.utime / touch -r), which a
+     * stat-only signature would wrongly suppress. Compute once per session/input
+     * file and reuse for the suppression check, wasModified, and the surfaced
+     * mark; non-session jobs still only hash their inputs. */
     const inputFileInfo = this.inputFileHashes.get(relativePath);
     const existingFile = inputByName.get(relativePath);
-    let wasModified = false;
-
-    if (inputFileInfo) {
+    let contentHash: string | undefined;
+    if (inputFileInfo != null || this.session != null) {
       try {
-        const currentHash = await this.computeFileHash(fullPath, true);
-        wasModified = currentHash !== inputFileInfo.hash;
-        if (wasModified) this.log.info({ file: relativePath }, 'Input file was modified');
+        contentHash = await this.computeFileHash(fullPath, true);
       } catch (err) {
         this.log.debug({ path: relativePath, err }, 'walkDir: failed to hash file');
       }
+    }
+
+    /* Skip a pure output already surfaced with identical content. */
+    if (this.session && inputFileInfo == null && contentHash != null
+      && this.session.isSurfaced(relativePath, contentHash)) {
+      return { collected: false, truncated: false, stopLoop: false };
+    }
+
+    let wasModified = false;
+    if (inputFileInfo && contentHash != null) {
+      wasModified = contentHash !== inputFileInfo.hash;
+      if (wasModified) this.log.info({ file: relativePath }, 'Input file was modified');
     }
 
     const echoed = this.tryEchoUnchangedInput({
@@ -1596,7 +1603,9 @@ export class Job {
     /* Defer the surfaced-mark until the upload succeeds (flushed in
      * uploadGeneratedFiles) — marking here would suppress the file forever if
      * its upload later fails and the route prunes it from the response. */
-    if (this.session) this.pendingSurfaced.set(newId, { name: relativePath, signature: outputSignature });
+    if (this.session && contentHash != null) {
+      this.pendingSurfaced.set(newId, { name: relativePath, signature: contentHash });
+    }
     return { collected: true, truncated: false, stopLoop: false };
   }
 

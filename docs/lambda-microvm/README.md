@@ -146,6 +146,7 @@ CODEAPI_SANDBOX_BACKEND=lambda-microvm
 CODEAPI_RUNTIME_SESSION_MODE=affinity          # warm sessions + checkpoints
 LAMBDA_MICROVM_IMAGE_ARN=<from step 3>
 LAMBDA_MICROVM_EXECUTION_ROLE_ARN=<terraform execution_role_arn>
+LAMBDA_MICROVM_LOG_GROUP=<terraform runtime_log_group>   # both this AND the role are needed for VM stdout
 LAMBDA_MICROVM_REGION=us-east-1
 LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS=arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:ALL_INGRESS
 LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS=arn:aws:lambda:us-east-1:aws:network-connector:aws-network-connector:INTERNET_EGRESS
@@ -191,7 +192,8 @@ All names as they appear in `service/src/config.ts`.
 |---|---|---|
 | `LAMBDA_MICROVM_IMAGE_ARN` | — (required) | The image created in step 3. |
 | `LAMBDA_MICROVM_IMAGE_VERSION` | latest | Pin a specific image version. |
-| `LAMBDA_MICROVM_EXECUTION_ROLE_ARN` | — | Logging-only role. Required for runtime VM stdout to reach CloudWatch. |
+| `LAMBDA_MICROVM_EXECUTION_ROLE_ARN` | — | Logging-only role. Required (with the log group below) for runtime VM stdout to reach CloudWatch. |
+| `LAMBDA_MICROVM_LOG_GROUP` | — | CloudWatch log group sent on `RunMicrovm`. Needed alongside the execution role or stdout goes nowhere. |
 | `LAMBDA_MICROVM_REGION` | SDK default | Region for the lambda-microvms client. |
 | `LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS` | — | Comma-separated. Inbound HTTPS to the VM. |
 | `LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS` | — | Comma-separated. Outbound from the VM. Required in hardened mode. |

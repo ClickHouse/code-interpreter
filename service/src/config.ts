@@ -175,6 +175,9 @@ export const env = {
   LAMBDA_MICROVM_IMAGE_ARN: process.env.LAMBDA_MICROVM_IMAGE_ARN ?? '',
   LAMBDA_MICROVM_IMAGE_VERSION: process.env.LAMBDA_MICROVM_IMAGE_VERSION || undefined,
   LAMBDA_MICROVM_EXECUTION_ROLE_ARN: process.env.LAMBDA_MICROVM_EXECUTION_ROLE_ARN || undefined,
+  /* Runtime VM stdout reaches CloudWatch only when RunMicrovm sends a logging
+   * config AND an executionRoleArn is set — pairs with the role above. */
+  LAMBDA_MICROVM_LOG_GROUP: process.env.LAMBDA_MICROVM_LOG_GROUP || undefined,
   LAMBDA_MICROVM_REGION: process.env.LAMBDA_MICROVM_REGION || undefined,
   LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS),
   LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS),

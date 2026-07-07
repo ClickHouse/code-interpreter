@@ -46,17 +46,22 @@ const LOCK_PREFIX = 'rtsx:lock:';
 const GEN_PREFIX = 'rtsx:gen:';
 const ACTIVE_ZSET = 'rtsx:active';
 
-/** The session lock is held across the whole `executeSession` critical path —
- * launch + health + execute + post-run checkpoint — so its TTL must outlive the
- * sum of those configurable budgets, else a live holder is fenced mid-operation
- * and a second worker can acquire the same session concurrently. Derive it from
- * the actual budgets (not a fixed placeholder) so raising any one of them keeps
- * the lock safe, plus headroom for lock-wait + scheduling jitter. */
+/** The session lock is held across the WHOLE `executeSession` critical path, so
+ * its TTL must outlive the worst-case sum of the configurable budgets — else a
+ * live holder is fenced mid-operation and a second worker acquires the same
+ * session concurrently. A relaunch path can spend, back to back:
+ *   - launch throttle wait (acquireOpBudget)      ≤ LAUNCH_TIMEOUT_MS
+ *   - poll to RUNNING (waitUntilRunning)          ≤ LAUNCH_TIMEOUT_MS
+ *   - restore the checkpoint before the first exec ≤ CHECKPOINT_TIMEOUT_MS
+ *   - health check                                 ≤ HEALTH_TIMEOUT_MS
+ *   - the execute                                  ≤ JOB_TIMEOUT
+ *   - the post-run checkpoint                      ≤ CHECKPOINT_TIMEOUT_MS
+ * so budget 2× launch and 2× checkpoint, plus headroom for lock-wait + jitter. */
 export const RUNTIME_SESSION_LOCK_TTL_MS =
   env.JOB_TIMEOUT +
-  env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS +
+  2 * env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS +
   env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS +
-  env.CHECKPOINT_TIMEOUT_MS +
+  2 * env.CHECKPOINT_TIMEOUT_MS +
   60_000;
 
 const MAX_MICROVM_DURATION_SECONDS = 28_800;

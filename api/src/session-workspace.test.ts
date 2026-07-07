@@ -109,6 +109,11 @@ describe('SessionWorkspace state', () => {
       ws.markPrimed('in.csv', 'file_abc');
       expect(ws.primedInputId('in.csv')).toBe('file_abc');
 
+      /* read-only primes report as not-primed so the caller re-downloads them
+       * (a reused on-disk copy could have been tampered via the writable dir). */
+      ws.markPrimed('skill.py', 'file_ro', true);
+      expect(ws.primedInputId('skill.py')).toBeUndefined();
+
       await ws.reset();
       expect(ws.isSurfaced('out.csv', '10:100')).toBe(false);
       expect(ws.primedInputId('in.csv')).toBeUndefined();

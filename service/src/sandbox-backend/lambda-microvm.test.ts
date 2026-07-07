@@ -343,6 +343,22 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
+  test('relaunches an idle-expired session instead of reusing the dead endpoint', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    /* Backdate last_seen past idle+suspended: AWS would have auto-terminated the
+     * VM, so the next request must relaunch rather than reuse the stale RUNNING
+     * endpoint (which would health-check-fail and 503 the first request). */
+    const token = (await acquireRuntimeSessionLock('rt_session_1', 60_000)) as string;
+    const rec = await readRuntimeSessionRecord('rt_session_1');
+    await writeRuntimeSessionRecord({ ...rec!, last_seen_at: 1 }, token);
+    const { releaseRuntimeSessionLock } = await import('../runtime-session/registry');
+    await releaseRuntimeSessionLock('rt_session_1', token);
+    await backend.execute(request(), sessionContext());
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+  });
+
   test('two concurrent executions on one session serialize on the registry lock', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);

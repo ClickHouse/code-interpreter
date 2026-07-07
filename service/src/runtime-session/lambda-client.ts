@@ -37,6 +37,9 @@ export interface RunMicrovmArgs {
   egressConnectorArns?: string[];
   maximumDurationSeconds: number;
   idlePolicy?: MicrovmIdlePolicy;
+  /** CloudWatch log group for the VM's stdout/stderr. Needs an executionRoleArn
+   *  too, or the logs go nowhere. */
+  logGroup?: string;
   /** Delivered verbatim as the /run lifecycle hook body (AWS cap: 16KB). */
   runHookPayload?: string;
   /** Idempotency token so a retried launch cannot double-provision. */
