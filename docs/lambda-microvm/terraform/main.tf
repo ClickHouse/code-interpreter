@@ -33,10 +33,14 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifact" {
   count  = var.create_artifact_bucket ? 1 : 0
   bucket = aws_s3_bucket.artifact[0].id
   rule {
+    # SSE-S3 (not SSE-KMS): the Lambda build role reads the artifact with only
+    # s3:GetObject, so a KMS-encrypted bucket would AccessDenied without a
+    # kms:Decrypt grant. Artifacts are non-sensitive (the runner image zip);
+    # upgrade to aws:kms + a kms:Decrypt statement on the build role if you need
+    # a customer-managed key.
     apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
+      sse_algorithm = "AES256"
     }
-    bucket_key_enabled = true
   }
 }
 
@@ -70,10 +74,13 @@ resource "aws_s3_bucket_versioning" "checkpoint" {
 resource "aws_s3_bucket_server_side_encryption_configuration" "checkpoint" {
   bucket = aws_s3_bucket.checkpoint.id
   rule {
+    # SSE-S3 so the checkpoint access policy needs no kms:Decrypt /
+    # kms:GenerateDataKey grant (the MinIO-compatible client reads/writes with
+    # plain S3 perms). Still encrypted at rest with AWS-managed keys; switch to
+    # aws:kms + KMS grants on checkpoint_access if you require a CMK.
     apply_server_side_encryption_by_default {
-      sse_algorithm = "aws:kms"
+      sse_algorithm = "AES256"
     }
-    bucket_key_enabled = true
   }
 }
 
@@ -143,10 +150,16 @@ data "aws_iam_policy_document" "build_perms" {
   }
 
   statement {
-    sid       = "BuildLogs"
-    effect    = "Allow"
-    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/lambda-microvms/*"]
+    sid     = "BuildLogs"
+    effect  = "Allow"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    # Two ARN forms: the log-group itself (CreateLogGroup) and its streams
+    # (`:*` suffix — CreateLogStream/PutLogEvents act at stream level, which the
+    # `/*` form does NOT match). Missing `:*` = build fails with empty stateReason.
+    resources = [
+      "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/lambda-microvms/*",
+      "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/lambda-microvms/*:*",
+    ]
   }
 
   dynamic "statement" {
@@ -195,10 +208,16 @@ resource "aws_iam_role" "execution" {
 
 data "aws_iam_policy_document" "exec_perms" {
   statement {
-    sid       = "RuntimeLogs"
-    effect    = "Allow"
-    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["${aws_cloudwatch_log_group.runtime.arn}:*"]
+    sid     = "RuntimeLogs"
+    effect  = "Allow"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    # Group ARN for CreateLogGroup + the `:*` stream form for the stream-level
+    # actions (the group is pre-created here, but grant both so the runtime
+    # logging agent works regardless).
+    resources = [
+      aws_cloudwatch_log_group.runtime.arn,
+      "${aws_cloudwatch_log_group.runtime.arn}:*",
+    ]
   }
 }
 

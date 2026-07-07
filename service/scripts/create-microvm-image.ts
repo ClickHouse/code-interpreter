@@ -83,12 +83,20 @@ async function main(): Promise<void> {
   }
 
   const started = Date.now();
+  /* Cap the wait so a build wedged in CREATING/UPDATING can't hang a
+   * provisioning job forever (observed during the spike). Override with
+   * MICROVM_BUILD_DEADLINE_MINUTES. */
+  const deadlineMs = started + Number(process.env.MICROVM_BUILD_DEADLINE_MINUTES ?? '30') * 60_000;
   for (;;) {
     /* GetMicrovmImage accepts the image name as the identifier. */
     const img = (await client.send(
       new GetMicrovmImageCommand({ imageIdentifier: name }),
     )) as { state?: string; imageArn?: string; imageVersion?: string; stateReason?: string };
     const elapsed = Math.round((Date.now() - started) / 1000);
+    if (Date.now() > deadlineMs) {
+      console.error(`\nTimed out after ${elapsed}s still in state ${img.state ?? 'UNKNOWN'}. Check the build log group.`);
+      process.exit(1);
+    }
     const state = img.state ?? 'UNKNOWN';
     if (state === 'CREATED' || state === 'UPDATED') {
       console.log(`\n${state} in ${elapsed}s`);

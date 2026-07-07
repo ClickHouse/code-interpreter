@@ -35,6 +35,13 @@ variable "artifact_bucket_name" {
   description = "Existing artifact bucket name when create_artifact_bucket = false."
   type        = string
   default     = ""
+
+  # Reject an empty name when reusing an existing bucket, else the build-role
+  # policy resolves to `arn:aws:s3:::/*` and the build can't read the artifact.
+  validation {
+    condition     = var.create_artifact_bucket || length(var.artifact_bucket_name) > 0
+    error_message = "artifact_bucket_name must be set when create_artifact_bucket is false."
+  }
 }
 
 variable "checkpoint_retention_days" {

@@ -145,6 +145,7 @@ LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS=arn:aws:lambda:us-east-1:aws:network-connec
 # checkpoints (S3-compatible, same client as file-server)
 CODEAPI_CHECKPOINT_BUCKET=<terraform checkpoint_bucket>
 MINIO_ENDPOINT=s3.us-east-1.amazonaws.com
+MINIO_PORT=443           # required: the client defaults to 9000, which fails against S3
 MINIO_USE_SSL=true
 MINIO_REGION=us-east-1
 MINIO_ACCESS_KEY=...    # from your CodeAPI task role, or the optional TF IAM user
@@ -313,9 +314,12 @@ Each of these cost a silent or blind failure during bring-up:
 ## Teardown
 
 ```bash
-# terminate any live VMs, then delete the image
+# Terminate only VMs launched from THIS image, then delete the image.
+# IMAGE_ARN scopes the sweep so it never touches unrelated MicroVMs in a shared
+# account (ListMicrovms returns every VM in the region).
 cd service
-AWS_PROFILE=... bun -e 'import { LambdaMicrovmsClient, ListMicrovmsCommand, TerminateMicrovmCommand, DeleteMicrovmImageCommand } from "@aws-sdk/client-lambda-microvms"; const c=new LambdaMicrovmsClient({region:"us-east-1"}); const v=await c.send(new ListMicrovmsCommand({})); for (const m of (v.microvms??[]).filter(x=>!/TERMINAT/.test(x.state))) await c.send(new TerminateMicrovmCommand({microvmIdentifier:m.microvmId})); await c.send(new DeleteMicrovmImageCommand({imageIdentifier:"codeapi-session"})).catch(()=>{});'
+export IMAGE_ARN="arn:aws:lambda:us-east-1:<acct>:microvm-image:codeapi-session"
+AWS_PROFILE=... bun -e 'import { LambdaMicrovmsClient, ListMicrovmsCommand, TerminateMicrovmCommand, DeleteMicrovmImageCommand } from "@aws-sdk/client-lambda-microvms"; const arn=process.env.IMAGE_ARN; const c=new LambdaMicrovmsClient({region:"us-east-1"}); const v=await c.send(new ListMicrovmsCommand({})) as any; for (const m of (v.microvms??[]).filter((x:any)=>!/TERMINAT/.test(x.state) && x.imageArn===arn)) await c.send(new TerminateMicrovmCommand({microvmIdentifier:m.microvmId})); await c.send(new DeleteMicrovmImageCommand({imageIdentifier:"codeapi-session"})).catch(()=>{});'
 
 # then the prerequisites
 cd ../docs/lambda-microvm/terraform && terraform destroy
