@@ -5,7 +5,7 @@ import type { SandboxBackend, SandboxExecuteContext, SandboxRawResponse, Sandbox
 import type { RuntimeSessionRecord } from '../runtime-session/registry';
 import type { CheckpointConfig } from '../runtime-session/checkpoint';
 import type { CheckpointStore } from '../runtime-session/checkpoint-store';
-import { LambdaMicrovmApiError } from '../runtime-session/lambda-client';
+import { LambdaMicrovmApiError, microvmPortHeaders } from '../runtime-session/lambda-client';
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
 import { checkpointSession, restoreSession } from '../runtime-session/checkpoint';
 import {
@@ -193,7 +193,15 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * isn't timed out at the router by the checkpoint's latency — the next
        * relaunch restores the prior checkpoint, one exec staler. */
       const remainingBudgetMs = this.config.jobTimeoutMs - (now - startedAt);
-      const canCheckpoint = !ctx.signal.aborted && remainingBudgetMs > this.config.checkpoint.timeoutMs;
+      /* Reserve the WHOLE checkpoint path, not just one timeout: it can spend a
+       * token-budget wait (up to launchTimeoutMs) + the checkpoint GET + the
+       * object-store put (each up to checkpoint.timeoutMs). Guarding on a single
+       * timeout let a run finishing with barely more than that still block long
+       * enough to blow the router's waitUntilFinished(JOB_TIMEOUT) after the
+       * sandbox work already succeeded. */
+      const worstCaseCheckpointMs =
+        this.config.launchTimeoutMs + 2 * this.config.checkpoint.timeoutMs;
+      const canCheckpoint = !ctx.signal.aborted && remainingBudgetMs > worstCaseCheckpointMs;
       const settled = await readRuntimeSessionRecord(runtimeSessionId);
       const nextRecord = settled
         ? canCheckpoint
@@ -470,6 +478,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           headers: {
             ...injectTraceHeaders(req.headers),
             [token.headerName]: token.token,
+            ...microvmPortHeaders(this.config.port),
             ...sessionHeader,
           },
           signal: ctx.signal,
@@ -574,7 +583,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
   private async assertHealthy(base: string, token: string, ctx: SandboxExecuteContext): Promise<void> {
     try {
       const response = await axios.get(`${base}/api/v2/health`, {
-        headers: { 'X-aws-proxy-auth': token },
+        headers: { 'X-aws-proxy-auth': token, ...microvmPortHeaders(this.config.port) },
         timeout: this.config.healthTimeoutMs,
         signal: ctx.signal,
       });

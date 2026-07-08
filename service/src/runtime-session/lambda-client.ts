@@ -75,6 +75,16 @@ export class LambdaMicrovmApiError extends Error {
 
 export const MICROVM_AUTH_HEADER = 'X-aws-proxy-auth';
 
+/** MicroVM endpoint traffic defaults to port 8080; to reach a different target
+ *  port the request must carry this header (AWS routes to 8080 without it). */
+export const MICROVM_PORT_HEADER = 'X-aws-proxy-port';
+export const DEFAULT_MICROVM_PORT = 8080;
+
+/** The port-routing header, only when the target port isn't the 8080 default. */
+export function microvmPortHeaders(port: number): Record<string, string> {
+  return port === DEFAULT_MICROVM_PORT ? {} : { [MICROVM_PORT_HEADER]: String(port) };
+}
+
 export interface LambdaMicrovmClient {
   runMicrovm(args: RunMicrovmArgs): Promise<MicrovmDescription>;
   getMicrovm(microvmId: string): Promise<MicrovmDescription>;

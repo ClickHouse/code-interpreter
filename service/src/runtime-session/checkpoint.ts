@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type { MicrovmAuthToken } from './lambda-client';
+import { microvmPortHeaders } from './lambda-client';
 import type { CheckpointStore } from './checkpoint-store';
 import {
   acquireRuntimeSessionLock,
@@ -58,6 +59,7 @@ export async function pullCheckpoint(
   const response = await axios.get<ArrayBuffer>(`${args.endpointBase}/api/v2/session/checkpoint`, {
     headers: {
       [token.headerName]: token.token,
+      ...microvmPortHeaders(config.port),
       [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
     },
     responseType: 'arraybuffer',
@@ -76,6 +78,7 @@ export async function pushRestore(
   await axios.post(`${args.endpointBase}/api/v2/session/restore`, data, {
     headers: {
       [token.headerName]: token.token,
+      ...microvmPortHeaders(config.port),
       [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
       'Content-Type': 'application/x-gtar',
     },

@@ -37,9 +37,14 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
   /* Carry the priming/output-diff state into the archive so a relaunched VM
    * rebuilds it (see restoreSessionCheckpoint). Written under the held session
    * lock, so no concurrent user code sees it, and removed from the live
-   * workspace once tar has read it. */
+   * workspace once tar has read it. Sandboxed code from a prior exec can squat
+   * this name as a symlink; the API process runs as root, so unlink it first
+   * (unlink never follows a link) then create a fresh regular file exclusively
+   * (`wx`) — otherwise a privileged write would follow the link and clobber an
+   * arbitrary target outside the workspace. */
   const metaPath = path.join(dir, SESSION_META_FILE);
-  await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()));
+  await fsp.rm(metaPath, { force: true });
+  await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()), { flag: 'wx' });
 
   res.status(200);
   res.setHeader('Content-Type', CHECKPOINT_CONTENT_TYPE);
@@ -110,6 +115,11 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
 async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promise<void> {
   const metaPath = path.join(dir, SESSION_META_FILE);
   try {
+    /* Only trust a regular file: a restored archive is untrusted, so never
+     * follow a symlinked sidecar (it would read an arbitrary file into the
+     * loaded metadata). lstat does not follow the link. */
+    const stat = await fsp.lstat(metaPath).catch(() => null);
+    if (!stat?.isFile()) return;
     const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as SessionMetaSnapshot;
     if (Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
       session.loadMeta(parsed);

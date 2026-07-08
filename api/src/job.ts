@@ -853,8 +853,10 @@ export class Job {
     if (this.session && file.id && name) {
       /* Record read-only so the next turn re-downloads it (primedInputId reports
        * read-only primes as not-primed) — a reused on-disk copy could have been
-       * tampered via the writable parent dir. */
-      this.session.markPrimed(name, file.id, this.inputFileHashes.get(name)?.readOnly === true);
+       * tampered via the writable parent dir. Keep the original upload hash as
+       * the reuse baseline so a later turn detects prior in-place mutations. */
+      const primed = this.inputFileHashes.get(name);
+      this.session.markPrimed(name, file.id, primed?.readOnly === true, primed?.hash);
     }
   }
 
@@ -866,7 +868,12 @@ export class Job {
     try {
       const st = await fsp.lstat(filePath);
       if (!st.isFile()) return false;
-      const hash = await this.computeFileHash(filePath, true);
+      /* Baseline against the ORIGINAL upload hash (recorded at prime time), not
+       * a re-hash of the on-disk copy: a prior turn may have mutated it in
+       * place, and re-hashing would bank the mutation as pristine and let the
+       * walker echo the original ref as unchanged. Falls back to hashing on
+       * disk if no original hash was retained. */
+      const hash = this.session?.primedHash(file.name) ?? (await this.computeFileHash(filePath, true));
       this.inputFileHashes.set(file.name, {
         originalId: file.id,
         originalSessionId: file.storage_session_id,

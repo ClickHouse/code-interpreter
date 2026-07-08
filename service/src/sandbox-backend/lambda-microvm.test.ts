@@ -413,6 +413,19 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
   });
 
+  test('sends X-aws-proxy-port only when the port is not the 8080 default', async () => {
+    const fake = fakeClient();
+    await makeBackend(fake, { port: 9090 }).execute(request(), sessionContext());
+    const exec = captured.find((c) => c.path === '/api/v2/execute');
+    /* Non-default port needs the routing header, or AWS sends traffic to 8080. */
+    expect(exec?.headers['x-aws-proxy-port']).toBe('9090');
+
+    captured = [];
+    await makeBackend(fake, { port: 8080 }).execute(request(), sessionContext({ runtimeSessionId: 'rt_8080' }));
+    const exec8080 = captured.find((c) => c.path === '/api/v2/execute');
+    expect(exec8080?.headers['x-aws-proxy-port']).toBeUndefined();
+  });
+
   test('a reused VM whose token mint returns not_found is torn down and the record dropped', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);

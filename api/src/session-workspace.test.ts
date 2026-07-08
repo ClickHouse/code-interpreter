@@ -126,7 +126,7 @@ describe('SessionWorkspace state', () => {
   test('snapshotMeta/loadMeta round-trips priming + output-diff state into a fresh workspace', () => {
     const source = new SessionWorkspace({ runtimeSessionId: 'rt_1' });
     source.markSurfaced('out.csv', '10:100');
-    source.markPrimed('in.csv', 'file_abc');
+    source.markPrimed('in.csv', 'file_abc', false, 'ORIGHASH');
     source.markPrimed('skill.py', 'file_ro', true);
 
     /* A relaunched VM starts with an empty workspace and loads the checkpoint's
@@ -137,6 +137,9 @@ describe('SessionWorkspace state', () => {
 
     expect(relaunched.primedInputId('in.csv')).toBe('file_abc');
     expect(relaunched.isSurfaced('out.csv', '10:100')).toBe(true);
+    /* the original upload hash survives so reuse baselines against it, not a
+     * re-hash of a possibly-mutated on-disk copy */
+    expect(relaunched.primedHash('in.csv')).toBe('ORIGHASH');
     /* read-only flag survives the round-trip, so it still re-downloads */
     expect(relaunched.primedInputId('skill.py')).toBeUndefined();
   });

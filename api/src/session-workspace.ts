@@ -43,7 +43,7 @@ export const RUNTIME_SESSION_ID_HEADER = 'x-runtime-session-id';
 export const SESSION_META_FILE = '.codeapi-session-meta.json';
 
 export interface SessionMetaSnapshot {
-  primed: Array<[string, { id: string; readOnly: boolean }]>;
+  primed: Array<[string, { id: string; readOnly: boolean; hash?: string }]>;
   surfaced: Array<[string, string]>;
 }
 
@@ -102,11 +102,14 @@ export class SessionWorkspace {
    *  later job re-scanning the persistent workspace does not re-upload
    *  unchanged prior outputs (output diffing). */
   private readonly surfaced = new Map<string, string>();
-  /** relPath -> {id, readOnly} already primed onto disk, so an unchanged input
-   *  delivered again is not re-downloaded (priming dedup). `readOnly` inputs are
-   *  never reused (a sandbox can unlink+replace a 0444 file via the writable
-   *  parent dir), so they re-download to restore pristine content + protection. */
-  private readonly primed = new Map<string, { id: string; readOnly: boolean }>();
+  /** relPath -> {id, readOnly, hash} already primed onto disk, so an unchanged
+   *  input delivered again is not re-downloaded (priming dedup). `readOnly`
+   *  inputs are never reused (a sandbox can unlink+replace a 0444 file via the
+   *  writable parent dir), so they re-download to restore pristine content +
+   *  protection. `hash` is the ORIGINAL upload hash, kept as the modification
+   *  baseline on reuse so a writable input mutated by a prior turn is reported
+   *  as modified-from-original rather than re-hashed as if it were pristine. */
+  private readonly primed = new Map<string, { id: string; readOnly: boolean; hash?: string }>();
 
   constructor(binding: SessionBinding) {
     this.runtimeSessionId = binding.runtimeSessionId;
@@ -153,8 +156,14 @@ export class SessionWorkspace {
     return entry.id;
   }
 
-  markPrimed(relPath: string, storageFileId: string, readOnly = false): void {
-    this.primed.set(relPath, { id: storageFileId, readOnly });
+  markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string): void {
+    this.primed.set(relPath, { id: storageFileId, readOnly, hash });
+  }
+
+  /** The original upload hash recorded when `relPath` was first primed, or
+   *  undefined. Used as the modification baseline on reuse. */
+  primedHash(relPath: string): string | undefined {
+    return this.primed.get(relPath)?.hash;
   }
 
   /** Serializes the priming + output-diff state into the checkpoint so a
