@@ -1578,6 +1578,14 @@ export class Job {
       return { collected: false, truncated: false, stopLoop: false };
     }
 
+    /* Skip a file primed as an input on an earlier turn that this turn didn't
+     * re-send: it has no inputFileInfo and was never surfaced as an output, so
+     * it would otherwise be echoed as a brand-new generated file on unrelated
+     * executions. It persists in the workspace as an input, not an output. */
+    if (this.session && inputFileInfo == null && this.session.isPrimedInput(relativePath)) {
+      return { collected: false, truncated: false, stopLoop: false };
+    }
+
     let wasModified = false;
     if (inputFileInfo && contentHash != null) {
       wasModified = contentHash !== inputFileInfo.hash;

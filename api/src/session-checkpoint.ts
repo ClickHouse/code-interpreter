@@ -38,12 +38,14 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
    * rebuilds it (see restoreSessionCheckpoint). Written under the held session
    * lock, so no concurrent user code sees it, and removed from the live
    * workspace once tar has read it. Sandboxed code from a prior exec can squat
-   * this name as a symlink; the API process runs as root, so unlink it first
-   * (unlink never follows a link) then create a fresh regular file exclusively
-   * (`wx`) — otherwise a privileged write would follow the link and clobber an
-   * arbitrary target outside the workspace. */
+   * this name as a symlink OR a directory; the API process runs as root, so
+   * remove whatever squats the path first — `recursive` clears a directory
+   * (else the write later fails EISDIR and breaks every checkpoint), `force`
+   * ignores absence, and neither follows a symlink — then create a fresh
+   * regular file exclusively (`wx`), so a privileged write can't follow a link
+   * and clobber an arbitrary target outside the workspace. */
   const metaPath = path.join(dir, SESSION_META_FILE);
-  await fsp.rm(metaPath, { force: true });
+  await fsp.rm(metaPath, { force: true, recursive: true });
   await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()), { flag: 'wx' });
 
   res.status(200);

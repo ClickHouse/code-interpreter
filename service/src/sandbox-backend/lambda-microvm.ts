@@ -547,7 +547,21 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     } catch (error) {
       microvmLaunches.inc({ outcome: 'failed' });
       await this.terminate(client, vm.microvmId, 'error');
-      throw error;
+      /* waitUntilRunning throws SandboxBackendError for its own conditions, but
+       * the GetMicrovm poll it makes can throw a raw LambdaMicrovmApiError
+       * (throttle/transient control-plane error). Map it like runMicrovm so it
+       * surfaces as a public MICROVM_LAUNCH_* failure, not a generic 500. */
+      if (error instanceof SandboxBackendError) throw error;
+      if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
+        await poisonOpBucket('run');
+        microvmThrottleEvents.inc({ op: 'run' });
+        throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
+      }
+      throw new SandboxBackendError(
+        'MICROVM_LAUNCH_FAILED',
+        error instanceof Error ? error.message : 'MicroVM poll failed',
+        error,
+      );
     }
   }
 

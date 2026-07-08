@@ -106,6 +106,7 @@ describe('SessionWorkspace state', () => {
       expect(ws.isSurfaced('out.csv', '11:200')).toBe(false);
 
       expect(ws.primedInputId('in.csv')).toBeUndefined();
+      expect(ws.isPrimedInput('in.csv')).toBe(false);
       ws.markPrimed('in.csv', 'file_abc');
       expect(ws.primedInputId('in.csv')).toBe('file_abc');
 
@@ -113,6 +114,11 @@ describe('SessionWorkspace state', () => {
        * (a reused on-disk copy could have been tampered via the writable dir). */
       ws.markPrimed('skill.py', 'file_ro', true);
       expect(ws.primedInputId('skill.py')).toBeUndefined();
+      /* ...but both still count as primed inputs, so a later turn that omits
+       * them doesn't re-surface them as generated outputs. */
+      expect(ws.isPrimedInput('in.csv')).toBe(true);
+      expect(ws.isPrimedInput('skill.py')).toBe(true);
+      expect(ws.isPrimedInput('never-primed.csv')).toBe(false);
 
       await ws.reset();
       expect(ws.isSurfaced('out.csv', '10:100')).toBe(false);

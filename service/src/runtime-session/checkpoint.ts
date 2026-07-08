@@ -4,7 +4,6 @@ import { microvmPortHeaders } from './lambda-client';
 import type { CheckpointStore } from './checkpoint-store';
 import {
   acquireRuntimeSessionLock,
-  allocateCheckpointSequence,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
   writeRuntimeSessionRecord,
@@ -109,6 +108,12 @@ export async function checkpointSession(args: {
     microvmCheckpoints.inc({ outcome: 'skipped_busy' });
     return 'skipped_busy';
   }
+  /* Stamp the checkpoint's start time and key the object by it: it never
+   * resets (unlike a counter with a TTL), so a checkpoint after a long idle gap
+   * always sorts above a retained older object, and a put that stalled and
+   * lands late carries this earlier start time so it can't overwrite a newer
+   * checkpoint. */
+  const takenAtMs = Date.now();
   try {
     const record = await readRuntimeSessionRecord(args.runtimeSessionId);
     if (!record || record.state !== 'RUNNING' || !record.microvm_id || !record.endpoint) {
@@ -121,15 +126,12 @@ export async function checkpointSession(args: {
       endpointBase: args.normalizeEndpoint(record.endpoint),
       runtimeSessionId: args.runtimeSessionId,
     }, args.config);
-    /* Each checkpoint writes a distinct, strictly increasing object key, so a
-     * put that stalled past the lock and lands late writes an OLDER key and can
-     * never overwrite the newer one restore reads. Fence the pointer write
-     * first: if it reports we were fenced, skip the store entirely. */
-    const sequence = await allocateCheckpointSequence(args.runtimeSessionId);
+    /* Fence the pointer write first: if it reports we were fenced, skip the
+     * store entirely. */
     const persisted = await writeRuntimeSessionRecord({
       ...record,
-      workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, sequence),
-      checkpointed_at: Date.now(),
+      workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, takenAtMs),
+      checkpointed_at: takenAtMs,
     }, lockToken);
     if (!persisted) {
       microvmCheckpoints.inc({ outcome: 'skipped_busy' });
@@ -138,7 +140,7 @@ export async function checkpointSession(args: {
     /* Bound the object-store write by the checkpoint timeout too — otherwise a
      * stalled S3/MinIO put holds the session lock past JOB_TIMEOUT. */
     await withTimeout(
-      args.store.put(args.runtimeSessionId, sequence, data),
+      args.store.put(args.runtimeSessionId, takenAtMs, data),
       args.config.timeoutMs,
       'checkpoint store.put',
     );

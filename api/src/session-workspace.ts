@@ -156,6 +156,13 @@ export class SessionWorkspace {
     return entry.id;
   }
 
+  /** Whether `relPath` was primed as an input on any earlier turn (regardless
+   *  of read-only). Such a file persists in the workspace, so a later turn that
+   *  doesn't re-send it must not mistake it for a newly generated output. */
+  isPrimedInput(relPath: string): boolean {
+    return this.primed.has(relPath);
+  }
+
   markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string): void {
     this.primed.set(relPath, { id: storageFileId, readOnly, hash });
   }

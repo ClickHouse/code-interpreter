@@ -14,7 +14,7 @@ import {
   setRedisForTests as setRegistryRedis,
   writeRuntimeSessionRecord,
 } from '../runtime-session/registry';
-import { MemoryCheckpointStore, checkpointObjectKey } from '../runtime-session/checkpoint-store';
+import { MemoryCheckpointStore, checkpointObjectKey, checkpointPrefixFor } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmSandboxBackend, normalizeMicrovmEndpoint, type LambdaMicrovmBackendConfig } from './lambda-microvm';
 import { SandboxBackendError } from './types';
 import type { SandboxExecuteContext, SandboxTransportRequest } from './types';
@@ -479,18 +479,20 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(checkpoints[0].headers['x-runtime-session-id']).toBe('rt_ckpt_1');
     expect((await store.get('rt_ckpt_1', 1_000_000))?.toString()).toBe(checkpointBlob);
     const record = await readRuntimeSessionRecord('rt_ckpt_1');
-    expect(record?.workspace_checkpoint).toBe(checkpointObjectKey('rt_ckpt_1', 1));
+    /* Key is timestamp-based now (Date.now at checkpoint), so match the shape. */
+    expect(record?.workspace_checkpoint).toStartWith(checkpointPrefixFor('rt_ckpt_1'));
+    expect(record?.workspace_checkpoint).toEndWith('.tar.gz');
     expect(record?.checkpointed_at).toBeGreaterThan(0);
   });
 
   test('a relaunched VM restores the checkpoint before the first exec', async () => {
     const store = new MemoryCheckpointStore();
-    await store.put('rt_ckpt_1', 1, Buffer.from('PRIOR_WORKSPACE'));
+    await store.put('rt_ckpt_1', 1000, Buffer.from('PRIOR_WORKSPACE'));
     /* Seed a terminated prior session so findOrLaunch relaunches. */
     const seedToken = await acquireRuntimeSessionLock('rt_ckpt_1', 60_000);
     await writeRuntimeSessionRecord({
       runtime_session_id: 'rt_ckpt_1', tenant_id: 'tenant-a', canonical_user_id: 'user-1',
-      state: 'TERMINATED', generation: 3, last_seen_at: 1, workspace_checkpoint: checkpointObjectKey('rt_ckpt_1', 1),
+      state: 'TERMINATED', generation: 3, last_seen_at: 1, workspace_checkpoint: checkpointObjectKey('rt_ckpt_1', 1000),
     }, seedToken as string);
     const { releaseRuntimeSessionLock } = await import('../runtime-session/registry');
     await releaseRuntimeSessionLock('rt_ckpt_1', seedToken as string);

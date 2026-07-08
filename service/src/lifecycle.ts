@@ -75,7 +75,11 @@ function setupQueueListeners(queue: Queue, name: string): void {
 export async function startupApiOnly(): Promise<void> {
   logger.info('Starting API service (no workers)...');
   validateApiHardenedConfig();
-  validateSandboxBackendPolicy();
+  /* No validateSandboxBackendPolicy() here: an API-only pod authenticates and
+   * enqueues jobs, it never constructs the Lambda backend or checkpoint store.
+   * Validating that policy would force worker-only config (LAMBDA_MICROVM_* and
+   * the MINIO_* checkpoint creds) into API pods just to boot. The worker and
+   * combined startups own that validation. */
   await validateLifecycleAuthConfig();
 
   // Set up queue listeners for monitoring (optional, for observability)
