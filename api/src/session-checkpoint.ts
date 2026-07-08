@@ -36,17 +36,25 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
 
   /* Carry the priming/output-diff state into the archive so a relaunched VM
    * rebuilds it (see restoreSessionCheckpoint). Written under the held session
-   * lock, so no concurrent user code sees it, and removed from the live
-   * workspace once tar has read it. Sandboxed code from a prior exec can squat
-   * this name as a symlink OR a directory; the API process runs as root, so
-   * remove whatever squats the path first — `recursive` clears a directory
-   * (else the write later fails EISDIR and breaks every checkpoint), `force`
-   * ignores absence, and neither follows a symlink — then create a fresh
-   * regular file exclusively (`wx`), so a privileged write can't follow a link
-   * and clobber an arbitrary target outside the workspace. */
+   * lock, so no concurrent user code sees it, and removed once tar has read it.
+   * The path is a collision point:
+   *  - a prior exec's sandbox code can squat it as a symlink OR a directory
+   *    (attack — remove it; `recursive` clears a dir else the write fails
+   *    EISDIR, `force` ignores absence, and neither follows a symlink), or
+   *  - user code can legitimately create a regular file with this name (their
+   *    data — do NOT delete it; skip metadata persistence this turn so their
+   *    file tars as normal workspace content).
+   * We only ever remove/restore a sidecar we actually wrote. */
   const metaPath = path.join(dir, SESSION_META_FILE);
-  await fsp.rm(metaPath, { force: true, recursive: true });
-  await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()), { flag: 'wx' });
+  const squat = await fsp.lstat(metaPath).catch(() => null);
+  let wroteSidecar = false;
+  if (squat?.isFile()) {
+    logger.warn('Session meta sidecar path holds a user file; skipping metadata persistence this checkpoint');
+  } else {
+    await fsp.rm(metaPath, { force: true, recursive: true });
+    await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()), { flag: 'wx' });
+    wroteSidecar = true;
+  }
 
   res.status(200);
   res.setHeader('Content-Type', CHECKPOINT_CONTENT_TYPE);
@@ -63,7 +71,7 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     if (!res.headersSent) res.status(500).json({ message: 'checkpoint failed' });
     else res.destroy();
   } finally {
-    await fsp.rm(metaPath, { force: true }).catch(() => {});
+    if (wroteSidecar) await fsp.rm(metaPath, { force: true }).catch(() => {});
   }
 }
 
@@ -125,11 +133,12 @@ async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promis
     const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as SessionMetaSnapshot;
     if (Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
       session.loadMeta(parsed);
+      /* Only remove a sidecar we recognize as our own metadata — a user file
+       * that merely shares the reserved name is left in the workspace intact. */
+      await fsp.rm(metaPath, { force: true }).catch(() => {});
     }
   } catch (error) {
     logger.debug({ err: error }, 'No session meta sidecar to restore');
-  } finally {
-    await fsp.rm(metaPath, { force: true }).catch(() => {});
   }
 }
 

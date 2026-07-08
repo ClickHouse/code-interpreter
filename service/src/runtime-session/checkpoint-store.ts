@@ -51,7 +51,10 @@ export class MinioCheckpointStore implements CheckpointStore {
       ...(process.env.MINIO_SESSION_TOKEN ? { sessionToken: process.env.MINIO_SESSION_TOKEN } : {}),
       ...(process.env.MINIO_REGION ? { region: process.env.MINIO_REGION } : {}),
     });
-    this.bucket = process.env.CODEAPI_CHECKPOINT_BUCKET ?? process.env.MINIO_BUCKET ?? 'test-bucket';
+    /* `||` not `??`: an empty-string CODEAPI_CHECKPOINT_BUCKET must fall through
+     * to MINIO_BUCKET (startup validation accepts the config when MINIO_BUCKET
+     * is set, so `??` would otherwise select '' and fail every S3 op). */
+    this.bucket = process.env.CODEAPI_CHECKPOINT_BUCKET || process.env.MINIO_BUCKET || 'test-bucket';
   }
 
   async put(runtimeSessionId: string, takenAtMs: number, data: Buffer): Promise<void> {

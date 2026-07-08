@@ -464,6 +464,20 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     const terminated = fake.callsFor('terminateMicrovm').map((c) => (c.args as { microvmId: string }).microvmId);
     expect(terminated).toContain(oldVmId);
   });
+
+  test('a tightened egress connector config makes an existing session non-reusable', async () => {
+    const fake = fakeClient();
+    await makeBackend(fake).execute(request(), sessionContext());
+    const oldVmId = [...fake.vms.keys()][0];
+    /* Connectors apply only at RunMicrovm, so a hardened deploy that tightens
+     * egress must relaunch rather than keep serving on the old broader policy. */
+    await makeBackend(fake, {
+      egressConnectorArns: ['arn:aws:lambda:us-east-2:1:network-connector:vpc-egress'],
+    }).execute(request(), sessionContext());
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+    const terminated = fake.callsFor('terminateMicrovm').map((c) => (c.args as { microvmId: string }).microvmId);
+    expect(terminated).toContain(oldVmId);
+  });
 });
 
 describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {

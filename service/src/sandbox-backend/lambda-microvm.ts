@@ -264,6 +264,15 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     }
   }
 
+  /** Order-independent fingerprint of the ingress/egress connector ARNs the
+   *  current config would launch a VM with, recorded on the session so a
+   *  connector config change makes an existing VM non-reusable. */
+  private connectorFingerprint(): string {
+    const ingress = [...(this.config.ingressConnectorArns ?? [])].sort();
+    const egress = [...(this.config.egressConnectorArns ?? [])].sort();
+    return JSON.stringify({ ingress, egress });
+  }
+
   private async findOrLaunchSession(
     client: LambdaMicrovmClient,
     ctx: SandboxExecuteContext,
@@ -279,7 +288,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     const configMatches = record
       && record.image_arn === this.config.imageArn
       && record.image_version === this.config.imageVersion
-      && record.port === this.config.port;
+      && record.port === this.config.port
+      && (record.connectors ?? '') === this.connectorFingerprint();
     /* Past idle+suspended, AWS auto-terminates the suspended VM while the record
      * still reads RUNNING until the 8h hard deadline. Treat that as non-reusable
      * so the first request after idle expiry relaunches + restores, instead of
@@ -345,6 +355,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       port: this.config.port,
       image_arn: this.config.imageArn,
       image_version: this.config.imageVersion,
+      connectors: this.connectorFingerprint(),
       state: 'RUNNING',
       generation,
       launched_at: launchedAt,
@@ -363,16 +374,58 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * restoreSession treats a missing object as `absent` (a truly new session
      * just no-ops one stat). */
     if (this.checkpointStore && this.checkpointsActive()) {
+      const endpointBase = normalizeMicrovmEndpoint(vm.endpoint ?? '');
+      /* Wait for the runner's API listener before restoring. RUNNING is a
+       * control-plane state — the endpoint can be allocated while the app is
+       * still booting, and pushRestore is intentionally non-fatal, so a restore
+       * that raced the boot would silently drop the checkpoint and run the first
+       * execute on an empty workspace. If the runner never comes up, tear the VM
+       * down so the next call relaunches instead of reusing a dead endpoint. */
+      try {
+        await this.waitForRunnerReady(client, vm.microvmId, endpointBase, ctx);
+      } catch (error) {
+        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
+        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+        throw error;
+      }
       await restoreSession({
         mintToken: (microvmId) => this.mintAuthToken(client, microvmId),
         store: this.checkpointStore,
         runtimeSessionId,
         microvmId: vm.microvmId,
-        endpointBase: normalizeMicrovmEndpoint(vm.endpoint ?? ''),
+        endpointBase,
         config: this.config.checkpoint,
       });
     }
     return { vm, reused: false };
+  }
+
+  /** Polls the runner's health endpoint until it responds, bounded by the
+   *  launch timeout — a freshly-RUNNING VM's app may still be booting. */
+  private async waitForRunnerReady(
+    client: LambdaMicrovmClient,
+    microvmId: string,
+    base: string,
+    ctx: SandboxExecuteContext,
+  ): Promise<void> {
+    const token = await this.mintAuthToken(client, microvmId);
+    const deadline = Date.now() + this.config.launchTimeoutMs;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      if (ctx.signal.aborted) {
+        throw new SandboxBackendError('MICROVM_LAUNCH_FAILED', 'Execution aborted while waiting for runner readiness');
+      }
+      try {
+        await this.assertHealthy(base, token.token, ctx);
+        return;
+      } catch (error) {
+        lastError = error;
+        await sleep(this.pollIntervalMs);
+      }
+    }
+    throw lastError instanceof SandboxBackendError
+      ? lastError
+      : new SandboxBackendError('MICROVM_UNHEALTHY', 'Runner did not become ready before restore', lastError);
   }
 
   /**
@@ -400,10 +453,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       normalizeEndpoint: normalizeMicrovmEndpoint,
       lockToken,
     });
-    /* checkpointSession wrote the pointer under our lock on success; re-read
-     * so we don't clobber it with our stale `base`. */
+    /* checkpointSession wrote the pointer under our lock on success; re-read so
+     * we keep it, but re-apply `last_seen_at: now` — that record was built from
+     * the pre-execute snapshot, so without this the liveness timestamp never
+     * advances on checkpointed executes and an actively-used session would look
+     * idle and relaunch needlessly. */
     if (result === 'stored') {
-      return (await readRuntimeSessionRecord(runtimeSessionId)) ?? base;
+      const persisted = await readRuntimeSessionRecord(runtimeSessionId);
+      return persisted ? { ...persisted, last_seen_at: now } : base;
     }
     return base;
   }

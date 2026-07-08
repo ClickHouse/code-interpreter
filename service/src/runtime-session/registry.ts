@@ -31,6 +31,11 @@ export interface RuntimeSessionRecord {
   port?: number;
   image_arn?: string;
   image_version?: string;
+  /** Fingerprint of the ingress/egress network connector ARNs the VM launched
+   *  with — connectors are only applied at RunMicrovm, so a config change must
+   *  make an existing session non-reusable (else a tightened egress policy is
+   *  bypassed by warm reuse). */
+  connectors?: string;
   state: RuntimeSessionState;
   generation: number;
   launched_at?: number;
@@ -52,16 +57,18 @@ const ACTIVE_ZSET = 'rtsx:active';
  * session concurrently. A relaunch path can spend, back to back:
  *   - launch throttle wait (acquireOpBudget)      ≤ LAUNCH_TIMEOUT_MS
  *   - poll to RUNNING (waitUntilRunning)          ≤ LAUNCH_TIMEOUT_MS
- *   - restore the checkpoint before the first exec ≤ CHECKPOINT_TIMEOUT_MS
+ *   - restore: store.get + pushRestore            ≤ 2× CHECKPOINT_TIMEOUT_MS
  *   - health check                                 ≤ HEALTH_TIMEOUT_MS
  *   - the execute                                  ≤ JOB_TIMEOUT
- *   - the post-run checkpoint                      ≤ CHECKPOINT_TIMEOUT_MS
- * so budget 2× launch and 2× checkpoint, plus headroom for lock-wait + jitter. */
+ *   - post-run checkpoint: pullCheckpoint + store.put ≤ 2× CHECKPOINT_TIMEOUT_MS
+ * Restore AND the post-run checkpoint each do TWO timeout-bounded I/Os (an
+ * object-store call plus a runner proxy call), so budget 2× launch and 4×
+ * checkpoint, plus headroom for lock-wait + jitter. */
 export const RUNTIME_SESSION_LOCK_TTL_MS =
   env.JOB_TIMEOUT +
   2 * env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS +
   env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS +
-  2 * env.CHECKPOINT_TIMEOUT_MS +
+  4 * env.CHECKPOINT_TIMEOUT_MS +
   60_000;
 
 const MAX_MICROVM_DURATION_SECONDS = 28_800;
