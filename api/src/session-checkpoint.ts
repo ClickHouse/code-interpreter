@@ -6,7 +6,7 @@ import { pipeline } from 'stream/promises';
 import { logger } from './logger';
 import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID } from './workspace-isolation';
 import type { SessionMetaSnapshot, SessionWorkspace } from './session-workspace';
-import { SESSION_META_FILE, getBoundSessionWorkspace } from './session-workspace';
+import { SESSION_META_FILE, SESSION_META_MARKER, getBoundSessionWorkspace } from './session-workspace';
 
 /**
  * Session workspace checkpoint / restore.
@@ -52,7 +52,7 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     logger.warn('Session meta sidecar path holds a user file; skipping metadata persistence this checkpoint');
   } else {
     await fsp.rm(metaPath, { force: true, recursive: true });
-    await fsp.writeFile(metaPath, JSON.stringify(session.snapshotMeta()), { flag: 'wx' });
+    await fsp.writeFile(metaPath, JSON.stringify({ marker: SESSION_META_MARKER, ...session.snapshotMeta() }), { flag: 'wx' });
     wroteSidecar = true;
   }
 
@@ -131,10 +131,12 @@ async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promis
     const stat = await fsp.lstat(metaPath).catch(() => null);
     if (!stat?.isFile()) return;
     const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as SessionMetaSnapshot;
-    if (Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
+    /* Require our authenticity marker: a user file sharing the reserved name is
+     * never loaded as metadata nor deleted, even if it happens to contain
+     * primed/surfaced arrays. */
+    if (parsed?.marker === SESSION_META_MARKER
+      && Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
       session.loadMeta(parsed);
-      /* Only remove a sidecar we recognize as our own metadata — a user file
-       * that merely shares the reserved name is left in the workspace intact. */
       await fsp.rm(metaPath, { force: true }).catch(() => {});
     }
   } catch (error) {

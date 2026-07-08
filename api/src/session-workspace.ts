@@ -42,7 +42,14 @@ export const RUNTIME_SESSION_ID_HEADER = 'x-runtime-session-id';
  *  and removed from disk again before any execute runs. */
 export const SESSION_META_FILE = '.codeapi-session-meta.json';
 
+/** Authenticity marker embedded in the sidecar so restore can tell OUR metadata
+ *  from a user file that merely shares the reserved name and happens to contain
+ *  primed/surfaced arrays — without it, restore would loadMeta (poisoning the
+ *  priming maps) and delete a legitimate user file. */
+export const SESSION_META_MARKER = 'codeapi.session-meta.v1';
+
 export interface SessionMetaSnapshot {
+  marker?: string;
   primed: Array<[string, { id: string; readOnly: boolean; hash?: string }]>;
   surfaced: Array<[string, string]>;
 }

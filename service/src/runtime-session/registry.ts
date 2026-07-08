@@ -49,21 +49,18 @@ export interface RuntimeSessionRecord {
 const SESS_PREFIX = 'rtsx:sess:';
 const LOCK_PREFIX = 'rtsx:lock:';
 const GEN_PREFIX = 'rtsx:gen:';
+const CKPT_SEQ_PREFIX = 'rtsx:ckptseq:';
 const ACTIVE_ZSET = 'rtsx:active';
 
-/** The session lock is held across the WHOLE `executeSession` critical path, so
- * its TTL must outlive the worst-case sum of the configurable budgets — else a
- * live holder is fenced mid-operation and a second worker acquires the same
- * session concurrently. A relaunch path can spend, back to back:
- *   - launch throttle wait (acquireOpBudget)      ≤ LAUNCH_TIMEOUT_MS
- *   - poll to RUNNING (waitUntilRunning)          ≤ LAUNCH_TIMEOUT_MS
- *   - restore: store.get + pushRestore            ≤ 2× CHECKPOINT_TIMEOUT_MS
- *   - health check                                 ≤ HEALTH_TIMEOUT_MS
- *   - the execute                                  ≤ JOB_TIMEOUT
- *   - post-run checkpoint: pullCheckpoint + store.put ≤ 2× CHECKPOINT_TIMEOUT_MS
- * Restore AND the post-run checkpoint each do TWO timeout-bounded I/Os (an
- * object-store call plus a runner proxy call), so budget 2× launch and 4×
- * checkpoint, plus headroom for lock-wait + jitter. */
+/** The session lock is held across the WHOLE `executeSession` critical path
+ * (launch throttle, readiness/restore, execute, post-run checkpoint), which sums
+ * to a large and variable worst case once per-op token-mint throttle waits are
+ * included. Rather than pin the TTL to that sum (fragile — a missed term lets a
+ * second worker fence a live holder and mutate the session concurrently), the
+ * holder RENEWS the lock on a heartbeat (`renewRuntimeSessionLock`) for as long
+ * as it runs. This value is therefore just a comfortable BASE that must outlive
+ * one heartbeat interval plus a stalled event loop — it already covers a normal
+ * relaunch (execute + launch + health + the checkpoint I/Os) with headroom. */
 export const RUNTIME_SESSION_LOCK_TTL_MS =
   env.JOB_TIMEOUT +
   2 * env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS +
@@ -76,6 +73,7 @@ export const RUNTIME_SESSION_RECORD_TTL_SECONDS = MAX_MICROVM_DURATION_SECONDS +
 
 type RedisWithScripts = Redis & {
   releaseRuntimeSessionLockScript(lockKey: string, token: string): Promise<number>;
+  renewRuntimeSessionLockScript(lockKey: string, token: string, ttlMs: string): Promise<number>;
   writeRuntimeSessionRecordScript(
     sessKey: string,
     lockKey: string,
@@ -100,6 +98,10 @@ function registerScripts(client: Redis): RedisWithScripts {
   client.defineCommand('releaseRuntimeSessionLockScript', {
     numberOfKeys: 1,
     lua: "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+  });
+  client.defineCommand('renewRuntimeSessionLockScript', {
+    numberOfKeys: 1,
+    lua: "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
   });
   client.defineCommand('writeRuntimeSessionRecordScript', {
     numberOfKeys: 2,
@@ -168,6 +170,29 @@ export async function releaseRuntimeSessionLock(runtimeSessionId: string, token:
   }
 }
 
+/** Fenced heartbeat: extend the lock's TTL only while we still hold the token.
+ *  Returns false if we've been fenced (another worker owns the lock now), which
+ *  the caller uses to stop renewing. Lets the critical path run arbitrarily long
+ *  (launch throttle + restore + execute + checkpoint, each with its own I/O and
+ *  token-mint waits) without the TTL having to bound the worst-case sum. */
+export async function renewRuntimeSessionLock(
+  runtimeSessionId: string,
+  token: string,
+  ttlMs: number = RUNTIME_SESSION_LOCK_TTL_MS,
+): Promise<boolean> {
+  try {
+    const result = await redis.renewRuntimeSessionLockScript(
+      `${LOCK_PREFIX}${runtimeSessionId}`,
+      token,
+      String(ttlMs),
+    );
+    return result === 1;
+  } catch (err) {
+    logger.warn('Failed to renew runtime session lock', { runtimeSessionId, err });
+    return false;
+  }
+}
+
 export async function readRuntimeSessionRecord(runtimeSessionId: string): Promise<RuntimeSessionRecord | null> {
   const data = await redis.get(`${SESS_PREFIX}${runtimeSessionId}`);
   if (data == null) return null;
@@ -206,6 +231,25 @@ export async function allocateRuntimeSessionGeneration(runtimeSessionId: string)
   const generation = await redis.incr(key);
   await redis.expire(key, RUNTIME_SESSION_RECORD_TTL_SECONDS);
   return generation;
+}
+
+/** Monotonic per-checkpoint sequence via INCR. Bounded by the record TTL, so it
+ *  can reset after a long idle; the caller re-seeds it above any retained
+ *  objects (see reseedCheckpointSequence). A pure counter — no wall clock — so
+ *  ordering is unaffected by cross-pod clock skew. */
+export async function allocateCheckpointSequence(runtimeSessionId: string): Promise<number> {
+  const key = `${CKPT_SEQ_PREFIX}${runtimeSessionId}`;
+  const sequence = await redis.incr(key);
+  await redis.expire(key, RUNTIME_SESSION_RECORD_TTL_SECONDS);
+  return sequence;
+}
+
+/** Force the checkpoint counter up to `value` after a TTL reset dropped it below
+ *  the sequences still retained in the object store, so the next INCR continues
+ *  above them and restore never picks a stale higher-sequence object. */
+export async function reseedCheckpointSequence(runtimeSessionId: string, value: number): Promise<void> {
+  const key = `${CKPT_SEQ_PREFIX}${runtimeSessionId}`;
+  await redis.set(key, String(value), 'EX', RUNTIME_SESSION_RECORD_TTL_SECONDS);
 }
 
 export async function touchRuntimeSessionActive(runtimeSessionId: string, lastSeenAtMs: number): Promise<void> {

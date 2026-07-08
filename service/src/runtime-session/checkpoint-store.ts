@@ -3,37 +3,46 @@ import { env } from '../config';
 
 /**
  * Durable storage for session workspace checkpoints. Each checkpoint writes a
- * distinct object under a per-session prefix keyed by the wall-clock time the
- * checkpoint was taken (`<prefix><runtime_session_id>/<takenAtMs>.tar.gz`);
- * restore reads the lexicographically-greatest (newest) object. A put that
- * timed out and lands late carries its START time, so it writes an OLDER key
- * and can never overwrite a newer checkpoint; and because the key is a
- * never-resetting timestamp (not a counter that can expire), a fresh checkpoint
- * after a long idle gap always sorts above and prunes any retained older
- * object. A relaunch finds the latest by listing the prefix even with no
+ * distinct object under a per-session prefix keyed by a monotonic sequence
+ * (`<prefix><runtime_session_id>/<sequence>.tar.gz`); restore reads the
+ * lexicographically-greatest (highest-sequence) object. The sequence comes from
+ * a Redis INCR (see `allocateCheckpointSequence`) that the caller seeds above
+ * `latestSequence()` if the counter was lost to a TTL — so ordering is a pure
+ * server-side monotonic counter with NO dependence on per-worker wall clocks
+ * (which can skew or step backwards across pods) and no reset below retained
+ * objects. A relaunch finds the latest by listing the prefix even with no
  * registry record. Older objects are best-effort pruned after each put.
  */
 export interface CheckpointStore {
-  put(runtimeSessionId: string, takenAtMs: number, data: Buffer): Promise<void>;
-  /** Reads the newest checkpoint for the session. `maxBytes` is enforced BEFORE
-   *  the object is buffered into memory (stat the object first for S3-backed
-   *  stores) so a stray oversized checkpoint can't OOM the worker. Throws
-   *  {@link CheckpointTooLargeError} when exceeded. */
+  put(runtimeSessionId: string, sequence: number, data: Buffer): Promise<void>;
+  /** Reads the highest-sequence checkpoint for the session. `maxBytes` is
+   *  enforced BEFORE the object is buffered into memory (stat the object first
+   *  for S3-backed stores) so a stray oversized checkpoint can't OOM the worker.
+   *  Throws {@link CheckpointTooLargeError} when exceeded. */
   get(runtimeSessionId: string, maxBytes: number): Promise<Buffer | null>;
+  /** The highest sequence number retained under the session prefix (0 if none),
+   *  used to re-seed a reset counter above already-stored objects. */
+  latestSequence(runtimeSessionId: string): Promise<number>;
 }
 
 export class CheckpointTooLargeError extends Error {}
 
-/** Zero-padded so lexicographic key order matches numeric (chronological)
- *  order; 15 digits covers epoch-ms well past the year 30000. */
-const TIMESTAMP_WIDTH = 15;
+/** Zero-padded so lexicographic key order matches numeric sequence order. */
+const SEQUENCE_WIDTH = 20;
 
 export function checkpointPrefixFor(runtimeSessionId: string): string {
   return `${env.CHECKPOINT_PREFIX}${runtimeSessionId}/`;
 }
 
-export function checkpointObjectKey(runtimeSessionId: string, takenAtMs: number): string {
-  return `${checkpointPrefixFor(runtimeSessionId)}${String(takenAtMs).padStart(TIMESTAMP_WIDTH, '0')}.tar.gz`;
+export function checkpointObjectKey(runtimeSessionId: string, sequence: number): string {
+  return `${checkpointPrefixFor(runtimeSessionId)}${String(sequence).padStart(SEQUENCE_WIDTH, '0')}.tar.gz`;
+}
+
+/** Parse the sequence back out of a full object key (inverse of the key fn). */
+function sequenceFromKey(key: string): number {
+  const base = key.slice(key.lastIndexOf('/') + 1).replace(/\.tar\.gz$/, '');
+  const seq = Number.parseInt(base, 10);
+  return Number.isFinite(seq) ? seq : 0;
 }
 
 /** S3/MinIO-backed store using the same MINIO_* envs as file-server. */
@@ -57,15 +66,20 @@ export class MinioCheckpointStore implements CheckpointStore {
     this.bucket = process.env.CODEAPI_CHECKPOINT_BUCKET || process.env.MINIO_BUCKET || 'test-bucket';
   }
 
-  async put(runtimeSessionId: string, takenAtMs: number, data: Buffer): Promise<void> {
-    const key = checkpointObjectKey(runtimeSessionId, takenAtMs);
+  async put(runtimeSessionId: string, sequence: number, data: Buffer): Promise<void> {
+    const key = checkpointObjectKey(runtimeSessionId, sequence);
     await this.client.putObject(this.bucket, key, data, data.length, {
       'Content-Type': 'application/x-gtar',
     });
     /* Best-effort: drop only STRICTLY-OLDER sequences. Never touch a newer key
-     * (a stale late put must not delete the checkpoint that superseded it —
-     * restore always reads the max sequence). */
+     * (a crash-orphaned late put must not delete the checkpoint that superseded
+     * it — restore always reads the max sequence). */
     await this.pruneOlderThan(runtimeSessionId, key).catch(() => {});
+  }
+
+  async latestSequence(runtimeSessionId: string): Promise<number> {
+    const key = await this.latestKey(runtimeSessionId);
+    return key ? sequenceFromKey(key) : 0;
   }
 
   async get(runtimeSessionId: string, maxBytes: number): Promise<Buffer | null> {
@@ -126,14 +140,23 @@ export class MinioCheckpointStore implements CheckpointStore {
 export class MemoryCheckpointStore implements CheckpointStore {
   readonly objects = new Map<string, Buffer>();
 
-  async put(runtimeSessionId: string, takenAtMs: number, data: Buffer): Promise<void> {
-    const key = checkpointObjectKey(runtimeSessionId, takenAtMs);
+  async put(runtimeSessionId: string, sequence: number, data: Buffer): Promise<void> {
+    const key = checkpointObjectKey(runtimeSessionId, sequence);
     const prefix = checkpointPrefixFor(runtimeSessionId);
     for (const existing of this.objects.keys()) {
       /* prune strictly-older checkpoints only — never a newer one */
       if (existing.startsWith(prefix) && existing < key) this.objects.delete(existing);
     }
     this.objects.set(key, Buffer.from(data));
+  }
+
+  async latestSequence(runtimeSessionId: string): Promise<number> {
+    const prefix = checkpointPrefixFor(runtimeSessionId);
+    let max = 0;
+    for (const key of this.objects.keys()) {
+      if (key.startsWith(prefix)) max = Math.max(max, sequenceFromKey(key));
+    }
+    return max;
   }
 
   async get(runtimeSessionId: string, maxBytes: number): Promise<Buffer | null> {

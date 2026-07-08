@@ -9,10 +9,12 @@ import { LambdaMicrovmApiError, microvmPortHeaders } from '../runtime-session/la
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
 import { checkpointSession, restoreSession } from '../runtime-session/checkpoint';
 import {
+  RUNTIME_SESSION_LOCK_TTL_MS,
   allocateRuntimeSessionGeneration,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
   removeRuntimeSession,
+  renewRuntimeSessionLock,
   touchRuntimeSessionActive,
   waitForRuntimeSessionLock,
   writeRuntimeSessionRecord,
@@ -180,6 +182,18 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       return this.executeStateless(client, req, ctx);
     }
 
+    /* Heartbeat the lock for as long as we hold it so an arbitrarily long
+     * critical path (launch throttle + readiness/restore + execute + checkpoint,
+     * each with its own I/O and token-mint waits) can't outlive a fixed TTL and
+     * let a second worker fence us and run concurrently. Fenced renew stops
+     * itself; the interval is a third of the TTL so a couple of missed ticks are
+     * survivable. */
+    const heartbeat = setInterval(() => {
+      void renewRuntimeSessionLock(runtimeSessionId, lockToken).then((held) => {
+        if (!held) clearInterval(heartbeat);
+      });
+    }, Math.floor(RUNTIME_SESSION_LOCK_TTL_MS / 3));
+
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
       const { vm, reused } = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
@@ -214,6 +228,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       await touchRuntimeSessionActive(runtimeSessionId, now);
       return result;
     } finally {
+      clearInterval(heartbeat);
       await releaseRuntimeSessionLock(runtimeSessionId, lockToken);
     }
   }
@@ -253,10 +268,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * Everything else keeps the warm VM: a non-2xx sandbox response (AxiosError
        * WITH `.response` — the VM is alive, only the request failed) and a
        * pre-request control-plane failure like a throttled CreateMicrovmAuthToken
-       * (not an axios error at all) — the VM was never touched. */
+       * (not an axios error at all) — the VM was never touched.
+       * Exception: a proxy 5xx (502/503/504) on a REUSED VM is the AWS gateway
+       * reporting the VM as unreachable — typically a suspended VM that failed to
+       * auto-resume. That has `.response` (so it's not a transport failure) but
+       * means the VM is dead, not that the runner rejected the request; recycle
+       * it, else every later call keeps reusing the dead VM until idle expiry. */
+      const status = axios.isAxiosError(error) ? error.response?.status ?? 0 : 0;
       const transportFailure = axios.isAxiosError(error) && error.response == null;
       const unhealthy = error instanceof SandboxBackendError && error.code === 'MICROVM_UNHEALTHY';
-      if (ctx.signal.aborted || transportFailure || unhealthy) {
+      const gatewayUnreachable = reused && status >= 502 && status <= 504;
+      if (ctx.signal.aborted || transportFailure || unhealthy || gatewayUnreachable) {
         await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
       }
@@ -388,7 +410,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
         throw error;
       }
-      await restoreSession({
+      const restoreResult = await restoreSession({
         mintToken: (microvmId) => this.mintAuthToken(client, microvmId),
         store: this.checkpointStore,
         runtimeSessionId,
@@ -396,6 +418,16 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         endpointBase,
         config: this.config.checkpoint,
       });
+      /* A push-restore that failed after the runner began extracting leaves the
+       * workspace possibly-partial (the runner's cleanup runs async past our
+       * abort). Don't execute against it — recycle so the next call relaunches a
+       * clean VM. (A fetch failure / absent checkpoint is safe: the workspace is
+       * the untouched fresh one.) */
+      if (restoreResult === 'push_failed') {
+        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
+        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+        throw new SandboxBackendError('MICROVM_UNHEALTHY', 'Checkpoint restore left the workspace in an unknown state');
+      }
     }
     return { vm, reused: false };
   }

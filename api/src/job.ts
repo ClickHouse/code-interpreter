@@ -788,6 +788,42 @@ export class Job {
    * (inclusive) so the per-job outside UID can create siblings/children while
    * escaped sibling UIDs cannot traverse the workspace tree.
    */
+  /**
+   * Creates every directory from submissionDir (exclusive) to `target`
+   * (inclusive) one component at a time, refusing to descend through a symlink.
+   * `fsp.mkdir(dir, { recursive: true })` would instead follow a symlinked
+   * ancestor a prior session turn planted and create directories OUTSIDE the
+   * workspace as root — so a persistent-session prime must build the path with
+   * no-follow semantics before writing.
+   */
+  private async ensureDirNoFollow(target: string): Promise<void> {
+    const rel = path.relative(this.submissionDir, target);
+    if (!rel || rel === '.') return;
+    if (rel === '..' || rel.startsWith('..' + path.sep)) {
+      throw new Error(`Workspace path escapes the sandbox: ${target}`);
+    }
+    let cursor = this.submissionDir;
+    for (const part of rel.split(path.sep).filter(Boolean)) {
+      cursor = path.join(cursor, part);
+      const st = await fsp.lstat(cursor).catch(() => null);
+      if (st == null) {
+        /* Parent is already validated as a real dir; create just this component
+         * (non-recursive, so it can't follow a link). Tolerate a concurrent
+         * sibling prime having just created it. */
+        await fsp.mkdir(cursor).catch((err: NodeJS.ErrnoException) => {
+          if (err.code !== 'EEXIST') throw err;
+        });
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        throw new Error(`Refusing to prime through symlinked workspace path: ${path.relative(this.submissionDir, cursor)}`);
+      }
+      if (!st.isDirectory()) {
+        throw new Error(`Workspace ancestor is not a directory: ${path.relative(this.submissionDir, cursor)}`);
+      }
+    }
+  }
+
   private async secureAncestors(leaf: string): Promise<void> {
     const rel = path.relative(this.submissionDir, leaf);
     if (!rel || rel === '..' || rel.startsWith('..' + path.sep)) return;
@@ -1035,7 +1071,10 @@ export class Job {
         validateFilePath(originalName, this.submissionDir);
         const finalPath = path.join(this.submissionDir, originalName);
         const finalParent = path.dirname(finalPath);
-        await fsp.mkdir(finalParent, { recursive: true });
+        /* Persistent-session workspaces can hold a prior turn's symlink, so build
+         * ancestors no-follow; a fresh per-job workspace can use plain mkdir -p. */
+        if (this.session) await this.ensureDirNoFollow(finalParent);
+        else await fsp.mkdir(finalParent, { recursive: true });
         await this.secureAncestors(finalParent);
         /* Clear a symlink/dir a prior session turn may have squatted at the
          * target so the rename lands a fresh regular file in the workspace
@@ -1133,7 +1172,8 @@ export class Job {
 
     const content = Buffer.from(file.content ?? '', (file.encoding as BufferEncoding) ?? 'utf8');
     const parentDir = path.dirname(filePath);
-    await fsp.mkdir(parentDir, { recursive: true });
+    if (this.session) await this.ensureDirNoFollow(parentDir);
+    else await fsp.mkdir(parentDir, { recursive: true });
     await this.secureAncestors(parentDir);
     /* In a persistent session workspace a prior turn could have left a symlink
      * (or a directory) squatting this path; the default writeFile would follow
@@ -1146,6 +1186,10 @@ export class Job {
 
     const hash = crypto.createHash('sha256').update(content).digest('hex');
     this.inputFileHashes.set(file.name, { hash, path: filePath });
+    /* Track inline source files as session inputs too (not just downloaded
+     * ones), so a later turn that switches entrypoint (e.g. main.py -> script.sh)
+     * doesn't re-surface the prior turn's source as a generated output. */
+    if (this.session) this.session.markPrimed(file.name, file.id ?? '', false, hash);
   }
 
   async safeCall(

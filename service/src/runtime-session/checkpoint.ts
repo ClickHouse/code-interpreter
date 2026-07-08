@@ -4,8 +4,10 @@ import { microvmPortHeaders } from './lambda-client';
 import type { CheckpointStore } from './checkpoint-store';
 import {
   acquireRuntimeSessionLock,
+  allocateCheckpointSequence,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
+  reseedCheckpointSequence,
   writeRuntimeSessionRecord,
 } from './registry';
 import { checkpointObjectKey } from './checkpoint-store';
@@ -108,12 +110,6 @@ export async function checkpointSession(args: {
     microvmCheckpoints.inc({ outcome: 'skipped_busy' });
     return 'skipped_busy';
   }
-  /* Stamp the checkpoint's start time and key the object by it: it never
-   * resets (unlike a counter with a TTL), so a checkpoint after a long idle gap
-   * always sorts above a retained older object, and a put that stalled and
-   * lands late carries this earlier start time so it can't overwrite a newer
-   * checkpoint. */
-  const takenAtMs = Date.now();
   try {
     const record = await readRuntimeSessionRecord(args.runtimeSessionId);
     if (!record || record.state !== 'RUNNING' || !record.microvm_id || !record.endpoint) {
@@ -126,12 +122,25 @@ export async function checkpointSession(args: {
       endpointBase: args.normalizeEndpoint(record.endpoint),
       runtimeSessionId: args.runtimeSessionId,
     }, args.config);
+    /* Allocate the checkpoint's sequence. INCR==1 means a fresh OR TTL-reset
+     * counter, so seed it above any objects still retained in the store (else a
+     * post-idle checkpoint would write seq 1 and restore would keep picking a
+     * stale higher-sequence object). Checkpoints for one session serialize on
+     * the lock, so this read-then-seed has no concurrent writer. */
+    let sequence = await allocateCheckpointSequence(args.runtimeSessionId);
+    if (sequence === 1) {
+      const retainedMax = await args.store.latestSequence(args.runtimeSessionId);
+      if (retainedMax >= sequence) {
+        sequence = retainedMax + 1;
+        await reseedCheckpointSequence(args.runtimeSessionId, sequence);
+      }
+    }
     /* Fence the pointer write first: if it reports we were fenced, skip the
      * store entirely. */
     const persisted = await writeRuntimeSessionRecord({
       ...record,
-      workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, takenAtMs),
-      checkpointed_at: takenAtMs,
+      workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, sequence),
+      checkpointed_at: Date.now(),
     }, lockToken);
     if (!persisted) {
       microvmCheckpoints.inc({ outcome: 'skipped_busy' });
@@ -140,7 +149,7 @@ export async function checkpointSession(args: {
     /* Bound the object-store write by the checkpoint timeout too — otherwise a
      * stalled S3/MinIO put holds the session lock past JOB_TIMEOUT. */
     await withTimeout(
-      args.store.put(args.runtimeSessionId, takenAtMs, data),
+      args.store.put(args.runtimeSessionId, sequence, data),
       args.config.timeoutMs,
       'checkpoint store.put',
     );
@@ -168,7 +177,7 @@ export async function restoreSession(args: {
   microvmId: string;
   endpointBase: string;
   config: CheckpointConfig;
-}): Promise<'restored' | 'absent' | 'failed'> {
+}): Promise<'restored' | 'absent' | 'fetch_failed' | 'push_failed'> {
   /* The store enforces `maxBytes` before buffering (stats S3 object size first),
    * so an oversized/stray checkpoint throws here instead of OOM'ing the worker.
    * Bound the fetch too — a stalled S3/MinIO get would otherwise hold the
@@ -181,12 +190,15 @@ export async function restoreSession(args: {
       'checkpoint store.get',
     );
   } catch (error) {
+    /* Fetch failed before the runner was touched — the workspace is still the
+     * clean fresh-VM one, so the caller can safely execute (degraded, no
+     * restore). */
     microvmRestores.inc({ outcome: 'failed' });
     logger.warn('Checkpoint fetch failed; continuing with a fresh workspace', {
       runtimeSessionId: args.runtimeSessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    return 'failed';
+    return 'fetch_failed';
   }
   if (!data) {
     microvmRestores.inc({ outcome: 'absent' });
@@ -205,11 +217,15 @@ export async function restoreSession(args: {
     });
     return 'restored';
   } catch (error) {
+    /* Push failed AFTER the runner may have started extracting/chowning/wiping
+     * the workspace. That cleanup runs async past our client abort, so the
+     * workspace is possibly-partial — the caller must recycle the VM rather than
+     * execute against it. */
     microvmRestores.inc({ outcome: 'failed' });
-    logger.warn('Checkpoint restore failed; continuing with a fresh workspace', {
+    logger.warn('Checkpoint push-restore failed; the VM workspace may be partial', {
       runtimeSessionId: args.runtimeSessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-    return 'failed';
+    return 'push_failed';
   }
 }

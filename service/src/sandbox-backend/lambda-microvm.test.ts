@@ -357,6 +357,19 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
+  test('a reused VM returning a proxy 502 (failed auto-resume) is recycled', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    /* 502/503/504 is the AWS proxy reporting the VM unreachable (a suspended VM
+     * that failed to auto-resume), not the runner rejecting the request — so the
+     * dead VM must be torn down, unlike a runner 500. */
+    executeStatus = 502;
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow();
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
   test('relaunches an idle-expired session instead of reusing the dead endpoint', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
