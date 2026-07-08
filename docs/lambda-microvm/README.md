@@ -304,8 +304,11 @@ Each of these cost a silent or blind failure during bring-up:
   and perms must include `logs:*` + `s3:GetObject` (+ ECR for a private base) —
   missing any yields a `CREATE_FAILED` build with an **empty** `stateReason`.
   (The Terraform module gets this right.)
-- **Build logs** live at `/aws/lambda-microvms/<image-name>` (hyphen), not the
-  docs' `/aws/lambda/microvms/<name>`.
+- **Build logs** live at `/aws/lambda-microvms/<image-name>` (hyphen), **not** the
+  AWS docs' `/aws/lambda/microvms/<name>` (slash) — the docs are wrong; verified
+  empirically, the slash path does not exist in a live account. Do not "correct"
+  the Terraform log group or IAM policy to the docs' path or you lose the build
+  logs.
 - **Runtime VM stdout** needs BOTH a `cloudWatch` logging config on RunMicrovm
   AND an `executionRoleArn`, or it goes nowhere. Set
   `LAMBDA_MICROVM_EXECUTION_ROLE_ARN`.

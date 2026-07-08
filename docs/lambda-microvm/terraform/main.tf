@@ -103,11 +103,15 @@ resource "aws_s3_bucket_lifecycle_configuration" "checkpoint" {
 
 # --------------------------------------------------------------------------
 # CloudWatch Logs
-# Build logs land at the EXACT path `/aws/lambda-microvms/<image-name>` (hyphen,
-# not the docs' `/aws/lambda/microvms/...`). Pre-creating it sets retention;
-# Lambda also auto-creates it if absent. Runtime VM stdout needs BOTH a
-# cloudWatch logging config on RunMicrovm AND an execution role, or it goes
-# nowhere.
+# Build logs land at the EXACT path `/aws/lambda-microvms/<image-name>` (hyphen).
+# DO NOT "correct" this to the AWS docs' `/aws/lambda/microvms/...` (slash) — the
+# docs are wrong. Verified empirically against a live account: every build's log
+# group is the hyphen form and the slash path does not exist. Switching to it
+# would stop matching the group the builder writes to and lose the build logs
+# (which then surface as a `CREATE_FAILED` with an empty `stateReason` —
+# undebuggable). Pre-creating it sets retention; Lambda also auto-creates it if
+# absent. Runtime VM stdout needs BOTH a cloudWatch logging config on RunMicrovm
+# AND an execution role, or it goes nowhere.
 # --------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "build" {
   name              = "/aws/lambda-microvms/${var.image_name}"
