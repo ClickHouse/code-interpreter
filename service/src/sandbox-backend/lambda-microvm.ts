@@ -182,8 +182,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
 
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
-      const vm = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
-      const result = await this.executeOnSessionVm(client, vm, req, ctx, runtimeSessionId, lockToken);
+      const { vm, reused } = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
+      const result = await this.executeOnSessionVm(client, vm, req, ctx, runtimeSessionId, lockToken, reused);
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
@@ -238,9 +238,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     runtimeSessionId: string,
     lockToken: string,
+    reused: boolean,
   ): Promise<SandboxRawResponse> {
     try {
-      return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId);
+      return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId, reused);
     } catch (error) {
       /* Recycle the VM ONLY on positive evidence it's unreachable or dirty:
        *  - abort: the runner keeps NsJail running after the socket closes, so a
@@ -269,7 +270,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     runtimeSessionId: string,
     record: RuntimeSessionRecord | null,
     lockToken: string,
-  ): Promise<MicrovmDescription> {
+  ): Promise<{ vm: MicrovmDescription; reused: boolean }> {
     const deadlineHeadroomMs = this.config.jobTimeoutMs + 30_000;
     /* A record whose image/version/port no longer match the current config was
      * launched by an older deploy — relaunch on the current config rather than
@@ -295,7 +296,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     if (reusable && record) {
       /* Reuse the warm VM. If AWS auto-suspended it, the proxy request
        * transparently auto-resumes it (idlePolicy.autoResume). */
-      return { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint };
+      return {
+        vm: { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint },
+        reused: true,
+      };
     }
 
     /* We're relaunching. If the recorded VM is a live-but-non-reusable one
@@ -368,7 +372,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         config: this.config.checkpoint,
       });
     }
-    return vm;
+    return { vm, reused: false };
   }
 
   /**
@@ -452,10 +456,20 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     req: SandboxTransportRequest,
     ctx: SandboxExecuteContext,
     runtimeSessionId?: string,
+    reused = false,
   ): Promise<SandboxRawResponse> {
     const base = normalizeMicrovmEndpoint(vm.endpoint ?? '');
     const token = await this.mintAuthToken(client, vm.microvmId);
-    await this.assertHealthy(base, token.token, ctx);
+    /* Skip the preflight health check on a REUSED session VM: AWS may be
+     * auto-resuming it from a suspend, and that resume can exceed the short
+     * healthTimeoutMs (it scales with suspended-state size) — a slow-but-valid
+     * resume would be misread as MICROVM_UNHEALTHY and the VM torn down. The
+     * execute itself carries the resume under the full job budget, a
+     * genuinely-evicted VM already fails token minting with not_found, and a
+     * freshly-launched VM (reused=false) still gets the readiness probe. */
+    if (!reused) {
+      await this.assertHealthy(base, token.token, ctx);
+    }
 
     /* Session mode is opted into per-request via this header (not a /run
      * lifecycle hook): stock container images can't route Lambda's build

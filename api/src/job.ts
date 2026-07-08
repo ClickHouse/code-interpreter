@@ -799,6 +799,15 @@ export class Job {
        * concurrently. Skip paths we've already chmodded to avoid N*M redundant
        * syscalls (N files × M shared ancestors). */
       if (this.chmoddedDirs.has(cursor)) continue;
+      /* A persistent session workspace can contain a symlink planted by a
+       * prior turn's sandbox code; priming through it as root would follow the
+       * link and write/chmod an arbitrary target outside the workspace. Reject
+       * a symlinked ancestor (lstat never follows) before touching it. Fresh
+       * per-job workspaces never contain one, so this is a no-op there. */
+      const st = await fsp.lstat(cursor);
+      if (st.isSymbolicLink()) {
+        throw new Error(`Refusing to prime through symlinked workspace path: ${path.relative(this.submissionDir, cursor)}`);
+      }
       await applySandboxPathPermissions(cursor, this.sandboxIdentity(), SANDBOX_DIR_MODE);
       this.chmoddedDirs.add(cursor);
     }
@@ -1028,6 +1037,10 @@ export class Job {
         const finalParent = path.dirname(finalPath);
         await fsp.mkdir(finalParent, { recursive: true });
         await this.secureAncestors(finalParent);
+        /* Clear a symlink/dir a prior session turn may have squatted at the
+         * target so the rename lands a fresh regular file in the workspace
+         * rather than following a link or failing on a directory. */
+        if (this.session) await fsp.rm(finalPath, { force: true, recursive: true });
 
         const hash = await this.streamToDisk(response, tempPath, finalPath);
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';
@@ -1122,6 +1135,12 @@ export class Job {
     const parentDir = path.dirname(filePath);
     await fsp.mkdir(parentDir, { recursive: true });
     await this.secureAncestors(parentDir);
+    /* In a persistent session workspace a prior turn could have left a symlink
+     * (or a directory) squatting this path; the default writeFile would follow
+     * the symlink and clobber its target as root. Remove whatever is there
+     * first (unlink never follows a link) so we always write a fresh regular
+     * file. A fresh per-job workspace has nothing here. */
+    if (this.session) await fsp.rm(filePath, { force: true, recursive: true });
     await fsp.writeFile(filePath, content);
     await this.applySandboxFilePermissions(filePath);
 
@@ -1581,9 +1600,17 @@ export class Job {
     /* Skip a file primed as an input on an earlier turn that this turn didn't
      * re-send: it has no inputFileInfo and was never surfaced as an output, so
      * it would otherwise be echoed as a brand-new generated file on unrelated
-     * executions. It persists in the workspace as an input, not an output. */
+     * executions. Only suppress it while UNCHANGED vs the primed baseline: if
+     * the sandbox modified it since, surface the new bytes (also lets the
+     * upload-retry path recover a modified input whose earlier upload was
+     * pruned). Read-only inputs never surface modifications (dropped by
+     * contract), so always suppress those. */
     if (this.session && inputFileInfo == null && this.session.isPrimedInput(relativePath)) {
-      return { collected: false, truncated: false, stopLoop: false };
+      const primedHash = this.session.primedHash(relativePath);
+      const unchanged = contentHash != null && primedHash != null && contentHash === primedHash;
+      if (unchanged || this.session.isPrimedReadOnly(relativePath)) {
+        return { collected: false, truncated: false, stopLoop: false };
+      }
     }
 
     let wasModified = false;

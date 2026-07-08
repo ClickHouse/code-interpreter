@@ -330,6 +330,19 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(executes).toHaveLength(2);
   });
 
+  test('a reused VM skips the preflight health check so a slow auto-resume can proceed', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    captured = [];
+    await backend.execute(request(), sessionContext());
+    /* The warm/suspended VM auto-resumes on the execute itself under the full
+     * job budget; a 5s health probe would misclassify a slow resume as
+     * unhealthy and tear the VM down. */
+    expect(captured.filter((c) => c.path === '/api/v2/health')).toHaveLength(0);
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(1);
+  });
+
   test('a runner non-2xx keeps the warm VM (does not tear down the session)', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);

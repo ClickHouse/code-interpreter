@@ -119,6 +119,10 @@ describe('SessionWorkspace state', () => {
       expect(ws.isPrimedInput('in.csv')).toBe(true);
       expect(ws.isPrimedInput('skill.py')).toBe(true);
       expect(ws.isPrimedInput('never-primed.csv')).toBe(false);
+      /* read-only primes are always suppressed (modifications dropped by
+       * contract); writable ones are only suppressed while unchanged. */
+      expect(ws.isPrimedReadOnly('skill.py')).toBe(true);
+      expect(ws.isPrimedReadOnly('in.csv')).toBe(false);
 
       await ws.reset();
       expect(ws.isSurfaced('out.csv', '10:100')).toBe(false);

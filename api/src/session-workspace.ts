@@ -163,6 +163,12 @@ export class SessionWorkspace {
     return this.primed.has(relPath);
   }
 
+  /** Whether the primed input at `relPath` is read-only — its sandboxed-code
+   *  modifications are dropped by contract and never surfaced as outputs. */
+  isPrimedReadOnly(relPath: string): boolean {
+    return this.primed.get(relPath)?.readOnly === true;
+  }
+
   markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string): void {
     this.primed.set(relPath, { id: storageFileId, readOnly, hash });
   }
