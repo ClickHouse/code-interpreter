@@ -27,6 +27,7 @@ let captured: CapturedRequest[] = [];
 let healthStatus = 200;
 let executeDelayMs = 0;
 let executeStatus = 200;
+let stealSessionLockOnExecute = false;
 let mock: InstanceType<typeof RedisMock>;
 const checkpointBlob = 'FAKE_TAR_GZ_BYTES';
 
@@ -61,6 +62,9 @@ beforeAll(() => {
         if (executeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, executeDelayMs));
         }
+        if (stealSessionLockOnExecute) {
+          await mock.set('rtsx:lock:rt_session_1', 'stolen');
+        }
         return new Response(JSON.stringify(EXECUTE_RESPONSE), {
           status: executeStatus,
           headers: { 'Content-Type': 'application/json' },
@@ -94,6 +98,7 @@ beforeEach(async () => {
   healthStatus = 200;
   executeDelayMs = 0;
   executeStatus = 200;
+  stealSessionLockOnExecute = false;
 });
 
 afterEach(() => {
@@ -357,6 +362,16 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
+  test('a fresh session VM returning a proxy 502 is recycled immediately', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    executeStatus = 502;
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow();
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
   test('a reused VM returning a proxy 502 (failed auto-resume) is recycled', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
@@ -398,6 +413,20 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(b).toEqual(EXECUTE_RESPONSE);
     /* Serialized launch: exactly one VM created, reused by the other. */
     expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+  });
+
+  test('a fenced post-execute record write fails instead of returning stale session state', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    stealSessionLockOnExecute = true;
+
+    try {
+      await backend.execute(request(), sessionContext());
+      throw new Error('expected rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SandboxBackendError);
+      expect((error as SandboxBackendError).code).toBe('MICROVM_FENCED');
+    }
   });
 
   test('strict mode raises RUNTIME_SESSION_BUSY when the lock is held', async () => {

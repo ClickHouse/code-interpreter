@@ -209,12 +209,13 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       const remainingBudgetMs = this.config.jobTimeoutMs - (now - startedAt);
       /* Reserve the WHOLE checkpoint path, not just one timeout: it can spend a
        * token-budget wait (up to launchTimeoutMs) + the checkpoint GET + the
-       * object-store put (each up to checkpoint.timeoutMs). Guarding on a single
-       * timeout let a run finishing with barely more than that still block long
-       * enough to blow the router's waitUntilFinished(JOB_TIMEOUT) after the
-       * sandbox work already succeeded. */
+       * object-store sequence/list (only on counter reset/first write) + the
+       * object-store put (each up to checkpoint.timeoutMs). Guarding on a
+       * single timeout let a run finishing with barely more than that still
+       * block long enough to blow the router's waitUntilFinished(JOB_TIMEOUT)
+       * after the sandbox work already succeeded. */
       const worstCaseCheckpointMs =
-        this.config.launchTimeoutMs + 2 * this.config.checkpoint.timeoutMs;
+        this.config.launchTimeoutMs + 3 * this.config.checkpoint.timeoutMs;
       const canCheckpoint = !ctx.signal.aborted && remainingBudgetMs > worstCaseCheckpointMs;
       const settled = await readRuntimeSessionRecord(runtimeSessionId);
       const nextRecord = settled
@@ -223,7 +224,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           : { ...settled, state: 'RUNNING' as const, last_seen_at: now }
         : undefined;
       if (nextRecord) {
-        await writeRuntimeSessionRecord(nextRecord, lockToken);
+        const persisted = await writeRuntimeSessionRecord(nextRecord, lockToken);
+        if (!persisted) {
+          throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after execute`);
+        }
       }
       await touchRuntimeSessionActive(runtimeSessionId, now);
       return result;
@@ -269,15 +273,16 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * WITH `.response` — the VM is alive, only the request failed) and a
        * pre-request control-plane failure like a throttled CreateMicrovmAuthToken
        * (not an axios error at all) — the VM was never touched.
-       * Exception: a proxy 5xx (502/503/504) on a REUSED VM is the AWS gateway
-       * reporting the VM as unreachable — typically a suspended VM that failed to
-       * auto-resume. That has `.response` (so it's not a transport failure) but
-       * means the VM is dead, not that the runner rejected the request; recycle
-       * it, else every later call keeps reusing the dead VM until idle expiry. */
+       * Exception: a proxy 5xx (502/503/504) is the AWS gateway reporting the
+       * VM as unreachable — typically a suspended VM that failed to auto-resume,
+       * but it can also happen after a fresh VM passed health and then died.
+       * That has `.response` (so it's not a transport failure) but means the VM
+       * is dead, not that the runner rejected the request; recycle it, else
+       * every later call keeps reusing the dead VM until idle expiry. */
       const status = axios.isAxiosError(error) ? error.response?.status ?? 0 : 0;
       const transportFailure = axios.isAxiosError(error) && error.response == null;
       const unhealthy = error instanceof SandboxBackendError && error.code === 'MICROVM_UNHEALTHY';
-      const gatewayUnreachable = reused && status >= 502 && status <= 504;
+      const gatewayUnreachable = status >= 502 && status <= 504;
       if (ctx.signal.aborted || transportFailure || unhealthy || gatewayUnreachable) {
         await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});

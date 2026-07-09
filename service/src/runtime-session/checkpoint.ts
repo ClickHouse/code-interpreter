@@ -129,7 +129,11 @@ export async function checkpointSession(args: {
      * the lock, so this read-then-seed has no concurrent writer. */
     let sequence = await allocateCheckpointSequence(args.runtimeSessionId);
     if (sequence === 1) {
-      const retainedMax = await args.store.latestSequence(args.runtimeSessionId);
+      const retainedMax = await withTimeout(
+        args.store.latestSequence(args.runtimeSessionId),
+        args.config.timeoutMs,
+        'checkpoint store.latestSequence',
+      );
       if (retainedMax >= sequence) {
         sequence = retainedMax + 1;
         await reseedCheckpointSequence(args.runtimeSessionId, sequence);

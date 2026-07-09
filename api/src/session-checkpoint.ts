@@ -25,6 +25,10 @@ const CHECKPOINT_CONTENT_TYPE = 'application/x-gtar';
 
 export class SessionCheckpointError extends Error {}
 
+function currentUid(): number | undefined {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
 /** Streams `tar -czf -` of the session workspace to the response. */
 export async function streamSessionCheckpoint(res: Response): Promise<void> {
   const session = getBoundSessionWorkspace();
@@ -52,7 +56,11 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     logger.warn('Session meta sidecar path holds a user file; skipping metadata persistence this checkpoint');
   } else {
     await fsp.rm(metaPath, { force: true, recursive: true });
-    await fsp.writeFile(metaPath, JSON.stringify({ marker: SESSION_META_MARKER, ...session.snapshotMeta() }), { flag: 'wx' });
+    await fsp.writeFile(
+      metaPath,
+      JSON.stringify({ marker: SESSION_META_MARKER, ...session.snapshotMeta() }),
+      { flag: 'wx', mode: 0o600 },
+    );
     wroteSidecar = true;
   }
 
@@ -103,8 +111,8 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
     await pipeline(req, tar.stdin);
     const code: number = await new Promise((resolve) => tar.on('close', resolve));
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
-    await chownRecursive(dir, uid, gid);
     await applyRestoredMeta(session, dir);
+    await chownRecursive(dir, uid, gid);
     res.status(200).json({ status: 'restored', dir: path.basename(dir) });
   } catch (error) {
     logger.error({ err: error }, 'Failed to restore session checkpoint');
@@ -130,10 +138,17 @@ async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promis
      * loaded metadata). lstat does not follow the link. */
     const stat = await fsp.lstat(metaPath).catch(() => null);
     if (!stat?.isFile()) return;
+    const trustedOwner = currentUid();
+    const ownerMatches = trustedOwner == null || stat.uid === trustedOwner;
+    const ownerWritable = (stat.mode & 0o200) !== 0;
+    if (!ownerMatches || !ownerWritable) {
+      logger.warn('Ignoring untrusted session meta sidecar from restored workspace');
+      return;
+    }
     const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as SessionMetaSnapshot;
-    /* Require our authenticity marker: a user file sharing the reserved name is
-     * never loaded as metadata nor deleted, even if it happens to contain
-     * primed/surfaced arrays. */
+    /* Require the runner-owned sidecar shape plus marker: a user file sharing
+     * the reserved name is never loaded as metadata nor deleted, even if it
+     * happens to contain primed/surfaced arrays. */
     if (parsed?.marker === SESSION_META_MARKER
       && Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
       session.loadMeta(parsed);
