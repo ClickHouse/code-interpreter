@@ -901,7 +901,7 @@ export class Job {
        * tampered via the writable parent dir. Keep the original upload hash as
        * the reuse baseline so a later turn detects prior in-place mutations. */
       const primed = this.inputFileHashes.get(name);
-      this.session.markPrimed(name, file.id, primed?.readOnly === true, primed?.hash);
+      this.session.markPrimed(name, file.id, primed?.readOnly === true, primed?.hash, file.storage_session_id);
     }
   }
 
@@ -909,6 +909,10 @@ export class Job {
     const session = this.session;
     if (!session || !file.id) return false;
     if (session.primedInputId(file.name) !== file.id) return false;
+    /* Match the storage session too: refs are addressed by (storage_session_id,
+     * id), so a later turn reusing the same path + id from a DIFFERENT storage
+     * session must re-download rather than run against the prior session's bytes. */
+    if (session.primedSessionId(file.name) !== file.storage_session_id) return false;
     const filePath = path.join(this.submissionDir, file.name);
     try {
       const st = await fsp.lstat(filePath);
@@ -1077,9 +1081,17 @@ export class Job {
         else await fsp.mkdir(finalParent, { recursive: true });
         await this.secureAncestors(finalParent);
         /* Clear a symlink/dir a prior session turn may have squatted at the
-         * target so the rename lands a fresh regular file in the workspace
-         * rather than following a link or failing on a directory. */
-        if (this.session) await fsp.rm(finalPath, { force: true, recursive: true });
+         * target so streamToDisk's rename lands a fresh regular file rather than
+         * following a link or failing on a directory. A regular file is LEFT in
+         * place and atomically replaced by that rename, so a failed/timed-out
+         * download can't delete prior session state before the replacement is
+         * safely written. */
+        if (this.session) {
+          const existing = await fsp.lstat(finalPath).catch(() => null);
+          if (existing && !existing.isFile()) {
+            await fsp.rm(finalPath, { force: true, recursive: true });
+          }
+        }
 
         const hash = await this.streamToDisk(response, tempPath, finalPath);
         const readOnly = response.headers.get('x-read-only')?.toLowerCase() === 'true';

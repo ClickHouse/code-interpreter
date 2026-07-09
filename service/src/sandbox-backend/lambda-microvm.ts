@@ -562,7 +562,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * genuinely-evicted VM already fails token minting with not_found, and a
      * freshly-launched VM (reused=false) still gets the readiness probe. */
     if (!reused) {
-      await this.assertHealthy(base, token.token, ctx);
+      /* A freshly-launched VM's runner may still be booting (RUNNING is a
+       * control-plane state). When checkpoints are active the launch path
+       * already polled readiness; when they are disabled/stateless this is the
+       * only gate — so poll until launchTimeoutMs rather than tearing the VM
+       * down on a single connection-refused/503 probe. */
+      await this.waitForRunnerReady(client, vm.microvmId, base, ctx);
     }
 
     /* Session mode is opted into per-request via this header (not a /run

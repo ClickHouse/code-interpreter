@@ -50,7 +50,7 @@ export const SESSION_META_MARKER = 'codeapi.session-meta.v1';
 
 export interface SessionMetaSnapshot {
   marker?: string;
-  primed: Array<[string, { id: string; readOnly: boolean; hash?: string }]>;
+  primed: Array<[string, { id: string; readOnly: boolean; hash?: string; sessionId?: string }]>;
   surfaced: Array<[string, string]>;
 }
 
@@ -116,7 +116,7 @@ export class SessionWorkspace {
    *  protection. `hash` is the ORIGINAL upload hash, kept as the modification
    *  baseline on reuse so a writable input mutated by a prior turn is reported
    *  as modified-from-original rather than re-hashed as if it were pristine. */
-  private readonly primed = new Map<string, { id: string; readOnly: boolean; hash?: string }>();
+  private readonly primed = new Map<string, { id: string; readOnly: boolean; hash?: string; sessionId?: string }>();
 
   constructor(binding: SessionBinding) {
     this.runtimeSessionId = binding.runtimeSessionId;
@@ -176,8 +176,18 @@ export class SessionWorkspace {
     return this.primed.get(relPath)?.readOnly === true;
   }
 
-  markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string): void {
-    this.primed.set(relPath, { id: storageFileId, readOnly, hash });
+  markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string, sessionId?: string): void {
+    this.primed.set(relPath, { id: storageFileId, readOnly, hash, sessionId });
+  }
+
+  /** The storage session id recorded when `relPath` was primed (undefined for
+   *  read-only primes, mirroring primedInputId). A reuse must match BOTH id and
+   *  storage session: the sandbox addresses file refs by (storage_session_id,
+   *  id), so id alone can collide across storage sessions and serve stale bytes. */
+  primedSessionId(relPath: string): string | undefined {
+    const entry = this.primed.get(relPath);
+    if (!entry || entry.readOnly) return undefined;
+    return entry.sessionId;
   }
 
   /** The original upload hash recorded when `relPath` was first primed, or

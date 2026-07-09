@@ -71,8 +71,14 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
   });
   tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'checkpoint tar'));
   try {
+    /* Register the 'close' listener BEFORE awaiting the pipeline: for a small
+     * workspace tar can exit and emit 'close' before pipeline resolves, and a
+     * listener attached only afterward would miss it and hang here forever —
+     * the finally never runs, leaving the runner sidecar in the workspace for
+     * the next /execute to mis-scan as user output. */
+    const closed: Promise<number> = new Promise((resolve) => tar.on('close', resolve));
     await pipeline(tar.stdout, res);
-    const code: number = await new Promise((resolve) => tar.on('close', resolve));
+    const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`checkpoint tar exited ${code}`);
   } catch (error) {
     logger.error({ err: error }, 'Failed to stream session checkpoint');
@@ -108,8 +114,14 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
   });
   tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'restore tar'));
   try {
+    /* Register the 'close' listener before awaiting the pipeline (see the create
+     * side): a small upload can finish and 'close' can fire before pipeline
+     * resolves, and a listener attached afterward would hang, never sending the
+     * 200 — the control plane would then hit the restore timeout and recycle a
+     * freshly-launched VM even though the archive was valid. */
+    const closed: Promise<number> = new Promise((resolve) => tar.on('close', resolve));
     await pipeline(req, tar.stdin);
-    const code: number = await new Promise((resolve) => tar.on('close', resolve));
+    const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
     await applyRestoredMeta(session, dir);
     await chownRecursive(dir, uid, gid);
