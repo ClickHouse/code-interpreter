@@ -272,6 +272,7 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
   let killed = false;
   let killMessage: string | null = null;
   let killStatus: string | null = null;
+  let stderrTruncated = false;
 
   function drainStream(
     child: ChildProcessWithoutNullStreams,
@@ -302,18 +303,23 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
           stdout += chunk;
           output += chunk;
         } else {
+          /* stderr overflow must not kill the job: noisy-but-healthy
+           * processes (e.g. libraries that dump stack traces per operation)
+           * would lose their entire computation over diagnostics. Truncate
+           * at the cap and keep draining so the pipe never back-pressures;
+           * a marker is appended after exit so consumers see what happened.
+           * stdout overflow still kills below — stdout is the product, and
+           * a runaway producer should stop paying for compute. */
+          if (stderrTruncated) {
+            return;
+          }
           if (stderr.length + chunk.length > outputMaxSize) {
             const remaining = outputMaxSize - stderr.length;
             if (remaining > 0) {
               stderr += chunk.slice(0, remaining);
               output += chunk.slice(0, remaining);
             }
-            if (!killed) {
-              killMessage = 'stderr length exceeded';
-              killStatus = 'EL';
-              killed = true;
-              child.kill('SIGKILL');
-            }
+            stderrTruncated = true;
             return;
           }
           stderr += chunk;
@@ -583,11 +589,24 @@ export async function execute(opts: ExecuteOptions, setupGate: NsJailSetupGate =
     signal = SIGNALS[code - 128] ?? null;
   }
 
-  const finalMessage = killMessage ?? logMessage;
+  let finalMessage = killMessage ?? logMessage;
   const finalStatus = killStatus ?? logStatus;
 
   if (finalStatus && ['TO', 'OL', 'EL'].includes(finalStatus)) {
     signal = 'SIGKILL';
+  }
+
+  if (stderrTruncated) {
+    finalMessage = finalMessage ?? `stderr truncated at ${outputMaxSize} bytes`;
+  }
+
+  /* Surface the reason in the streams themselves: most clients (and the
+   * models consuming tool output) only ever see stdout/stderr, so a kill
+   * or truncation without an in-band marker reads as a silent hang. */
+  if (finalMessage) {
+    const marker = `\n[sandbox] ${finalMessage}\n`;
+    stderr += marker;
+    output += marker;
   }
 
   return {

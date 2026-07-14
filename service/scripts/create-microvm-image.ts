@@ -23,7 +23,10 @@
  *   --build-role    MICROVM_BUILD_ROLE_ARN build role arn (required)
  *   --base-image    MICROVM_BASE_IMAGE_ARN default arn:aws:lambda:<region>:aws:microvm-image:al2023-1
  *   --region        MICROVM_REGION         default us-east-1
- *   --memory        MICROVM_MEMORY_MIB     baseline memory (default 2048)
+ *   --memory        MICROVM_MEMORY_MIB     baseline memory (default 4096; RunMicrovm has no
+ *                                          per-session memory override, so this image-time value
+ *                                          is the ONLY memory lever — embedded-engine workloads
+ *                                          like chdb OOM inside 2048)
  *   --update        MICROVM_UPDATE=true    update an existing image (new version) instead of create
  */
 import {
@@ -48,7 +51,7 @@ const baseImageArn = arg(
   'MICROVM_BASE_IMAGE_ARN',
   `arn:aws:lambda:${region}:aws:microvm-image:al2023-1`,
 ) as string;
-const memory = Number(arg('--memory', 'MICROVM_MEMORY_MIB', '2048'));
+const memory = Number(arg('--memory', 'MICROVM_MEMORY_MIB', '4096'));
 const isUpdate = (arg('--update', 'MICROVM_UPDATE') ?? 'false') === 'true' || process.argv.includes('--update');
 
 if (!artifactUri || !buildRoleArn) {
@@ -63,7 +66,11 @@ if (!artifactUri || !buildRoleArn) {
  * --env-json '{"FILE_SERVER_URL":"...","EGRESS_GATEWAY_URL":"...", ...}' (or the
  * MICROVM_IMAGE_ENV_JSON env). Typical keys: FILE_SERVER_URL, EGRESS_GATEWAY_URL,
  * SANDBOX_ALLOWED_LOCAL_NETWORK_PORT, SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY,
- * SANDBOX_REQUIRE_EGRESS_MANIFEST, REQUIRE_EXECUTION_MANIFEST. */
+ * SANDBOX_REQUIRE_EGRESS_MANIFEST, REQUIRE_EXECUTION_MANIFEST.
+ * Runner limits also inject here and default LOW for session workloads:
+ * SANDBOX_RUN_TIMEOUT / SANDBOX_RUN_CPU_TIME (30000ms default kills long
+ * computations) and SANDBOX_OUTPUT_MAX_SIZE (1024 bytes default truncates
+ * output after a single verbose stack trace). */
 function parseEnvJson(): Record<string, string> {
   const raw = arg('--env-json', 'MICROVM_IMAGE_ENV_JSON');
   if (!raw) return {};
@@ -91,10 +98,17 @@ const client = new LambdaMicrovmsClient({ region, retryMode: 'adaptive', maxAtte
 
 async function main(): Promise<void> {
   console.log(`${isUpdate ? 'Updating' : 'Creating'} hookless MicroVM image "${name}" in ${region}...`);
+  let createdArn: string | undefined;
   if (isUpdate) {
-    await client.send(new UpdateMicrovmImageCommand({ imageIdentifier: name, ...shared } as never));
+    const res = (await client.send(
+      new UpdateMicrovmImageCommand({ imageIdentifier: name, ...shared } as never),
+    )) as { imageArn?: string };
+    createdArn = res.imageArn;
   } else {
-    await client.send(new CreateMicrovmImageCommand({ name, description: 'CodeAPI hookless session runner', ...shared } as never));
+    const res = (await client.send(
+      new CreateMicrovmImageCommand({ name, description: 'CodeAPI hookless session runner', ...shared } as never),
+    )) as { imageArn?: string };
+    createdArn = res.imageArn;
   }
 
   const started = Date.now();
@@ -103,9 +117,10 @@ async function main(): Promise<void> {
    * MICROVM_BUILD_DEADLINE_MINUTES. */
   const deadlineMs = started + Number(process.env.MICROVM_BUILD_DEADLINE_MINUTES ?? '30') * 60_000;
   for (;;) {
-    /* GetMicrovmImage accepts the image name as the identifier. */
+    /* GetMicrovmImage requires the full ARN — polling by name 400s with
+     * "Invalid ARN format" even though Create/Update accept the name. */
     const img = (await client.send(
-      new GetMicrovmImageCommand({ imageIdentifier: name }),
+      new GetMicrovmImageCommand({ imageIdentifier: createdArn ?? name }),
     )) as { state?: string; imageArn?: string; imageVersion?: string; stateReason?: string };
     const elapsed = Math.round((Date.now() - started) / 1000);
     if (Date.now() > deadlineMs) {
