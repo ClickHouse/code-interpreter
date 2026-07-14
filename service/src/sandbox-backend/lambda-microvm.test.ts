@@ -280,6 +280,31 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     await makeBackend(fake).execute(req, context());
     expect(JSON.stringify(req.body)).toBe(before);
   });
+
+  test('a MicroVM that dies during boot is retried once with a fresh clientToken', async () => {
+    const fake = fakeClient();
+    fake.terminateNextLaunch();
+
+    const result = await makeBackend(fake).execute(request(), context());
+
+    expect(result).toEqual(EXECUTE_RESPONSE);
+    const runCalls = fake.callsFor('runMicrovm');
+    expect(runCalls).toHaveLength(2);
+    const tokens = runCalls.map((call) => (call.args as { clientToken?: string }).clientToken);
+    expect(tokens[0]).toBe('exec-exec_42');
+    expect(tokens[1]).toBe('exec-exec_42-r1');
+  });
+
+  test('a second boot-time death fails the request — single retry only', async () => {
+    const fake = fakeClient();
+    fake.terminateNextLaunch();
+    fake.terminateNextLaunch();
+
+    await expect(makeBackend(fake).execute(request(), context())).rejects.toMatchObject({
+      code: 'MICROVM_LAUNCH_FAILED',
+    });
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+  });
 });
 
 describe('LambdaMicrovmSandboxBackend session execution', () => {

@@ -609,6 +609,32 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     opts: LaunchOptions,
   ): Promise<MicrovmDescription> {
+    try {
+      return await this.launchOnce(client, ctx, opts);
+    } catch (error) {
+      const retryable =
+        error instanceof SandboxBackendError &&
+        error.code === 'MICROVM_LAUNCH_FAILED' &&
+        error.transient &&
+        !ctx.signal.aborted;
+      if (!retryable) {
+        throw error;
+      }
+      /* Fresh clientToken: RunMicrovm is idempotent per token, so reusing the
+       * original would hand back the same dead VM. */
+      logger.warn(
+        `[${ctx.executionId}] MicroVM died during boot (${error.message}); retrying launch once`,
+      );
+      microvmLaunches.inc({ outcome: 'retried' });
+      return this.launchOnce(client, ctx, { ...opts, clientToken: `${opts.clientToken}-r1` });
+    }
+  }
+
+  private async launchOnce(
+    client: LambdaMicrovmClient,
+    ctx: SandboxExecuteContext,
+    opts: LaunchOptions,
+  ): Promise<MicrovmDescription> {
     const endLaunchTimer = microvmLaunchDuration.startTimer();
     try {
       await acquireOpBudget('run', {
@@ -690,9 +716,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         throw new SandboxBackendError('MICROVM_LAUNCH_FAILED', 'Execution aborted while MicroVM was launching');
       }
       if (current.state === 'TERMINATED' || current.state === 'TERMINATING') {
+        /* A boot-time death is a fast, provider-side transient (observed in
+         * the field a few times a day) — mark it retryable so `launch` can
+         * try once more instead of surfacing a 503 to the caller. */
         throw new SandboxBackendError(
           'MICROVM_LAUNCH_FAILED',
           `MicroVM ${current.microvmId} entered ${current.state} before becoming ready`,
+          undefined,
+          true,
         );
       }
       if (Date.now() + this.pollIntervalMs > deadline) {

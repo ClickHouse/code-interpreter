@@ -61,6 +61,13 @@ export class FakeLambdaMicrovmClient implements LambdaMicrovmClient {
     this.pendingPollsByClientToken.set('__next__', polls);
   }
 
+  /** Make the next launched VM come back already TERMINATED (boot-time death). */
+  terminateNextLaunch(): void {
+    this.terminateNextLaunches += 1;
+  }
+
+  private terminateNextLaunches = 0;
+
   setState(microvmId: string, state: MicrovmLifecycleState): void {
     const vm = this.mustGet(microvmId);
     vm.state = state;
@@ -111,10 +118,14 @@ export class FakeLambdaMicrovmClient implements LambdaMicrovmClient {
     if (pendingPolls > 0) {
       this.pendingPollsByClientToken.set(microvmId, pendingPolls);
     }
+    const bootDeath = this.terminateNextLaunches > 0;
+    if (bootDeath) {
+      this.terminateNextLaunches -= 1;
+    }
 
     const vm: FakeMicrovm = {
       microvmId,
-      state: pendingPolls > 0 ? 'PENDING' : 'RUNNING',
+      state: bootDeath ? 'TERMINATED' : pendingPolls > 0 ? 'PENDING' : 'RUNNING',
       endpoint: this.options.endpointProvider?.(microvmId) ?? `https://${microvmId}.fake-microvm.on.aws`,
       imageIdentifier: args.imageIdentifier,
       imageVersion: args.imageVersion,

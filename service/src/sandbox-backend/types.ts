@@ -48,10 +48,17 @@ export type SandboxBackendErrorCode =
  *  the router can map them (e.g. RUNTIME_SESSION_BUSY -> 409). Axios errors
  *  from the sandbox POST itself are rethrown raw by every backend. */
 export class SandboxBackendError extends Error {
+  /**
+   * @param transient - Marks a failure the backend may safely retry once with
+   * fresh identifiers (e.g. a MicroVM that reached a terminal state during
+   * boot). Throttles, aborts, and deadline timeouts stay non-transient: a
+   * throttle retry worsens the pressure and a timeout retry doubles the wait.
+   */
   constructor(
     public readonly code: SandboxBackendErrorCode,
     message: string,
     public readonly cause?: unknown,
+    public readonly transient: boolean = false,
   ) {
     super(message);
     this.name = 'SandboxBackendError';
