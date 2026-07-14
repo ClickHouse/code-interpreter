@@ -186,7 +186,11 @@ export const env = {
     Number(process.env.LAMBDA_MICROVM_MAX_DURATION_SECONDS) || 28_800,
     28_800,
   ),
-  LAMBDA_MICROVM_IDLE_SECONDS: Number(process.env.LAMBDA_MICROVM_IDLE_SECONDS) || 300,
+  /* 30min keeps a session's VM fully RUNNING (RAM + page cache live, ~0.3s
+   * follow-ups) across a realistic conversation gap before it suspends;
+   * 5min proved too aggressive — heavy libraries (chdb ~400MB) pay a
+   * 30-120s lazy rootfs re-read whenever the cache is lost. */
+  LAMBDA_MICROVM_IDLE_SECONDS: Number(process.env.LAMBDA_MICROVM_IDLE_SECONDS) || 1800,
   LAMBDA_MICROVM_SUSPEND_SECONDS: Number(process.env.LAMBDA_MICROVM_SUSPEND_SECONDS) || 1_800,
   LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: Number(process.env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS) || 300,
   LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: Number(process.env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS) || 60_000,

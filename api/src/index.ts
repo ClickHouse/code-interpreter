@@ -6,6 +6,7 @@ import { validateHardenedSandboxStartup } from './secure-startup';
 import { initializeSandboxWorkspaceIsolation, startWorkspaceReaper } from './workspace-isolation';
 import { httpMetricsMiddleware, metricsHandler } from './metrics';
 import { positiveInt, shutdownTelemetry, traceHttpRequest } from './telemetry';
+import { startWarmupCommand } from './warmup';
 import v2Router from './api/v2';
 import lifecycleRouter, { LIFECYCLE_HOOK_BASE_PATH } from './api/lifecycle';
 
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
   const server = app.listen(Number(port), address, () => {
     logger.info({ address: config.bind_address }, 'Sandbox API started');
   });
+  startWarmupCommand();
 
   let shuttingDown = false;
   const closeHttpServer = (): Promise<void> => new Promise((resolve, reject) => {
