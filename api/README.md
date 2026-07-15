@@ -40,7 +40,7 @@ All prefixed with `SANDBOX_` unless noted:
 | `SANDBOX_PACKAGES_DIRECTORY` | `/pkgs` | Directory containing language packages |
 | `SANDBOX_DISABLE_NETWORKING` | `true` | Isolate sandbox from the network |
 | `SANDBOX_ALLOWED_LOCAL_NETWORK_PORT` | `0` | Allow sandbox to reach this host port (for tool calling) |
-| `SANDBOX_OUTPUT_MAX_SIZE` | `1024` | Max stdout/stderr bytes before truncation |
+| `SANDBOX_OUTPUT_MAX_SIZE` | `1024` | Per-stream output cap. stderr truncates at this size (the job keeps running); stdout overflow kills the job (`status: OL`), since stdout is the result. Every shipped compose/helm config sets `65536` — the `1024` fallback only applies when running the runner bare. |
 | `SANDBOX_MAX_PROCESS_COUNT` | `64` | Max PIDs inside the sandbox |
 | `SANDBOX_MAX_OPEN_FILES` | `2048` | rlimit nofile |
 | `SANDBOX_MAX_FILE_SIZE` | `10000000` | rlimit fsize (bytes) |
