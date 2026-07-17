@@ -17,7 +17,7 @@ import {
   bindSessionWorkspace,
   parseSessionBindingFromHeader,
 } from '../session-workspace';
-import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
+import { streamSessionCheckpoint, restoreSessionCheckpoint, receiveSessionFiles } from '../session-checkpoint';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
@@ -254,8 +254,8 @@ function manifestErrorStatus(error: ExecutionManifestError): number {
 
 router.use((req: Request, res: Response, next: NextFunction) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-  /* Checkpoint restore streams a tar.gz body, not JSON. */
-  if (req.path === '/session/restore') return next();
+  /* Checkpoint restore and additive file delivery stream tar.gz bodies, not JSON. */
+  if (req.path === '/session/restore' || req.path === '/session/files') return next();
   if (!req.headers['content-type']?.startsWith('application/json')) {
     return res.status(415).json({ message: 'requests must be of type application/json' });
   }
@@ -492,6 +492,12 @@ router.post('/session/restore', (req: Request, res: Response, next: NextFunction
     return res.status(409).json({ message: 'Missing runtime session header' });
   }
   return restoreSessionCheckpoint(req, res).catch(next);
+});
+router.post('/session/files', (req: Request, res: Response, next: NextFunction) => {
+  if (!bindSessionFromHeader(req)) {
+    return res.status(409).json({ message: 'Missing runtime session header' });
+  }
+  return receiveSessionFiles(req, res).catch(next);
 });
 
 export default router;

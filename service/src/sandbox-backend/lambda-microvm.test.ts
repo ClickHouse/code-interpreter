@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import RedisMock from 'ioredis-mock';
+import * as zlib from 'zlib';
 import axios from 'axios';
+import { env } from '../config';
 import { FakeLambdaMicrovmClient } from '../runtime-session/lambda-client-fake';
 import { LambdaMicrovmApiError } from '../runtime-session/lambda-client';
 import {
@@ -27,7 +29,10 @@ let captured: CapturedRequest[] = [];
 let healthStatus = 200;
 let executeDelayMs = 0;
 let executeStatus = 200;
+let sessionFilesStatus = 200;
+let lastSessionFilesBody: Buffer | null = null;
 let stealSessionLockOnExecute = false;
+const fileObjectBytes = 'csv,bytes\n1,2\n';
 let mock: InstanceType<typeof RedisMock>;
 const checkpointBlob = 'FAKE_TAR_GZ_BYTES';
 
@@ -47,11 +52,24 @@ beforeAll(() => {
     port: 0,
     async fetch(req) {
       const path = new URL(req.url).pathname;
+      const raw = Buffer.from(await req.arrayBuffer());
       captured.push({
         path,
-        rawBody: await req.text(),
+        rawBody: raw.toString(),
         headers: Object.fromEntries(req.headers.entries()),
       });
+      /* The same server doubles as the internal file server the control plane
+       * fetches input refs from when building a session files delivery. */
+      if (path.startsWith('/sessions/')) {
+        return new Response(fileObjectBytes, { status: 200 });
+      }
+      if (path === '/api/v2/session/files') {
+        lastSessionFilesBody = raw;
+        return new Response(JSON.stringify({ status: 'received' }), {
+          status: sessionFilesStatus,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       if (path === '/api/v2/health') {
         return new Response(JSON.stringify({ status: 'ok' }), {
           status: healthStatus,
@@ -82,6 +100,7 @@ beforeAll(() => {
       return new Response('not found', { status: 404 });
     },
   });
+  env.FILE_SERVER_URL = `http://localhost:${server.port}`;
 });
 
 afterAll(() => {
@@ -98,6 +117,8 @@ beforeEach(async () => {
   healthStatus = 200;
   executeDelayMs = 0;
   executeStatus = 200;
+  sessionFilesStatus = 200;
+  lastSessionFilesBody = null;
   stealSessionLockOnExecute = false;
 });
 
@@ -387,6 +408,50 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
+  test('delivers by-ref input files to the session VM before the execute', async () => {
+    const fake = fakeClient();
+    await makeBackend(fake).execute(request(), sessionContext());
+
+    const paths = captured.map((c) => c.path);
+    expect(paths.indexOf('/sessions/sess_store_1/objects/file_1')).toBeGreaterThanOrEqual(0);
+    expect(paths.indexOf('/api/v2/session/files')).toBeGreaterThanOrEqual(0);
+    expect(paths.indexOf('/api/v2/session/files')).toBeLessThan(paths.indexOf('/api/v2/execute'));
+
+    const filesReq = captured.find((c) => c.path === '/api/v2/session/files');
+    expect(filesReq?.headers['x-runtime-session-id']).toBe('rt_session_1');
+    expect(filesReq?.headers['content-type']).toBe('application/x-gtar');
+
+    /* Real tar.gz on the wire: member paths and the primed-files manifest are
+     * visible in the decompressed stream. */
+    const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
+    expect(untarred).toContain('session/inputs/data.csv');
+    expect(untarred).toContain(fileObjectBytes);
+    expect(untarred).toContain('codeapi.session-files.v1');
+    expect(untarred).toContain('"id":"file_1"');
+    expect(untarred).toContain('"storage_session_id":"sess_store_1"');
+  });
+
+  test('a failed file delivery recycles the VM instead of executing partial inputs', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    sessionFilesStatus = 500;
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
+      'Session input file delivery failed',
+    );
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
+  test('a payload with no by-ref files skips the delivery leg entirely', async () => {
+    const fake = fakeClient();
+    const req = request();
+    req.body.files = [{ name: 'inline.txt', content: 'inline' }];
+    await makeBackend(fake).execute(req, sessionContext());
+    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(0);
+  });
+
   test('a fresh session VM returning a proxy 502 is recycled immediately', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
@@ -623,7 +688,11 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     const store = new MemoryCheckpointStore();
     const backend = makeBackend(fake, { checkpointsEnabled: false }, store);
     await backend.execute(request(), sessionContext());
-    expect(captured.filter((c) => c.path.startsWith('/api/v2/session/'))).toHaveLength(0);
+    /* File delivery is independent of checkpointing — only the checkpoint and
+     * restore legs must be skipped. */
+    expect(captured.filter((c) =>
+      c.path === '/api/v2/session/checkpoint' || c.path === '/api/v2/session/restore',
+    )).toHaveLength(0);
     expect(store.objects.size).toBe(0);
   });
 

@@ -1,4 +1,6 @@
 import { spawn } from 'child_process';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import type { Request, Response } from 'express';
@@ -22,6 +24,14 @@ import { SESSION_META_FILE, SESSION_META_MARKER, getBoundSessionWorkspace } from
  */
 
 const CHECKPOINT_CONTENT_TYPE = 'application/x-gtar';
+
+/** Reserved archive member the control plane includes with a files delivery so
+ *  the runner can register the delivered inputs as primed (see
+ *  {@link receiveSessionFiles}). Never left in the workspace. */
+export const SESSION_FILES_MANIFEST_FILE = '.codeapi-files.json';
+export const SESSION_FILES_MANIFEST_MARKER = 'codeapi.session-files.v1';
+
+type DeliveredFileEntry = { name: string; id: string; storage_session_id: string };
 
 export class SessionCheckpointError extends Error {}
 
@@ -136,6 +146,105 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
     await fsp.mkdir(dir, { recursive: true }).catch(() => {});
     if (!res.headersSent) res.status(500).json({ message: 'restore failed' });
   }
+}
+
+/**
+ * Additive input-file delivery: extracts a tar.gz into the bound session
+ * workspace WITHOUT clearing it — the overlay counterpart to
+ * {@link restoreSessionCheckpoint}'s full replace. The control plane pushes
+ * user uploads through this over the same authed proxy channel as restore,
+ * which is what makes uploads work on backends where the VM cannot reach a
+ * file server (the MicroVM's only egress is the public internet, so the
+ * pull-based priming path has nothing reachable to pull from).
+ *
+ * Inherits restore's traversal hardening verbatim: `--strip-components=1 -C
+ * dir` pins every archive member under the workspace, so `../x`,
+ * `other-ws/x`, or absolute members cannot escape into runner space. Unlike
+ * restore, failure never wipes: the workspace holds real session state, so a
+ * cut-off overlay leaves existing files untouched (at worst a partial
+ * overlay, which the caller may retry idempotently). A reserved
+ * {@link SESSION_FILES_MANIFEST_FILE} member registers the delivered inputs
+ * as primed (see {@link applyDeliveredFilesManifest}).
+ */
+export async function receiveSessionFiles(req: Request, res: Response): Promise<void> {
+  const session = getBoundSessionWorkspace();
+  if (!session) {
+    res.status(409).json({ message: 'No session workspace is bound' });
+    return;
+  }
+  const { dir, uid, gid } = await session.ownership();
+  await fsp.mkdir(dir, { recursive: true });
+
+  const tar = spawn('tar', ['-xzf', '-', '--strip-components=1', '-C', dir], {
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'session files tar'));
+  try {
+    /* 'close' listener before the pipeline await, for the same small-body
+     * race documented on the checkpoint/restore sides. */
+    const closed: Promise<number> = new Promise((resolve) => tar.on('close', resolve));
+    await pipeline(req, tar.stdin);
+    const code = await closed;
+    if (code !== 0) throw new SessionCheckpointError(`session files tar exited ${code}`);
+    await chownRecursive(dir, uid, gid);
+    await applyDeliveredFilesManifest(session, dir);
+    res.status(200).json({ status: 'received' });
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to receive session files');
+    if (!res.headersSent) res.status(500).json({ message: 'session file delivery failed' });
+  }
+}
+
+/**
+ * Registers delivered inputs as primed from the reserved manifest member the
+ * control plane packs into the archive. Priming is what stitches a pushed file
+ * into the normal input lifecycle: the next execute's `reusePrimedInput` sees a
+ * matching (storage_session_id, id) already on disk and skips its own fetch
+ * (which has nothing reachable to fetch from on push-model backends), and later
+ * turns that omit the ref suppress it from the output scan while unchanged.
+ * Hashes are computed locally so the primed baseline matches the runner's own
+ * `computeFileHash` format exactly. The manifest is removed before responding —
+ * user code never sees it. A missing or marker-less manifest is non-fatal (and
+ * a marker-less regular file with the reserved name is left untouched as user
+ * data, mirroring the SESSION_META_FILE squat handling).
+ */
+async function applyDeliveredFilesManifest(session: SessionWorkspace, dir: string): Promise<void> {
+  const manifestPath = path.join(dir, SESSION_FILES_MANIFEST_FILE);
+  try {
+    const stat = await fsp.lstat(manifestPath).catch(() => null);
+    if (!stat?.isFile()) return;
+    const parsed = JSON.parse(await fsp.readFile(manifestPath, 'utf8')) as {
+      marker?: string;
+      files?: DeliveredFileEntry[];
+    };
+    if (parsed?.marker !== SESSION_FILES_MANIFEST_MARKER || !Array.isArray(parsed.files)) return;
+    await fsp.rm(manifestPath, { force: true }).catch(() => {});
+    for (const entry of parsed.files) {
+      if (typeof entry?.name !== 'string' || typeof entry?.id !== 'string'
+        || typeof entry?.storage_session_id !== 'string') continue;
+      /* The manifest names workspace-relative paths; resolve and re-check
+       * containment so a malformed entry can never prime (or hash) a path
+       * outside the session workspace. */
+      const target = path.resolve(dir, entry.name);
+      if (target !== dir && !target.startsWith(dir + path.sep)) continue;
+      const st = await fsp.lstat(target).catch(() => null);
+      if (!st?.isFile()) continue;
+      session.markPrimed(entry.name, entry.id, false, await sha256File(target), entry.storage_session_id);
+    }
+  } catch (error) {
+    logger.debug({ err: error }, 'No session files manifest to apply');
+  }
+}
+
+/** Same digest shape as Job.computeFileHash (streaming sha256 hex, no-follow)
+ *  so primed baselines recorded here compare equal to the output scan's. */
+async function sha256File(filePath: string): Promise<string> {
+  const hash = crypto.createHash('sha256');
+  const stream = fs.createReadStream(filePath, {
+    flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+  });
+  for await (const chunk of stream) hash.update(chunk as Buffer);
+  return hash.digest('hex');
 }
 
 /** Applies the restored priming/output-diff sidecar to the bound session and

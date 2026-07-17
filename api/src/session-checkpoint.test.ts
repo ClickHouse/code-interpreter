@@ -1,8 +1,45 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { restoreSessionCheckpoint, streamSessionCheckpoint } from './session-checkpoint';
-import { resetSessionWorkspaceStateForTests } from './session-workspace';
+import { spawnSync } from 'child_process';
+import { Readable } from 'stream';
+import * as fsp from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import { config } from './config';
+import type { SandboxJobIdentity } from './workspace-isolation';
+import type { SessionWorkspace } from './session-workspace';
+import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID, fallbackSandboxIdentity } from './workspace-isolation';
+import {
+  SESSION_FILES_MANIFEST_FILE,
+  SESSION_FILES_MANIFEST_MARKER,
+  receiveSessionFiles,
+  restoreSessionCheckpoint,
+  streamSessionCheckpoint,
+} from './session-checkpoint';
+import { bindSessionWorkspace, resetSessionWorkspaceStateForTests, unbindSessionWorkspace } from './session-workspace';
 
-afterEach(resetSessionWorkspaceStateForTests);
+const savedEnabled = config.session_workspace_enabled;
+const savedPerJob = config.per_job_uids;
+
+afterEach(async () => {
+  config.session_workspace_enabled = savedEnabled;
+  config.per_job_uids = savedPerJob;
+  await unbindSessionWorkspace().catch(() => {});
+  resetSessionWorkspaceStateForTests();
+  await fsp
+    .rm(path.join(SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID), { recursive: true, force: true })
+    .catch(() => {});
+});
+
+/** CI and local dev run bun as a non-root user, where the default per-job-UID
+ *  configuration requires root for workspace chowns. Switch the session to the
+ *  shared fallback identity (perJobUid=false) and flip the config flag the
+ *  workspace-root preparation consults, so skipped chowns degrade to
+ *  compatibility modes — the same degradation the runner itself applies when
+ *  running unprivileged outside hardened mode. */
+function seedNonRootIdentity(session: SessionWorkspace): void {
+  config.per_job_uids = false;
+  (session as unknown as { identity?: SandboxJobIdentity }).identity = fallbackSandboxIdentity();
+}
 
 /** Minimal Express response double capturing status + json body. */
 function fakeRes(): { status: number; body: unknown; setHeader: () => void; destroy: () => void } & {
@@ -34,5 +71,114 @@ describe('session checkpoint gating', () => {
     const res = fakeRes();
     await restoreSessionCheckpoint({} as never, res as never);
     expect((res as unknown as { statusCode: number }).statusCode).toBe(409);
+  });
+
+  test('session files delivery is 409 when no session is bound', async () => {
+    const res = fakeRes();
+    await receiveSessionFiles({} as never, res as never);
+    expect((res as unknown as { statusCode: number }).statusCode).toBe(409);
+  });
+});
+
+/** Builds a real tar.gz whose members live under a leading `session/` dir,
+ *  matching the archive shape both restore and files-delivery expect. */
+async function makeArchive(files: Record<string, string>): Promise<Buffer> {
+  const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'sess-files-'));
+  const stage = path.join(tmp, 'session');
+  for (const [name, content] of Object.entries(files)) {
+    const target = path.join(stage, name);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, content);
+  }
+  const tar = spawnSync('tar', ['-czf', '-', '-C', tmp, 'session'], { maxBuffer: 64 * 1024 * 1024 });
+  await fsp.rm(tmp, { recursive: true, force: true });
+  if (tar.status !== 0) throw new Error(`fixture tar exited ${tar.status}`);
+  return tar.stdout;
+}
+
+function fakeStreamRes(): { statusCode: number; body: unknown; headersSent: boolean } & {
+  status(code: number): { json(body: unknown): void };
+} {
+  const res = {
+    statusCode: 0,
+    body: undefined as unknown,
+    headersSent: false,
+    status(code: number) {
+      res.statusCode = code;
+      return {
+        json(body: unknown) { res.body = body; res.headersSent = true; },
+      };
+    },
+  };
+  return res as never;
+}
+
+describe('receiveSessionFiles (additive delivery)', () => {
+  test('overlays uploaded files WITHOUT clearing existing workspace content', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_1' });
+    expect(session).toBeDefined();
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'existing.txt'), 'already-here');
+
+    const archive = await makeArchive({ 'upload.csv': 'a,b\n1,2\n', 'nested/notes.md': '# hi' });
+    const res = fakeStreamRes();
+    await receiveSessionFiles(Readable.from(archive) as never, res as never);
+
+    expect(res.statusCode).toBe(200);
+    expect(await fsp.readFile(path.join(dir, 'upload.csv'), 'utf8')).toBe('a,b\n1,2\n');
+    expect(await fsp.readFile(path.join(dir, 'nested/notes.md'), 'utf8')).toBe('# hi');
+    /* The additive contract: pre-existing session state survives. */
+    expect(await fsp.readFile(path.join(dir, 'existing.txt'), 'utf8')).toBe('already-here');
+  });
+
+  test('a manifest member primes delivered files and never reaches the workspace', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_manifest' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+
+    const archive = await makeArchive({
+      'upload.csv': 'a,b\n1,2\n',
+      [SESSION_FILES_MANIFEST_FILE]: JSON.stringify({
+        marker: SESSION_FILES_MANIFEST_MARKER,
+        files: [
+          { name: 'upload.csv', id: 'file_up1', storage_session_id: 'store_1' },
+          { name: '../escape.txt', id: 'file_bad', storage_session_id: 'store_1' },
+          { name: 'never-delivered.txt', id: 'file_missing', storage_session_id: 'store_1' },
+        ],
+      }),
+    });
+    const res = fakeStreamRes();
+    await receiveSessionFiles(Readable.from(archive) as never, res as never);
+
+    expect(res.statusCode).toBe(200);
+    /* Delivered + listed ⇒ primed, so the next exec reuses the on-disk copy
+     * instead of attempting an unreachable pull, and later turns suppress it
+     * from the output scan. */
+    expect(session!.primedInputId('upload.csv')).toBe('file_up1');
+    expect(session!.primedSessionId('upload.csv')).toBe('store_1');
+    /* Traversal names and entries with no on-disk file are ignored. */
+    expect(session!.primedInputId('../escape.txt')).toBeUndefined();
+    expect(session!.primedInputId('never-delivered.txt')).toBeUndefined();
+    /* The reserved member is consumed, never left for user code to see. */
+    expect(await fsp.lstat(path.join(dir, SESSION_FILES_MANIFEST_FILE)).catch(() => null)).toBeNull();
+  });
+
+  test('a corrupt archive fails WITHOUT wiping existing workspace content', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_2' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'precious.txt'), 'do-not-lose');
+
+    const res = fakeStreamRes();
+    await receiveSessionFiles(Readable.from(Buffer.from('not a tarball')) as never, res as never);
+
+    expect(res.statusCode).toBe(500);
+    /* Unlike restore's clean-slate error path, delivery failure must never
+     * destroy real session state. */
+    expect(await fsp.readFile(path.join(dir, 'precious.txt'), 'utf8')).toBe('do-not-lose');
   });
 });

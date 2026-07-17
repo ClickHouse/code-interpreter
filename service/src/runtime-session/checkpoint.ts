@@ -88,6 +88,27 @@ export async function pushRestore(
   });
 }
 
+/** Pushes an additive input-file delivery (see runtime-session/files.ts) into
+ *  the bound session workspace — same authed proxy channel as a restore, but
+ *  the runner overlays instead of replacing. */
+export async function pushFiles(
+  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; runtimeSessionId: string },
+  data: Buffer,
+  config: CheckpointConfig,
+): Promise<void> {
+  const token = await args.mintToken();
+  await axios.post(`${args.endpointBase}/api/v2/session/files`, data, {
+    headers: {
+      [token.headerName]: token.token,
+      ...microvmPortHeaders(config.port),
+      [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
+      'Content-Type': 'application/x-gtar',
+    },
+    maxBodyLength: config.maxBytes,
+    timeout: config.timeoutMs,
+  });
+}
+
 /**
  * Checkpoint the session workspace: pull the tar from the still-warm VM,
  * store it, and record the pointer under the lock (fenced write). Pass

@@ -7,7 +7,8 @@ import type { CheckpointConfig } from '../runtime-session/checkpoint';
 import type { CheckpointStore } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmApiError, microvmPortHeaders } from '../runtime-session/lambda-client';
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
-import { checkpointSession, restoreSession } from '../runtime-session/checkpoint';
+import { checkpointSession, pushFiles, restoreSession } from '../runtime-session/checkpoint';
+import { buildSessionFilesArchive, sessionFileRefs } from '../runtime-session/files';
 import {
   RUNTIME_SESSION_LOCK_TTL_MS,
   allocateRuntimeSessionGeneration,
@@ -197,6 +198,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
       const { vm, reused } = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
+      await this.pushSessionInputFiles(client, vm, req, ctx, runtimeSessionId, lockToken);
       const result = await this.executeOnSessionVm(client, vm, req, ctx, runtimeSessionId, lockToken, reused);
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
@@ -541,6 +543,55 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         throw new SandboxBackendError('MICROVM_LAUNCH_FAILED', error.message, error);
       }
       throw error;
+    }
+  }
+
+  /**
+   * Delivers the request's by-reference input files into the session workspace
+   * before the execute. The MicroVM's only egress is the public internet, so
+   * the runner's own pull-based priming has nothing reachable to pull from —
+   * the control plane fetches the bytes from the internal file server and
+   * pushes them over the same authed proxy channel as a restore. The archive's
+   * manifest member makes the runner register them as primed, so the execute's
+   * priming reuses the on-disk copies instead of fetching.
+   *
+   * Archive build failures (unsafe name, file-server fetch error, over-size)
+   * throw before any bytes reach the VM — the workspace is untouched, so the
+   * warm VM survives for the next call. A failed push after transfer began
+   * leaves the workspace possibly-partial, exactly like a failed push-restore:
+   * recycle so the next call relaunches + restores clean rather than executing
+   * against a truncated input.
+   */
+  private async pushSessionInputFiles(
+    client: LambdaMicrovmClient,
+    vm: MicrovmDescription,
+    req: SandboxTransportRequest,
+    ctx: SandboxExecuteContext,
+    runtimeSessionId: string,
+    lockToken: string,
+  ): Promise<void> {
+    const refs = sessionFileRefs(req.body.files);
+    if (refs.length === 0) return;
+    const archive = await buildSessionFilesArchive(refs, {
+      timeoutMs: this.config.checkpoint.timeoutMs,
+      maxBytes: this.config.checkpoint.maxBytes,
+    });
+    if (!archive) return;
+    try {
+      await pushFiles({
+        mintToken: () => this.mintAuthToken(client, vm.microvmId),
+        endpointBase: normalizeMicrovmEndpoint(vm.endpoint ?? ''),
+        runtimeSessionId,
+      }, archive, this.config.checkpoint);
+    } catch (error) {
+      if (ctx.signal.aborted) throw error;
+      await this.terminate(client, vm.microvmId, 'error').catch(() => {});
+      await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+      throw new SandboxBackendError(
+        'MICROVM_UNHEALTHY',
+        'Session input file delivery failed',
+        error,
+      );
     }
   }
 
