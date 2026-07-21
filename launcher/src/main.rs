@@ -130,6 +130,8 @@ mod seccomp {
             libc::SYS_tgkill as u32,
             libc::SYS_getpid as u32,
             libc::SYS_getrandom as u32,
+            libc::SYS_clock_gettime as u32,
+            libc::SYS_clock_nanosleep as u32,
             libc::SYS_sched_getaffinity as u32,
             libc::SYS_sched_yield as u32,
             libc::SYS_set_robust_list as u32,
