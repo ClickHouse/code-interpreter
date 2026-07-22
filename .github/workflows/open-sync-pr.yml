@@ -12,6 +12,10 @@ permissions:
   contents: read
   pull-requests: write
 
+concurrency:
+  group: open-sync-pr
+  cancel-in-progress: false
+
 jobs:
   open-pr:
     runs-on: ubuntu-latest
@@ -22,7 +26,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          OPEN=$(gh pr list --head sync/main --base main --state open --json number --jq length)
+          OPEN=$(gh api -X GET repos/ClickHouse/code-interpreter/pulls \
+            -f state=open -f base=main -f head=ClickHouse:sync/main \
+            -f per_page=1 --jq length)
           if [ "$OPEN" -gt 0 ]; then
             echo "Sync PR already open."
             exit 0
