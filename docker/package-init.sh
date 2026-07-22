@@ -13,6 +13,13 @@ FORCE_REBUILD="${FORCE_REBUILD:-false}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 PYTHON_SITE_VERSION="${PYTHON_VERSION%.*}"
 PYTHON_ALIAS="python${PYTHON_SITE_VERSION}"
+# "uv" (default) installs the Python package list noticeably faster than pip.
+# Set to "pip" to use the previous behavior. Like any unpinned "latest
+# compatible" install, the exact resolved versions can differ run to run (and
+# between installers) for packages with no version constraint in the list
+# below — that's inherent to installing unpinned packages, not specific to uv.
+PYTHON_PACKAGE_INSTALLER="${PYTHON_PACKAGE_INSTALLER:-uv}"
+UV_VERSION="${UV_VERSION:-0.11.26}"
 NODE_VERSION="${NODE_VERSION:-24.15.0}"
 BUN_VERSION="${BUN_VERSION:-1.3.14}"
 BASH_PACKAGE_VERSION="${BASH_PACKAGE_VERSION:-5.2.0}"
@@ -167,10 +174,16 @@ if [ -f "$PIP_PATH" ]; then
     "$PIP_PATH" install --upgrade pip 2>/dev/null || true
     PYTHON_PACKAGES_INSTALLED=false
 
+    PYTHON_INSTALL_CMD=("$PIP_PATH" install)
+    if [ "$PYTHON_PACKAGE_INSTALLER" = "uv" ]; then
+        "$PIP_PATH" install "uv==${UV_VERSION}" 2>/dev/null || true
+        PYTHON_INSTALL_CMD=("${PKG_DEST}/bin/uv" pip install --python "${PKG_DEST}/bin/python3")
+    fi
+
     # MarkItDown 0.1.x initializes Magika/ONNX at import time; the aarch64
     # onnxruntime wheel segfaults under NsJail. 0.0.2 still supports PPTX via
     # python-pptx without that native dependency.
-    if ! "$PIP_PATH" install \
+    if ! "${PYTHON_INSTALL_CMD[@]}" \
         openpyxl \
         matplotlib \
         numpy \
