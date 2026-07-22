@@ -47,7 +47,15 @@ export function deriveRuntimeSessionId(args: {
   return `rt_${createHash('sha256').update(material, 'utf8').digest('hex').slice(0, 40)}`;
 }
 
-/** Router-side gate: stateless mode never derives a runtime session. */
+/**
+ * Router-side gate: stateless mode never derives a runtime session, and a
+ * request WITHOUT a hint never lands on a session either — deriving from the
+ * default hint would silently share one persistent per-user workspace across
+ * every hintless conversation, contradicting the caller's toggle-off
+ * expectation. Affinity degrades the hintless request to a stateless one-shot;
+ * strict mode rejects it, since the caller asked for guaranteed session
+ * semantics it failed to identify.
+ */
 export function resolveRuntimeSessionIdForRequest(args: {
   mode: 'stateless' | 'affinity' | 'strict';
   storageNamespace: string;
@@ -55,5 +63,11 @@ export function resolveRuntimeSessionIdForRequest(args: {
   hint?: string;
 }): string | undefined {
   if (args.mode === 'stateless') return undefined;
+  if (args.hint == null || args.hint === '') {
+    if (args.mode === 'strict') {
+      throw new RuntimeSessionHintError('runtime_session_hint is required in strict mode');
+    }
+    return undefined;
+  }
   return deriveRuntimeSessionId(args);
 }

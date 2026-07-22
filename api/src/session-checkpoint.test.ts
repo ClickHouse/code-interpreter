@@ -141,10 +141,12 @@ describe('receiveSessionFiles (additive delivery)', () => {
 
     const archive = await makeArchive({
       'upload.csv': 'a,b\n1,2\n',
+      'skill.md': '# infra file',
       [SESSION_FILES_MANIFEST_FILE]: JSON.stringify({
         marker: SESSION_FILES_MANIFEST_MARKER,
         files: [
           { name: 'upload.csv', id: 'file_up1', storage_session_id: 'store_1' },
+          { name: 'skill.md', id: 'file_ro1', storage_session_id: 'store_1', read_only: true },
           { name: '../escape.txt', id: 'file_bad', storage_session_id: 'store_1' },
           { name: 'never-delivered.txt', id: 'file_missing', storage_session_id: 'store_1' },
         ],
@@ -159,6 +161,12 @@ describe('receiveSessionFiles (additive delivery)', () => {
      * from the output scan. */
     expect(session!.primedInputId('upload.csv')).toBe('file_up1');
     expect(session!.primedSessionId('upload.csv')).toBe('store_1');
+    /* Read-only deliveries keep the pull model's contract: always suppressed
+     * from the output scan, and reported as not-primed so each exec receives
+     * a pristine re-delivery instead of trusting the writable workspace copy. */
+    expect(session!.isPrimedInput('skill.md')).toBe(true);
+    expect(session!.isPrimedReadOnly('skill.md')).toBe(true);
+    expect(session!.primedInputId('skill.md')).toBeUndefined();
     /* Traversal names and entries with no on-disk file are ignored. */
     expect(session!.primedInputId('../escape.txt')).toBeUndefined();
     expect(session!.primedInputId('never-delivered.txt')).toBeUndefined();

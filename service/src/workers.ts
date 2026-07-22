@@ -76,6 +76,14 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     });
     egressGrantTokenForRestore = egressGrantToken;
 
+    /* Strict mode promises guaranteed session semantics; a job that lost its
+     * session id (router bug, stale enqueue) must fail loudly rather than
+     * silently run stateless. Synthetic health probes are exempt — they are
+     * deliberately sessionless. */
+    if (env.RUNTIME_SESSION_MODE === 'strict' && !isSyntheticJob && !job.data.runtimeSessionId) {
+      throw new Error('strict runtime session mode requires a runtimeSessionId on the job');
+    }
+
     const responseRaw = await getSandboxBackend().execute(
       { body: sandboxRequest.body, headers: sandboxRequest.headers },
       {

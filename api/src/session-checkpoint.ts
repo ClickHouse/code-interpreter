@@ -31,7 +31,16 @@ const CHECKPOINT_CONTENT_TYPE = 'application/x-gtar';
 export const SESSION_FILES_MANIFEST_FILE = '.codeapi-files.json';
 export const SESSION_FILES_MANIFEST_MARKER = 'codeapi.session-files.v1';
 
-type DeliveredFileEntry = { name: string; id: string; storage_session_id: string };
+type DeliveredFileEntry = {
+  name: string;
+  id: string;
+  storage_session_id: string;
+  /** Mirrors the file server's X-Read-Only contract: read-only deliveries are
+   *  primed as such, so the output scan always suppresses them and each exec
+   *  re-delivers a pristine copy (a writable workspace copy of an
+   *  infrastructure file is never trusted). */
+  read_only?: boolean;
+};
 
 export class SessionCheckpointError extends Error {}
 
@@ -85,8 +94,13 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
      * workspace tar can exit and emit 'close' before pipeline resolves, and a
      * listener attached only afterward would miss it and hang here forever —
      * the finally never runs, leaving the runner sidecar in the workspace for
-     * the next /execute to mis-scan as user output. */
-    const closed: Promise<number> = new Promise((resolve) => tar.on('close', resolve));
+     * the next /execute to mis-scan as user output. The 'error' listener turns
+     * a spawn failure (e.g. tar missing from PATH) into a rejected promise
+     * instead of an unhandled ChildProcess 'error' crashing the runner. */
+    const closed: Promise<number> = new Promise((resolve, reject) => {
+      tar.on('close', resolve);
+      tar.on('error', reject);
+    });
     await pipeline(tar.stdout, res);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`checkpoint tar exited ${code}`);
@@ -128,8 +142,12 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
      * side): a small upload can finish and 'close' can fire before pipeline
      * resolves, and a listener attached afterward would hang, never sending the
      * 200 — the control plane would then hit the restore timeout and recycle a
-     * freshly-launched VM even though the archive was valid. */
-    const closed: Promise<number> = new Promise((resolve) => tar.on('close', resolve));
+     * freshly-launched VM even though the archive was valid. 'error' guards the
+     * spawn-failure case (see the create side). */
+    const closed: Promise<number> = new Promise((resolve, reject) => {
+      tar.on('close', resolve);
+      tar.on('error', reject);
+    });
     await pipeline(req, tar.stdin);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
@@ -181,8 +199,12 @@ export async function receiveSessionFiles(req: Request, res: Response): Promise<
   tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'session files tar'));
   try {
     /* 'close' listener before the pipeline await, for the same small-body
-     * race documented on the checkpoint/restore sides. */
-    const closed: Promise<number> = new Promise((resolve) => tar.on('close', resolve));
+     * race documented on the checkpoint/restore sides; 'error' guards the
+     * spawn-failure case. */
+    const closed: Promise<number> = new Promise((resolve, reject) => {
+      tar.on('close', resolve);
+      tar.on('error', reject);
+    });
     await pipeline(req, tar.stdin);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`session files tar exited ${code}`);
@@ -229,7 +251,13 @@ async function applyDeliveredFilesManifest(session: SessionWorkspace, dir: strin
       if (target !== dir && !target.startsWith(dir + path.sep)) continue;
       const st = await fsp.lstat(target).catch(() => null);
       if (!st?.isFile()) continue;
-      session.markPrimed(entry.name, entry.id, false, await sha256File(target), entry.storage_session_id);
+      session.markPrimed(
+        entry.name,
+        entry.id,
+        entry.read_only === true,
+        await sha256File(target),
+        entry.storage_session_id,
+      );
     }
   } catch (error) {
     logger.debug({ err: error }, 'No session files manifest to apply');
@@ -237,13 +265,14 @@ async function applyDeliveredFilesManifest(session: SessionWorkspace, dir: strin
 }
 
 /** Same digest shape as Job.computeFileHash (streaming sha256 hex, no-follow)
- *  so primed baselines recorded here compare equal to the output scan's. */
+ *  so primed baselines recorded here compare equal to the output scan's.
+ *  Opens via fsp.open because numeric flag constants are only typed there —
+ *  `createReadStream`'s options type wants a string mode with no O_NOFOLLOW
+ *  spelling. */
 async function sha256File(filePath: string): Promise<string> {
+  const handle = await fsp.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   const hash = crypto.createHash('sha256');
-  const stream = fs.createReadStream(filePath, {
-    flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
-  });
-  for await (const chunk of stream) hash.update(chunk as Buffer);
+  for await (const chunk of handle.createReadStream()) hash.update(chunk as Buffer);
   return hash.digest('hex');
 }
 

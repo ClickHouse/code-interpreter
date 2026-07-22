@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type * as t from '../types';
 import { internalServiceHeaders } from '../internal-service-auth';
+import { getAxiosErrorDetails } from '../utils';
 import { env } from '../config';
 import logger from '../logger';
 
@@ -23,6 +24,13 @@ import logger from '../logger';
  * the execute's own priming then reuses the on-disk copy instead of attempting
  * an unreachable pull, and later turns suppress unchanged inputs from the
  * output scan exactly as on pull-model backends.
+ *
+ * Refs the session record marks as already delivered are skipped entirely —
+ * re-pushing them would overwrite in-place modifications the sandbox made on
+ * a prior turn, defeating the runner's `reusePrimedInput` contract. Read-only
+ * refs are the deliberate exception: they are re-delivered every exec (and
+ * marked read-only in the manifest), mirroring the pull model's rule that a
+ * writable workspace copy of an infrastructure file is never trusted.
  */
 
 /** Mirrors the runner's reserved manifest member (api/src/session-checkpoint.ts);
@@ -30,12 +38,21 @@ import logger from '../logger';
 export const SESSION_FILES_MANIFEST_FILE = '.codeapi-files.json';
 export const SESSION_FILES_MANIFEST_MARKER = 'codeapi.session-files.v1';
 
+/** Upper bound on refs per delivery — matches the batch-upload ceiling rather
+ *  than trusting the request body to be reasonable. */
+export const SESSION_FILES_MAX_COUNT = 256;
+
 export class SessionFilesError extends Error {}
 
 export interface SessionFileRef {
   id: string;
   storage_session_id: string;
   name: string;
+}
+
+/** `<storage_session_id>/<id>` — the registry key for a delivered ref. */
+export function sessionFileRefKey(ref: SessionFileRef): string {
+  return `${ref.storage_session_id}/${ref.id}`;
 }
 
 /** The by-reference subset of the payload's files (inline `content` entries
@@ -63,48 +80,79 @@ function safeRelativeName(stage: string, name: string): string | undefined {
   return normalized;
 }
 
+export interface SessionFilesArchive {
+  data: Buffer;
+  /** Registry keys of WRITABLE refs staged into this archive — the caller
+   *  records them as delivered after a successful push. Read-only refs are
+   *  intentionally absent so they re-deliver next exec. */
+  deliveredKeys: string[];
+}
+
 /**
  * Fetches every ref from the file server and builds the delivery archive
  * (`session/<name>` members + the primed-files manifest). Throws
- * {@link SessionFilesError} on an unsafe name or a failed fetch — a silently
- * missing input is precisely the failure mode this module exists to fix, so
- * the execute must fail loudly rather than run without the user's file.
+ * {@link SessionFilesError} on an unsafe name, a failed fetch, or a blown
+ * size/count budget — a silently missing input is precisely the failure mode
+ * this module exists to fix, so the execute must fail loudly rather than run
+ * without the user's file. Honors `opts.signal` between and during fetches so
+ * an aborted job stops consuming disk and file-server bandwidth.
  */
 export async function buildSessionFilesArchive(
   refs: SessionFileRef[],
-  opts: { timeoutMs: number; maxBytes: number; fileServerUrl?: string },
-): Promise<Buffer | undefined> {
+  opts: { timeoutMs: number; maxBytes: number; fileServerUrl?: string; signal?: AbortSignal },
+): Promise<SessionFilesArchive | undefined> {
   if (refs.length === 0) return undefined;
+  if (refs.length > SESSION_FILES_MAX_COUNT) {
+    throw new SessionFilesError(
+      `Session delivery of ${refs.length} files exceeds the ${SESSION_FILES_MAX_COUNT}-file limit`,
+    );
+  }
   const baseUrl = (opts.fileServerUrl ?? env.FILE_SERVER_URL).replace(/\/$/, '');
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'codeapi-session-files-'));
   const stage = path.join(tmp, 'session');
   try {
     await fsp.mkdir(stage);
-    const staged: SessionFileRef[] = [];
+    const staged: Array<SessionFileRef & { read_only: boolean }> = [];
     const seen = new Set<string>();
+    /* Cumulative UNCOMPRESSED budget: per-fetch maxContentLength alone lets
+     * one authorized object repeated under many names consume unbounded disk
+     * and heap before the post-compression check would ever run. */
+    let totalBytes = 0;
     for (const ref of refs) {
+      if (opts.signal?.aborted) {
+        throw new SessionFilesError('Session file delivery aborted');
+      }
       const name = safeRelativeName(stage, ref.name);
       if (!name) throw new SessionFilesError(`Unsafe input file name: ${ref.name}`);
       if (seen.has(name)) continue;
       seen.add(name);
-      const bytes = await fetchFileObject(baseUrl, ref, opts);
+      const fetched = await fetchFileObject(baseUrl, ref, opts);
+      totalBytes += fetched.bytes.length;
+      if (totalBytes > opts.maxBytes) {
+        throw new SessionFilesError(
+          `Session files exceed the ${opts.maxBytes}-byte delivery budget`,
+        );
+      }
       const target = path.join(stage, name);
       await fsp.mkdir(path.dirname(target), { recursive: true });
-      await fsp.writeFile(target, bytes);
-      staged.push({ ...ref, name });
+      await fsp.writeFile(target, fetched.bytes);
+      staged.push({ ...ref, name, read_only: fetched.readOnly });
     }
     await fsp.writeFile(
       path.join(stage, SESSION_FILES_MANIFEST_FILE),
       JSON.stringify({ marker: SESSION_FILES_MANIFEST_MARKER, files: staged }),
       { mode: 0o600 },
     );
-    const archive = await tarDirectory(tmp);
-    if (archive.length > opts.maxBytes) {
+    const data = await tarDirectory(tmp);
+    if (data.length > opts.maxBytes) {
       throw new SessionFilesError(
-        `Session files archive is ${archive.length} bytes (limit ${opts.maxBytes})`,
+        `Session files archive is ${data.length} bytes (limit ${opts.maxBytes})`,
       );
     }
-    return archive;
+    return {
+      data,
+      deliveredKeys: staged.filter((ref) => !ref.read_only).map(sessionFileRefKey),
+    };
   } finally {
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
@@ -113,8 +161,8 @@ export async function buildSessionFilesArchive(
 async function fetchFileObject(
   baseUrl: string,
   ref: SessionFileRef,
-  opts: { timeoutMs: number; maxBytes: number },
-): Promise<Buffer> {
+  opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal },
+): Promise<{ bytes: Buffer; readOnly: boolean }> {
   const url = `${baseUrl}/sessions/${encodeURIComponent(ref.storage_session_id)}/objects/${encodeURIComponent(ref.id)}`;
   try {
     const response = await axios.get<ArrayBuffer>(url, {
@@ -122,10 +170,17 @@ async function fetchFileObject(
       responseType: 'arraybuffer',
       maxContentLength: opts.maxBytes,
       timeout: opts.timeoutMs,
+      signal: opts.signal,
     });
-    return Buffer.from(response.data);
+    const readOnly = String(response.headers['x-read-only'] ?? '').toLowerCase() === 'true';
+    return { bytes: Buffer.from(response.data), readOnly };
   } catch (error) {
-    logger.error(`Failed to fetch session input file ${ref.id}:`, error);
+    /* Sanitized details only: a raw axios error carries the request config —
+     * including the internal service token header — straight into the logs. */
+    logger.error(
+      `Failed to fetch session input file ${ref.id}:`,
+      getAxiosErrorDetails(error),
+    );
     throw new SessionFilesError(`Failed to fetch input file ${ref.name} from file server`);
   }
 }

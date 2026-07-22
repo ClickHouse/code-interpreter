@@ -65,4 +65,18 @@ describe('resolveRuntimeSessionIdForRequest', () => {
     expect(affinity).toBeDefined();
     expect(affinity).toBe(strict as string);
   });
+
+  /* A hintless request must never land on a session: deriving from the
+   * default hint would silently share one persistent per-user workspace
+   * across every hintless conversation. */
+  test('affinity mode without a hint degrades to stateless', () => {
+    expect(resolveRuntimeSessionIdForRequest({ mode: 'affinity', ...BASE })).toBeUndefined();
+    expect(resolveRuntimeSessionIdForRequest({ mode: 'affinity', ...BASE, hint: '' })).toBeUndefined();
+  });
+
+  test('strict mode without a hint is rejected', () => {
+    expect(() => resolveRuntimeSessionIdForRequest({ mode: 'strict', ...BASE })).toThrow(
+      RuntimeSessionHintError,
+    );
+  });
 });

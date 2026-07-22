@@ -44,6 +44,18 @@ export interface RuntimeSessionRecord {
   workspace_checkpoint?: string;
   checkpointed_at?: number;
   last_error?: string;
+  /** Writable by-ref inputs (`<storage_session_id>/<id>`) already delivered
+   *  into the session workspace. Push delivery skips these so a later turn
+   *  re-sending the same ref cannot overwrite in-place modifications the
+   *  sandbox made to the file (read-only refs are never recorded — they are
+   *  re-delivered every exec, mirroring the pull model's re-download rule).
+   *  Only meaningful for the live workspace: after a relaunch the list is
+   *  trusted solely when the restored checkpoint post-dates `delivered_at`,
+   *  since a budget-skipped checkpoint would not contain the delivered files. */
+  delivered_files?: string[];
+  /** When `delivered_files` last changed — compared against `checkpointed_at`
+   *  on restore to decide whether the checkpoint captured the deliveries. */
+  delivered_at?: number;
 }
 
 const SESS_PREFIX = 'rtsx:sess:';
@@ -175,21 +187,28 @@ export async function releaseRuntimeSessionLock(runtimeSessionId: string, token:
  *  the caller uses to stop renewing. Lets the critical path run arbitrarily long
  *  (launch throttle + restore + execute + checkpoint, each with its own I/O and
  *  token-mint waits) without the TTL having to bound the worst-case sum. */
+/** `lost` is positive evidence another holder fenced us (token mismatch);
+ *  `error` is a transport failure where the lock may well still be held —
+ *  callers must only abort in-flight work on `lost`, never on a single
+ *  transient `error` (the TTL is a multiple of the heartbeat interval, so
+ *  the next tick retries well before expiry). */
+export type LockRenewal = 'held' | 'lost' | 'error';
+
 export async function renewRuntimeSessionLock(
   runtimeSessionId: string,
   token: string,
   ttlMs: number = RUNTIME_SESSION_LOCK_TTL_MS,
-): Promise<boolean> {
+): Promise<LockRenewal> {
   try {
     const result = await redis.renewRuntimeSessionLockScript(
       `${LOCK_PREFIX}${runtimeSessionId}`,
       token,
       String(ttlMs),
     );
-    return result === 1;
+    return result === 1 ? 'held' : 'lost';
   } catch (err) {
     logger.warn('Failed to renew runtime session lock', { runtimeSessionId, err });
-    return false;
+    return 'error';
   }
 }
 

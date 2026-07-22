@@ -214,12 +214,24 @@ export class SessionWorkspace {
     for (const [relPath, hash] of snapshot.surfaced) this.surfaced.set(relPath, hash);
   }
 
-  /** Full teardown: wipe the dir, release the pinned UID, clear diff state. */
+  /** Full teardown: wipe the dir, release the pinned UID, clear diff state.
+   *  Fail closed on a failed wipe: the directory was quarantined with this
+   *  session's data still inside, so the pinned UID is deliberately NOT
+   *  released — recycling it could let a later session reactivate the
+   *  quarantined contents under a matching identity. Leaking one UID slot on
+   *  a VM that is being recycled anyway is the cheaper failure. */
   async reset(): Promise<void> {
-    await resetSessionWorkspace();
+    const wiped = await resetSessionWorkspace();
     this.surfaced.clear();
     this.primed.clear();
     this.lease = undefined;
+    if (!wiped) {
+      logger.error(
+        { runtimeSessionId: this.runtimeSessionId },
+        'Session workspace wipe failed; retaining pinned UID for the quarantined directory',
+      );
+      return;
+    }
     if (this.identity) {
       sandboxJobUidPool.release(this.identity);
       this.identity = undefined;
@@ -229,15 +241,25 @@ export class SessionWorkspace {
 
 let boundSession: SessionWorkspace | undefined;
 
-/** Called by the `/run` lifecycle hook. Binding the same session twice is a
- *  no-op; a different runtime session id resets the prior one first. */
+/** Binding the same session twice is a no-op. A DIFFERENT runtime session id
+ *  is rejected outright: in the MicroVM topology one runner serves exactly one
+ *  session for its whole lifetime, so a second id is a control-plane bug or a
+ *  forged header — and honoring it would race an async wipe of the previous
+ *  session against the new session's restore over the same directory (the
+ *  reset could delete the new session's files, or checkpoint one session's
+ *  data under the other's identity). Fail closed; the control plane recycles
+ *  the VM on the resulting 409. */
 export function bindSessionWorkspace(binding: SessionBinding | undefined): SessionWorkspace | undefined {
   if (!binding) return boundSession;
   if (boundSession && boundSession.runtimeSessionId === binding.runtimeSessionId) {
     return boundSession;
   }
   if (boundSession) {
-    void boundSession.reset().catch((err) => logger.error({ err }, 'Failed to reset superseded session workspace'));
+    logger.error(
+      { bound: boundSession.runtimeSessionId, requested: binding.runtimeSessionId },
+      'Refusing to rebind runner to a different runtime session',
+    );
+    return undefined;
   }
   boundSession = new SessionWorkspace(binding);
   return boundSession;

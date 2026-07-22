@@ -8,7 +8,7 @@ import type { CheckpointStore } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmApiError, microvmPortHeaders } from '../runtime-session/lambda-client';
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
 import { checkpointSession, pushFiles, restoreSession } from '../runtime-session/checkpoint';
-import { buildSessionFilesArchive, sessionFileRefs } from '../runtime-session/files';
+import { buildSessionFilesArchive, sessionFileRefKey, sessionFileRefs } from '../runtime-session/files';
 import {
   RUNTIME_SESSION_LOCK_TTL_MS,
   allocateRuntimeSessionGeneration,
@@ -189,17 +189,40 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * let a second worker fence us and run concurrently. Fenced renew stops
      * itself; the interval is a third of the TTL so a couple of missed ticks are
      * survivable. */
+    /* A LOST renewal is positive evidence another worker fenced us and now owns
+     * the session — merely stopping the heartbeat would let this worker keep
+     * mutating a VM the new holder is using. Abort the in-flight critical path
+     * instead. A transient renew ERROR does not abort: the TTL is three
+     * intervals, so the next tick retries long before expiry. */
+    const fence = new AbortController();
     const heartbeat = setInterval(() => {
-      void renewRuntimeSessionLock(runtimeSessionId, lockToken).then((held) => {
-        if (!held) clearInterval(heartbeat);
+      void renewRuntimeSessionLock(runtimeSessionId, lockToken).then((renewal) => {
+        if (renewal === 'lost') {
+          clearInterval(heartbeat);
+          fence.abort();
+        }
       });
     }, Math.floor(RUNTIME_SESSION_LOCK_TTL_MS / 3));
+    const sessionCtx: SandboxExecuteContext = {
+      ...ctx,
+      signal: AbortSignal.any([ctx.signal, fence.signal]),
+    };
 
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
-      const { vm, reused } = await this.findOrLaunchSession(client, ctx, runtimeSessionId, existing, lockToken);
-      await this.pushSessionInputFiles(client, vm, req, ctx, runtimeSessionId, lockToken);
-      const result = await this.executeOnSessionVm(client, vm, req, ctx, runtimeSessionId, lockToken, reused);
+      const { vm, reused, restored } = await this.findOrLaunchSession(client, sessionCtx, runtimeSessionId, existing, lockToken);
+      /* Refs already delivered into the live workspace. Valid on warm reuse;
+       * after a relaunch only when the restored checkpoint post-dates the last
+       * delivery (a budget-skipped checkpoint would not contain those files —
+       * treating them as delivered would silently drop inputs). */
+      const checkpointCoversDeliveries = existing?.delivered_at != null
+        && existing?.checkpointed_at != null
+        && existing.checkpointed_at >= existing.delivered_at;
+      const deliveredBefore = reused || (restored && checkpointCoversDeliveries)
+        ? existing?.delivered_files ?? []
+        : [];
+      await this.pushSessionInputFiles(client, vm, req, sessionCtx, runtimeSessionId, lockToken, deliveredBefore, fence.signal);
+      const result = await this.executeOnSessionVm(client, vm, req, sessionCtx, runtimeSessionId, lockToken, reused, fence.signal);
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
@@ -218,7 +241,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * after the sandbox work already succeeded. */
       const worstCaseCheckpointMs =
         this.config.launchTimeoutMs + 3 * this.config.checkpoint.timeoutMs;
-      const canCheckpoint = !ctx.signal.aborted && remainingBudgetMs > worstCaseCheckpointMs;
+      const canCheckpoint = !sessionCtx.signal.aborted && remainingBudgetMs > worstCaseCheckpointMs;
       const settled = await readRuntimeSessionRecord(runtimeSessionId);
       const nextRecord = settled
         ? canCheckpoint
@@ -260,6 +283,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     runtimeSessionId: string,
     lockToken: string,
     reused: boolean,
+    fenceSignal?: AbortSignal,
   ): Promise<SandboxRawResponse> {
     try {
       return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId, reused);
@@ -282,6 +306,16 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * is dead, not that the runner rejected the request; recycle it, else
        * every later call keeps reusing the dead VM until idle expiry. */
       const status = axios.isAxiosError(error) ? error.response?.status ?? 0 : 0;
+      /* A fence abort means another worker holds the lock and may already be
+       * using this VM — never terminate it out from under them. Our stale
+       * lockToken makes the registry writes no-ops anyway; just stop. */
+      if (fenceSignal?.aborted === true) {
+        throw new SandboxBackendError(
+          'MICROVM_FENCED',
+          `Lost session lock for ${runtimeSessionId} during execute`,
+          error,
+        );
+      }
       const transportFailure = axios.isAxiosError(error) && error.response == null;
       const unhealthy = error instanceof SandboxBackendError && error.code === 'MICROVM_UNHEALTHY';
       const gatewayUnreachable = status >= 502 && status <= 504;
@@ -308,7 +342,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     runtimeSessionId: string,
     record: RuntimeSessionRecord | null,
     lockToken: string,
-  ): Promise<{ vm: MicrovmDescription; reused: boolean }> {
+  ): Promise<{ vm: MicrovmDescription; reused: boolean; restored: boolean }> {
     const deadlineHeadroomMs = this.config.jobTimeoutMs + 30_000;
     /* A record whose image/version/port no longer match the current config was
      * launched by an older deploy — relaunch on the current config rather than
@@ -338,6 +372,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       return {
         vm: { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint },
         reused: true,
+        restored: false,
       };
     }
 
@@ -425,18 +460,27 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         endpointBase,
         config: this.config.checkpoint,
       });
-      /* A push-restore that failed after the runner began extracting leaves the
-       * workspace possibly-partial (the runner's cleanup runs async past our
-       * abort). Don't execute against it — recycle so the next call relaunches a
-       * clean VM. (A fetch failure / absent checkpoint is safe: the workspace is
-       * the untouched fresh one.) */
-      if (restoreResult === 'push_failed') {
+      /* Fail closed on BOTH failure shapes:
+       *  - push_failed: the runner may hold a partially-extracted workspace.
+       *  - fetch_failed: the workspace is clean but EMPTY. Executing anyway
+       *    used to look like a harmless degraded run, but the post-run
+       *    checkpoint then writes a higher-sequence snapshot of that empty
+       *    workspace and prunes the last good one — a transient S3 blip
+       *    becoming permanent data loss. A retryable 503 is strictly better.
+       * (An absent checkpoint stays fine: a genuinely new session no-ops.) */
+      if (restoreResult === 'push_failed' || restoreResult === 'fetch_failed') {
         await this.terminate(client, vm.microvmId, 'error').catch(() => {});
         await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
-        throw new SandboxBackendError('MICROVM_UNHEALTHY', 'Checkpoint restore left the workspace in an unknown state');
+        throw new SandboxBackendError(
+          'MICROVM_UNHEALTHY',
+          restoreResult === 'push_failed'
+            ? 'Checkpoint restore left the workspace in an unknown state'
+            : 'Checkpoint fetch failed; refusing to run against an empty workspace',
+        );
       }
+      return { vm, reused: false, restored: restoreResult === 'restored' };
     }
-    return { vm, reused: false };
+    return { vm, reused: false, restored: false };
   }
 
   /** Polls the runner's health endpoint until it responds, bounded by the
@@ -555,12 +599,19 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
    * manifest member makes the runner register them as primed, so the execute's
    * priming reuses the on-disk copies instead of fetching.
    *
-   * Archive build failures (unsafe name, file-server fetch error, over-size)
-   * throw before any bytes reach the VM — the workspace is untouched, so the
-   * warm VM survives for the next call. A failed push after transfer began
-   * leaves the workspace possibly-partial, exactly like a failed push-restore:
-   * recycle so the next call relaunches + restores clean rather than executing
-   * against a truncated input.
+   * Writable refs recorded as already delivered are skipped: re-pushing them
+   * would overwrite in-place modifications the sandbox made on a prior turn.
+   * Newly delivered writable refs are recorded on the session (with
+   * `delivered_at`) under the held lock before the execute runs.
+   *
+   * Archive build failures (unsafe name, file-server fetch error, blown
+   * size/count budget) throw before any bytes reach the VM — the workspace is
+   * untouched, so the warm VM survives for the next call. A failed or aborted
+   * push after transfer began leaves the workspace possibly-partial, exactly
+   * like a failed push-restore: recycle so the next call relaunches + restores
+   * clean rather than executing against a truncated input. The one exception
+   * is a fence abort — the lock now belongs to another worker that may be
+   * using this VM, so cease without touching it.
    */
   private async pushSessionInputFiles(
     client: LambdaMicrovmClient,
@@ -569,12 +620,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     runtimeSessionId: string,
     lockToken: string,
+    deliveredBefore: string[],
+    fenceSignal: AbortSignal,
   ): Promise<void> {
-    const refs = sessionFileRefs(req.body.files);
+    const deliveredSet = new Set(deliveredBefore);
+    const refs = sessionFileRefs(req.body.files)
+      .filter((ref) => !deliveredSet.has(sessionFileRefKey(ref)));
     if (refs.length === 0) return;
     const archive = await buildSessionFilesArchive(refs, {
       timeoutMs: this.config.checkpoint.timeoutMs,
       maxBytes: this.config.checkpoint.maxBytes,
+      signal: ctx.signal,
     });
     if (!archive) return;
     try {
@@ -582,15 +638,35 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         mintToken: () => this.mintAuthToken(client, vm.microvmId),
         endpointBase: normalizeMicrovmEndpoint(vm.endpoint ?? ''),
         runtimeSessionId,
-      }, archive, this.config.checkpoint);
+      }, archive.data, this.config.checkpoint);
     } catch (error) {
-      if (ctx.signal.aborted) throw error;
+      if (fenceSignal.aborted) {
+        throw new SandboxBackendError(
+          'MICROVM_FENCED',
+          `Lost session lock for ${runtimeSessionId} during file delivery`,
+          error,
+        );
+      }
       await this.terminate(client, vm.microvmId, 'error').catch(() => {});
       await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
       throw new SandboxBackendError(
         'MICROVM_UNHEALTHY',
         'Session input file delivery failed',
         error,
+      );
+    }
+    if (archive.deliveredKeys.length === 0) return;
+    const current = await readRuntimeSessionRecord(runtimeSessionId);
+    if (!current) return;
+    const merged = Array.from(new Set([...(current.delivered_files ?? []), ...archive.deliveredKeys]));
+    const persisted = await writeRuntimeSessionRecord(
+      { ...current, delivered_files: merged, delivered_at: Date.now() },
+      lockToken,
+    );
+    if (!persisted) {
+      throw new SandboxBackendError(
+        'MICROVM_FENCED',
+        `Lost session lock for ${runtimeSessionId} after file delivery`,
       );
     }
   }

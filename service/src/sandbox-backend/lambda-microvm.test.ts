@@ -32,6 +32,7 @@ let executeStatus = 200;
 let sessionFilesStatus = 200;
 let lastSessionFilesBody: Buffer | null = null;
 let stealSessionLockOnExecute = false;
+let fileReadOnly = false;
 const fileObjectBytes = 'csv,bytes\n1,2\n';
 let mock: InstanceType<typeof RedisMock>;
 const checkpointBlob = 'FAKE_TAR_GZ_BYTES';
@@ -61,7 +62,10 @@ beforeAll(() => {
       /* The same server doubles as the internal file server the control plane
        * fetches input refs from when building a session files delivery. */
       if (path.startsWith('/sessions/')) {
-        return new Response(fileObjectBytes, { status: 200 });
+        return new Response(fileObjectBytes, {
+          status: 200,
+          headers: fileReadOnly ? { 'X-Read-Only': 'true' } : {},
+        });
       }
       if (path === '/api/v2/session/files') {
         lastSessionFilesBody = raw;
@@ -120,6 +124,7 @@ beforeEach(async () => {
   sessionFilesStatus = 200;
   lastSessionFilesBody = null;
   stealSessionLockOnExecute = false;
+  fileReadOnly = false;
 });
 
 afterEach(() => {
@@ -431,6 +436,35 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(untarred).toContain('"storage_session_id":"sess_store_1"');
   });
 
+  test('a ref already delivered to the warm session is not re-pushed', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    await backend.execute(request(), sessionContext());
+
+    /* One push, not two: re-delivering the same writable ref would overwrite
+     * any in-place modification the first exec made to the file. */
+    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(1);
+    const record = await readRuntimeSessionRecord('rt_session_1');
+    expect(record?.delivered_files).toEqual(['sess_store_1/file_1']);
+    expect(record?.delivered_at).toBeGreaterThan(0);
+  });
+
+  test('read-only refs are re-delivered on every exec and never recorded', async () => {
+    fileReadOnly = true;
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    await backend.execute(request(), sessionContext());
+
+    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(2);
+    const record = await readRuntimeSessionRecord('rt_session_1');
+    expect(record?.delivered_files ?? []).toEqual([]);
+    /* The manifest carries the read-only bit so the runner primes accordingly. */
+    const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
+    expect(untarred).toContain('"read_only":true');
+  });
+
   test('a failed file delivery recycles the VM instead of executing partial inputs', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
@@ -694,6 +728,22 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
       c.path === '/api/v2/session/checkpoint' || c.path === '/api/v2/session/restore',
     )).toHaveLength(0);
     expect(store.objects.size).toBe(0);
+  });
+
+  test('a checkpoint FETCH failure fails closed instead of running on an empty workspace', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    store.get = () => Promise.reject(new Error('S3 down'));
+    const backend = makeBackend(fake, cfgOn, store);
+
+    /* Running anyway used to let the post-run checkpoint prune the last good
+     * snapshot — a transient S3 blip becoming permanent data loss. */
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
+      'refusing to run against an empty workspace',
+    );
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_ckpt_1')).toBeNull();
   });
 
   test('a failed checkpoint is non-fatal — the exec still succeeds', async () => {

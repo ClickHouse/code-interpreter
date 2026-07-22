@@ -78,11 +78,15 @@ describe('bindSessionWorkspace lifecycle', () => {
     expect(getBoundSessionWorkspace()).toBe(a);
   });
 
-  test('a different runtime session replaces the binding', () => {
+  /* One runner serves exactly one session for its lifetime: honoring a second
+   * id would race the previous session's async wipe against the new session's
+   * restore over the same directory. The bind must fail closed instead. */
+  test('a different runtime session is rejected, never rebound', () => {
     const a = bindSessionWorkspace({ runtimeSessionId: 'rt_1' });
     const b = bindSessionWorkspace({ runtimeSessionId: 'rt_2' });
-    expect(b).not.toBe(a);
-    expect(getBoundSessionWorkspace()?.runtimeSessionId).toBe('rt_2');
+    expect(b).toBeUndefined();
+    expect(getBoundSessionWorkspace()).toBe(a);
+    expect(getBoundSessionWorkspace()?.runtimeSessionId).toBe('rt_1');
   });
 
   test('unbind clears the bound session', async () => {
