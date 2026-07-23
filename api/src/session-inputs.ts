@@ -42,10 +42,13 @@ const ENTRY_PATTERN = /^[0-9a-f]{64}(\.json)?$/;
 const META_SUFFIX = '.json';
 
 export interface CachedInputMeta {
-  /** Original filename as the file server reported it (Content-Disposition on
-   *  the pull path), so a cache hit resolves the same on-disk name a fetch
-   *  would have. Absent ⇒ priming falls back to the requested ref name. */
-  name?: string;
+  /** Whether the object is infrastructure the sandbox must not modify. This is
+   *  a property of the OBJECT, so it belongs here. A filename deliberately
+   *  does not: the cache is keyed by object, and the same object can be
+   *  requested at several destinations in one execute, so the requesting ref
+   *  owns the name. Emitting one cached name as Content-Disposition made every
+   *  ref resolve to the first ref's path — which then overwrote a file the
+   *  sandbox had edited. */
   readOnly?: boolean;
 }
 
@@ -99,12 +102,8 @@ export async function openCachedInput(
  */
 export function cachedInputResponse(entry: CachedInput): Response {
   const headers = new Headers();
-  if (entry.meta.name != null && entry.meta.name !== '') {
-    headers.set(
-      'content-disposition',
-      `attachment; filename*=UTF-8''${encodeURIComponent(entry.meta.name)}`,
-    );
-  }
+  /* No Content-Disposition: priming falls back to the ref's requested name,
+   * so each destination gets its own copy (see CachedInputMeta). */
   if (entry.meta.readOnly === true) headers.set('x-read-only', 'true');
   return new Response(fs.createReadStream(entry.path) as unknown as ReadableStream, {
     status: 200,

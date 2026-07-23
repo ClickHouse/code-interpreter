@@ -453,12 +453,12 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
       paths.indexOf('/api/v2/session/inputs/probe'),
     );
     expect(paths.indexOf('/api/v2/session/inputs')).toBeLessThan(paths.indexOf('/api/v2/execute'));
-    /* Objects are pushed under runner-computed digests; the caller's path is
-     * carried only as metadata the runner hands to priming, never as a member
-     * name the extraction could act on. */
+    /* Objects are pushed under runner-computed digests, and carry only
+     * object-level metadata: no caller-supplied path appears anywhere in the
+     * batch, so nothing in delivery can act on one. */
     const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
     expect(untarred).toMatch(/[0-9a-f]{64}/);
-    expect(untarred).toContain('"name":"inputs/data.csv"');
+    expect(untarred).not.toContain('inputs/data.csv');
   });
 
   test('a second execution pushes nothing when the VM already holds the object', async () => {

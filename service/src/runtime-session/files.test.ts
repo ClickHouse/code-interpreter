@@ -93,7 +93,7 @@ describe('buildInputBatch', () => {
     expect(await membersOf(batch!.data)).toEqual([key, `${key}.json`].sort());
   });
 
-  test('carries the file server original name and read-only bit', async () => {
+  test('carries only object-level metadata (read-only), never a name', async () => {
     const batch = await buildInputBatch(
       [{ id: 'ro', storage_session_id: 's1', name: 'skill.md' }],
       opts(),
@@ -106,7 +106,8 @@ describe('buildInputBatch', () => {
       await fsp.readFile(path.join(tmp, `${inputCacheKey('s1', 'ro')}.json`), 'utf8'),
     );
     await fsp.rm(tmp, { recursive: true, force: true });
-    expect(meta).toEqual({ name: 'server-name.txt', readOnly: true });
+    /* A name here would override every requesting ref's destination. */
+    expect(meta).toEqual({ readOnly: true });
   });
 
   test('rejects deliveries above the object-count cap before any fetch', async () => {

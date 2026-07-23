@@ -85,9 +85,9 @@ describe('pushed input cache', () => {
     const hit = await openCachedInput('s1', 'f1');
     expect(hit).not.toBeNull();
     const response = cachedInputResponse(hit!);
-    /* Priming reads the name from Content-Disposition and the read-only bit
-     * from X-Read-Only, exactly as it does for a file-server response. */
-    expect(response.headers.get('content-disposition')).toContain('data.csv');
+    /* No Content-Disposition: the cache is keyed by OBJECT, so the requesting
+     * ref owns the destination name and priming falls back to it. */
+    expect(response.headers.get('content-disposition')).toBeNull();
     expect(response.headers.get('x-read-only')).toBeNull();
     expect(await response.text()).toBe('a,b\n1,2\n');
 
@@ -123,8 +123,8 @@ describe('pushed input cache', () => {
 
   test('eviction drops least-recently-used entries with their metadata', async () => {
     const batch = await makeBatch([
-      { storageSessionId: 's1', id: 'old', body: 'x'.repeat(4096), meta: { name: 'old.bin' } },
-      { storageSessionId: 's1', id: 'new', body: 'y'.repeat(4096), meta: { name: 'new.bin' } },
+      { storageSessionId: 's1', id: 'old', body: 'x'.repeat(4096), meta: {} },
+      { storageSessionId: 's1', id: 'new', body: 'y'.repeat(4096), meta: {} },
     ]);
     await storeCachedInputs(Readable.from(batch));
     const oldKey = inputCacheKey('s1', 'old');

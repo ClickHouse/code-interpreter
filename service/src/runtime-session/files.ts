@@ -104,7 +104,9 @@ export async function buildInputBatch(
       await fsp.writeFile(path.join(tmp, key), fetched.bytes);
       await fsp.writeFile(
         path.join(tmp, `${key}.json`),
-        JSON.stringify({ name: fetched.name ?? ref.name, readOnly: fetched.readOnly }),
+        /* Only object-level facts travel with the object; the destination
+         * name belongs to each requesting ref (see CachedInputMeta). */
+        JSON.stringify({ readOnly: fetched.readOnly }),
       );
     }
     return { data: await tarDirectory(tmp), count: refs.length };
@@ -117,7 +119,7 @@ async function fetchFileObject(
   baseUrl: string,
   ref: SessionFileRef,
   opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal },
-): Promise<{ bytes: Buffer; readOnly: boolean; name?: string }> {
+): Promise<{ bytes: Buffer; readOnly: boolean }> {
   const url = `${baseUrl}/sessions/${encodeURIComponent(ref.storage_session_id)}/objects/${encodeURIComponent(ref.id)}`;
   try {
     const response = await axios.get<ArrayBuffer>(url, {
@@ -128,12 +130,7 @@ async function fetchFileObject(
       signal: opts.signal,
     });
     const readOnly = String(response.headers['x-read-only'] ?? '').toLowerCase() === 'true';
-    /* Carry the server's original filename so a cache hit resolves the same
-     * on-disk name a direct fetch would have (Content-Disposition parity). */
-    const name = typeof response.headers['x-original-filename'] === 'string'
-      ? response.headers['x-original-filename']
-      : undefined;
-    return { bytes: Buffer.from(response.data), readOnly, name };
+    return { bytes: Buffer.from(response.data), readOnly };
   } catch (error) {
     /* Sanitized details only: a raw axios error carries the request config —
      * including the internal service token header — straight into the logs. */

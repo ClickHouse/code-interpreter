@@ -42,7 +42,7 @@ function makeJob(files: TFile[]): Job {
 describe('priming from the pushed input cache', () => {
   test('writes the cached bytes under the requested name without any HTTP fetch', async () => {
     tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'prime-cache-'));
-    await seedCache('s1', 'f1', 'a,b\n1,2\n', { name: 'data.csv' });
+    await seedCache('s1', 'f1', 'a,b\n1,2\n', {});
 
     const file: TFile = { id: 'f1', storage_session_id: 's1', name: 'data.csv' };
     const job = makeJob([file]);
@@ -55,19 +55,34 @@ describe('priming from the pushed input cache', () => {
     expect(await fsp.readFile(path.join(tmpDir, 'data.csv'), 'utf8')).toBe('a,b\n1,2\n');
   });
 
-  test('honors the cached read-only bit and original name', async () => {
+  test('honors the cached read-only bit at the requested destination', async () => {
     tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'prime-cache-ro-'));
-    await seedCache('s1', 'ro', 'SKILL\n', { name: 'renamed-by-server.md', readOnly: true });
+    await seedCache('s1', 'ro', 'SKILL\n', { readOnly: true });
 
     const file: TFile = { id: 'ro', storage_session_id: 's1', name: 'requested.md' };
     const job = makeJob([file]);
     (job as unknown as { submissionDir: string }).submissionDir = tmpDir;
 
-    /* Content-Disposition parity: the server's name wins over the requested
-     * one, exactly as it does on the pull path. */
     const written = await job.downloadAndWriteFile(file);
-    expect(written).toBe('renamed-by-server.md');
-    const stat = await fsp.lstat(path.join(tmpDir, 'renamed-by-server.md'));
+    expect(written).toBe('requested.md');
+    const stat = await fsp.lstat(path.join(tmpDir, 'requested.md'));
     expect(stat.mode & 0o777).toBe(0o444);
+  });
+
+  test('one cached object serves several destinations in the same execute', async () => {
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'prime-cache-multi-'));
+    await seedCache('s1', 'shared', 'shared bytes\n', {});
+
+    /* Live regression: a per-OBJECT cached name made the second ref resolve to
+     * the first ref's path — which overwrote a file the sandbox had edited.
+     * The cache is keyed by object, so destinations belong to the refs. */
+    const job = makeJob([]);
+    (job as unknown as { submissionDir: string }).submissionDir = tmpDir;
+    for (const name of ['first.txt', 'nested/second.txt']) {
+      const written = await job.downloadAndWriteFile({ id: 'shared', storage_session_id: 's1', name });
+      expect(written).toBe(name);
+    }
+    expect(await fsp.readFile(path.join(tmpDir, 'first.txt'), 'utf8')).toBe('shared bytes\n');
+    expect(await fsp.readFile(path.join(tmpDir, 'nested/second.txt'), 'utf8')).toBe('shared bytes\n');
   });
 });
