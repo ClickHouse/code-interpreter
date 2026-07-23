@@ -190,13 +190,20 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
  * pull-based priming path has nothing reachable to pull from).
  *
  * Inherits restore's traversal hardening verbatim: `--strip-components=1 -C
- * dir` pins every archive member under the workspace, so `../x`,
+ * <staging>` pins every archive member under a scratch directory, so `../x`,
  * `other-ws/x`, or absolute members cannot escape into runner space. Unlike
  * restore, failure never wipes: the workspace holds real session state, so a
- * cut-off overlay leaves existing files untouched (at worst a partial
- * overlay, which the caller may retry idempotently). A reserved
- * {@link SESSION_FILES_MANIFEST_FILE} member registers the delivered inputs
- * as primed (see {@link applyDeliveredFilesManifest}).
+ * failed delivery leaves it untouched (the caller may retry idempotently).
+ *
+ * Extraction lands in staging rather than straight into the workspace so the
+ * merge can enforce the invariant that makes re-delivery safe: a WRITABLE
+ * input the sandbox has modified since it was primed is never overwritten by
+ * a re-push of its original bytes. The control plane also skips already
+ * delivered refs, but that state lives in Redis and dies with the session
+ * record (VM recycle, failover, flush) — enforcing it here, against the
+ * primed baseline that travels inside the checkpoint, makes the guarantee
+ * independent of control-plane state. Read-only inputs are exempt by
+ * contract: they are always restored to pristine bytes.
  */
 export async function receiveSessionFiles(req: Request, res: Response): Promise<void> {
   const session = getBoundSessionWorkspace();
@@ -206,8 +213,12 @@ export async function receiveSessionFiles(req: Request, res: Response): Promise<
   }
   const { dir, uid, gid } = await session.ownership();
   await fsp.mkdir(dir, { recursive: true });
+  /* Sibling of the workspace so the merge can rename() instead of copying,
+   * and 0o700 so no sandbox UID can read or tamper with files in flight. */
+  const staging = await fsp.mkdtemp(path.join(SANDBOX_WORKSPACE_ROOT, '.delivery-'));
+  await fsp.chmod(staging, 0o700);
 
-  const tar = spawn('tar', ['-xzf', '-', '--strip-components=1', '-C', dir], {
+  const tar = spawn('tar', ['-xzf', '-', '--strip-components=1', '-C', staging], {
     stdio: ['pipe', 'ignore', 'pipe'],
   });
   tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'session files tar'));
@@ -227,84 +238,148 @@ export async function receiveSessionFiles(req: Request, res: Response): Promise<
     await pipeline(req, tar.stdin);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`session files tar exited ${code}`);
-    await chownRecursive(dir, uid, gid);
-    await applyDeliveredFilesManifest(session, dir);
+    await mergeDeliveredFiles(session, staging, dir, uid, gid);
     res.status(200).json({ status: 'received' });
   } catch (error) {
     logger.error({ err: error }, 'Failed to receive session files');
     if (!res.headersSent) res.status(500).json({ message: 'session file delivery failed' });
+  } finally {
+    await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
   }
 }
 
 /**
- * Registers delivered inputs as primed from the reserved manifest member the
- * control plane packs into the archive. Priming is what stitches a pushed file
- * into the normal input lifecycle: the next execute's `reusePrimedInput` sees a
- * matching (storage_session_id, id) already on disk and skips its own fetch
- * (which has nothing reachable to fetch from on push-model backends), and later
- * turns that omit the ref suppress it from the output scan while unchanged.
- * Hashes are computed locally so the primed baseline matches the runner's own
- * `computeFileHash` format exactly. The manifest is removed before responding —
- * user code never sees it. A missing or marker-less manifest is non-fatal (and
- * a marker-less regular file with the reserved name is left untouched as user
- * data, mirroring the SESSION_META_FILE squat handling).
+ * Moves an extracted delivery into the live workspace, preserving sandbox
+ * modifications to writable inputs (see {@link receiveSessionFiles}) and
+ * registering every entry as primed + freshly delivered so the next execute
+ * reuses the on-disk copy instead of attempting an unreachable pull.
+ *
+ * Every failure here is a REAL delivery failure — priming is what makes the
+ * pushed files usable — so this throws rather than acknowledging a push the
+ * next execute cannot use.
  */
-async function applyDeliveredFilesManifest(session: SessionWorkspace, dir: string): Promise<void> {
-  const manifestPath = path.join(dir, SESSION_FILES_MANIFEST_FILE);
+async function mergeDeliveredFiles(
+  session: SessionWorkspace,
+  staging: string,
+  dir: string,
+  uid: number,
+  gid: number,
+): Promise<void> {
+  const manifest = await readDeliveryManifest(staging);
+  const entries = new Map(manifest.map((entry) => [entry.name, entry]));
+  const applied = new Set<string>();
+
+  for (const rel of await listFilesRecursive(staging)) {
+    if (rel === SESSION_FILES_MANIFEST_FILE) continue;
+    const target = path.resolve(dir, rel);
+    if (target !== dir && !target.startsWith(dir + path.sep)) {
+      throw new SessionCheckpointError(`Session delivery escapes the workspace: ${rel}`);
+    }
+    const entry = entries.get(rel);
+    const readOnly = entry?.read_only === true;
+
+    /* Writable input the sandbox changed since it was primed: keep THEIR
+     * version. Re-pushing the original bytes here is what would silently
+     * revert a user's in-place edit on a later turn. Read-only inputs skip
+     * the check — restoring pristine bytes is their contract. */
+    if (!readOnly && (await isModifiedSincePrimed(session, dir, rel))) {
+      logger.info({ file: rel }, 'Keeping sandbox-modified input over re-delivered original');
+      session.markDelivered(rel);
+      applied.add(rel);
+      continue;
+    }
+
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    /* Replace atomically-ish: rename over an existing 0444 root-owned
+     * read-only input succeeds because the runner owns the directory. */
+    await fsp.rm(target, { force: true });
+    await fsp.rename(path.join(staging, rel), target);
+    await fsp.lchown(target, uid, gid).catch(() => {});
+    if (readOnly) {
+      /* Same defense-in-depth as the pull path: root-owned 0444 so the sandbox
+       * UID can read an infrastructure file but cannot chmod it writable.
+       * Best-effort exactly like the pull path (an unprivileged runner outside
+       * hardened mode cannot chown). */
+      await applyReadOnlyInputPermissions(target).catch((err) => {
+        logger.warn({ file: rel, err }, 'Failed to protect read-only delivered input');
+      });
+    }
+    if (entry) {
+      session.markPrimed(rel, entry.id, readOnly, await sha256File(target), entry.storage_session_id);
+    }
+    session.markDelivered(rel);
+    applied.add(rel);
+  }
+
+  /* Every manifest entry must correspond to a delivered file. A name that
+   * never materialized means the archive was incomplete or the entry named a
+   * path tar refused to extract (traversal, symlink): acknowledging it would
+   * strand the execute on the unreachable pull path. */
+  for (const name of entries.keys()) {
+    if (!applied.has(name)) {
+      throw new SessionCheckpointError(`Session files manifest names an undelivered file: ${name}`);
+    }
+  }
+}
+
+/** True when `rel` exists on disk with content differing from the primed
+ *  baseline — i.e. the sandbox edited a previously delivered input. */
+async function isModifiedSincePrimed(
+  session: SessionWorkspace,
+  dir: string,
+  rel: string,
+): Promise<boolean> {
+  const primedHash = session.primedHash(rel);
+  if (!primedHash) return false;
+  const target = path.join(dir, rel);
+  const stat = await fsp.lstat(target).catch(() => null);
+  if (!stat?.isFile()) return false;
+  return (await sha256File(target)) !== primedHash;
+}
+
+/** Reads and validates the reserved manifest member from a staged delivery. */
+async function readDeliveryManifest(staging: string): Promise<DeliveredFileEntry[]> {
+  const manifestPath = path.join(staging, SESSION_FILES_MANIFEST_FILE);
   const stat = await fsp.lstat(manifestPath).catch(() => null);
-  /* No manifest at all: a legacy/manifest-less delivery. Nothing to register,
-   * and nothing is broken — the pull path still applies where reachable. */
-  if (!stat?.isFile()) return;
+  /* No manifest: a legacy/manifest-less delivery. The files still land; they
+   * just carry no priming metadata. */
+  if (!stat?.isFile()) return [];
 
   let parsed: { marker?: string; files?: DeliveredFileEntry[] };
   try {
     parsed = JSON.parse(await fsp.readFile(manifestPath, 'utf8')) as typeof parsed;
   } catch (error) {
-    /* Unparseable content under the reserved name is user data, not our
-     * manifest (we never write invalid JSON): leave it in the workspace
-     * untouched, exactly like the marker-mismatch case below. */
-    logger.warn({ err: error }, 'Ignoring unparseable file at the reserved session-files manifest path');
-    return;
+    throw new SessionCheckpointError(
+      `Unparseable session files manifest: ${error instanceof Error ? error.message : 'invalid JSON'}`,
+    );
   }
-  if (parsed?.marker !== SESSION_FILES_MANIFEST_MARKER || !Array.isArray(parsed.files)) return;
-
-  /* From here the manifest is provably ours, so every failure is a REAL
-   * delivery failure: priming is what makes the pushed files usable, and a
-   * push-model runner cannot fall back to pulling them. Throw so
-   * receiveSessionFiles answers 500 and the control plane recycles, instead
-   * of acknowledging a delivery the next execute cannot use. */
-  await fsp.rm(manifestPath, { force: true });
+  if (parsed?.marker !== SESSION_FILES_MANIFEST_MARKER || !Array.isArray(parsed.files)) {
+    throw new SessionCheckpointError('Session files manifest is missing its marker');
+  }
   for (const entry of parsed.files) {
     if (typeof entry?.name !== 'string' || typeof entry?.id !== 'string'
       || typeof entry?.storage_session_id !== 'string') {
       throw new SessionCheckpointError('Malformed session files manifest entry');
     }
-    /* The manifest names workspace-relative paths; resolve and re-check
-     * containment so a malformed entry can never prime (or hash) a path
-     * outside the session workspace. */
-    const target = path.resolve(dir, entry.name);
-    if (target !== dir && !target.startsWith(dir + path.sep)) {
-      throw new SessionCheckpointError(`Session files manifest escapes the workspace: ${entry.name}`);
-    }
-    const st = await fsp.lstat(target).catch(() => null);
-    if (!st?.isFile()) {
-      throw new SessionCheckpointError(`Session files manifest names a missing file: ${entry.name}`);
-    }
-    const readOnly = entry.read_only === true;
-    if (readOnly) {
-      /* Same defense-in-depth as the pull path: root-owned 0444 so the sandbox
-       * UID can read an infrastructure file but cannot chmod it writable. Runs
-       * AFTER the delivery-wide chown, which would otherwise hand it back.
-       * Best-effort exactly like the pull path (an unprivileged runner outside
-       * hardened mode cannot chown), so a failure warns rather than voiding a
-       * delivery whose bytes are already correct. */
-      await applyReadOnlyInputPermissions(target).catch((err) => {
-        logger.warn({ file: entry.name, err }, 'Failed to protect read-only delivered input');
-      });
-    }
-    session.markPrimed(entry.name, entry.id, readOnly, await sha256File(target), entry.storage_session_id);
-    session.markDelivered(entry.name);
   }
+  return parsed.files;
+}
+
+/** Workspace-relative paths of every regular file under `root`. */
+async function listFilesRecursive(root: string, prefix = ''): Promise<string[]> {
+  const out: string[] = [];
+  const dirents = await fsp.readdir(path.join(root, prefix), { withFileTypes: true });
+  for (const dirent of dirents) {
+    const rel = prefix ? path.join(prefix, dirent.name) : dirent.name;
+    /* Never follow a link out of staging; the archive is untrusted input. */
+    if (dirent.isSymbolicLink()) continue;
+    if (dirent.isDirectory()) {
+      out.push(...(await listFilesRecursive(root, rel)));
+      continue;
+    }
+    if (dirent.isFile()) out.push(rel);
+  }
+  return out;
 }
 
 /** Same digest shape as Job.computeFileHash (streaming sha256 hex, no-follow)

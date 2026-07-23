@@ -176,6 +176,50 @@ describe('receiveSessionFiles (additive delivery)', () => {
     expect(await fsp.lstat(path.join(dir, SESSION_FILES_MANIFEST_FILE)).catch(() => null)).toBeNull();
   });
 
+  test('a re-delivered writable input never overwrites the sandbox\'s edit', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_modified' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+
+    const manifest = JSON.stringify({
+      marker: SESSION_FILES_MANIFEST_MARKER,
+      files: [
+        { name: 'data.csv', id: 'file_1', storage_session_id: 'store_1' },
+        { name: 'skill.md', id: 'file_ro', storage_session_id: 'store_1', read_only: true },
+      ],
+    });
+    const original = { 'data.csv': 'a,b\n1,2\n', 'skill.md': 'PRISTINE\n' };
+    await receiveSessionFiles(
+      Readable.from(await makeArchive({ ...original, [SESSION_FILES_MANIFEST_FILE]: manifest })) as never,
+      fakeStreamRes() as never,
+    );
+
+    /* The sandbox edits the writable input, and forces the read-only one
+     * writable to tamper with it (0444 alone cannot stop an owner, which is
+     * exactly why the pull path also re-downloads read-only inputs). */
+    await fsp.writeFile(path.join(dir, 'data.csv'), 'a,b\n1,2\n3,4\n');
+    await fsp.chmod(path.join(dir, 'skill.md'), 0o644);
+    await fsp.writeFile(path.join(dir, 'skill.md'), 'TAMPERED\n');
+
+    const res = fakeStreamRes();
+    await receiveSessionFiles(
+      Readable.from(await makeArchive({ ...original, [SESSION_FILES_MANIFEST_FILE]: manifest })) as never,
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(200);
+    /* Writable input: the user's edit wins over the re-pushed original. This
+     * holds even though the control plane re-sent the ref — the guarantee must
+     * not depend on Redis dedupe state that dies with the session record. */
+    expect(await fsp.readFile(path.join(dir, 'data.csv'), 'utf8')).toBe('a,b\n1,2\n3,4\n');
+    /* Read-only input: restored to pristine bytes by contract. */
+    expect(await fsp.readFile(path.join(dir, 'skill.md'), 'utf8')).toBe('PRISTINE\n');
+    /* Both are reusable this exec, so neither falls back to an unreachable pull. */
+    expect(session!.consumeFreshDelivery('data.csv', 'file_1', 'store_1')).toBe(true);
+    expect(session!.consumeFreshDelivery('skill.md', 'file_ro', 'store_1')).toBe(true);
+  });
+
   test('a manifest naming a path outside the workspace fails the delivery', async () => {
     config.session_workspace_enabled = true;
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_bad' });
