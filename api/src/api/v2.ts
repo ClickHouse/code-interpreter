@@ -529,7 +529,9 @@ router.post('/session/restore', (req: Request, res: Response, next: NextFunction
  * mechanism serves stateful sessions and stateless one-shots alike. The
  * workspace is still only ever written by the normal priming path.
  */
-router.post('/session/inputs/probe', async (req: Request, res: Response, next: NextFunction) => {
+/* No global body parser exists (see index.ts), so the probe installs its own.
+ * A ref list is tiny — a few hundred bytes per entry — but bound it anyway. */
+router.post('/session/inputs/probe', express.json({ limit: '1mb' }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const refs = (req.body as { refs?: Array<{ storage_session_id?: unknown; id?: unknown }> })?.refs;
     if (!Array.isArray(refs)) {
