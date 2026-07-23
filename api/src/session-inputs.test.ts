@@ -4,6 +4,7 @@ import { Readable } from 'stream';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import { SANDBOX_WORKSPACE_ROOT, reapStaleWorkspaces } from './workspace-isolation';
 import {
   SESSION_INPUT_CACHE_DIR,
   cachedInputResponse,
@@ -40,6 +41,20 @@ async function makeBatch(
 }
 
 describe('pushed input cache', () => {
+  test('lives outside the workspace root so the reaper cannot eat it', async () => {
+    /* Regression: the cache was originally a dot-directory INSIDE
+     * SANDBOX_WORKSPACE_ROOT, where the stale-workspace reaper treats every
+     * entry as a workspace — it deleted pending inputs between the push and
+     * the execute they were pushed for. */
+    expect(SESSION_INPUT_CACHE_DIR.startsWith(`${SANDBOX_WORKSPACE_ROOT}/`)).toBe(false);
+
+    await fsp.mkdir(SESSION_INPUT_CACHE_DIR, { recursive: true });
+    const key = inputCacheKey('s1', 'survives');
+    await fsp.writeFile(path.join(SESSION_INPUT_CACHE_DIR, key), 'bytes');
+    await reapStaleWorkspaces({ maxAgeMs: 0 });
+    expect(await hasCachedInput('s1', 'survives')).toBe(true);
+  });
+
   test('stores a batch and serves it as the response a fetch would have returned', async () => {
     const batch = await makeBatch([
       { storageSessionId: 's1', id: 'f1', body: 'a,b\n1,2\n', meta: { name: 'data.csv' } },
