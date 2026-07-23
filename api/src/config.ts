@@ -83,6 +83,10 @@ export const config = {
   nsjail_path: process.env.NSJAIL_PATH ?? '/usr/sbin/nsjail',
   nsjail_config: process.env.NSJAIL_CONFIG ?? '/sandbox_api/config/sandbox.cfg',
   execute_body_limit: process.env.SANDBOX_EXECUTE_BODY_LIMIT ?? '50mb',
+  /* Ceiling for the pushed input cache (session-inputs.ts). Eviction is
+   * always safe — a miss simply re-pushes on the next probe — so this is a
+   * disk guard, not a correctness knob. */
+  input_cache_max_bytes: Number(process.env.SANDBOX_INPUT_CACHE_MAX_BYTES ?? 512 * 1024 * 1024),
   egress_gateway_url: egressGatewayUrl,
   file_server_url: process.env.FILE_SERVER_URL ?? '',
   max_nesting_depth: safeInt(process.env.SANDBOX_MAX_NESTING_DEPTH, 10),

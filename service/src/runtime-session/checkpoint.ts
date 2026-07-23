@@ -88,24 +88,50 @@ export async function pushRestore(
   });
 }
 
-/** Pushes an additive input-file delivery (see runtime-session/files.ts) into
- *  the bound session workspace — same authed proxy channel as a restore, but
- *  the runner overlays instead of replacing. */
-export async function pushFiles(
-  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; runtimeSessionId: string },
+/**
+ * Asks the VM which of `refs` its input cache is missing. Dedupe lives here,
+ * not in Redis: control-plane state can be lost with a recycle, while the VM
+ * cannot be wrong about what it holds.
+ */
+export async function probeInputs(
+  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; signal?: AbortSignal },
+  refs: Array<{ storage_session_id: string; id: string }>,
+  config: CheckpointConfig,
+): Promise<Array<{ storage_session_id: string; id: string }>> {
+  const token = await args.mintToken();
+  const response = await axios.post<{ missing?: Array<{ storage_session_id: string; id: string }> }>(
+    `${args.endpointBase}/api/v2/session/inputs/probe`,
+    { refs },
+    {
+      headers: {
+        [token.headerName]: token.token,
+        ...microvmPortHeaders(config.port),
+        'Content-Type': 'application/json',
+      },
+      timeout: config.timeoutMs,
+      signal: args.signal,
+    },
+  );
+  return response.data?.missing ?? [];
+}
+
+/** Pushes a digest-named input batch into the VM's runner-local cache. Never
+ *  touches the sandbox workspace — priming does that, from the cache. */
+export async function pushInputs(
+  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; signal?: AbortSignal },
   data: Buffer,
   config: CheckpointConfig,
 ): Promise<void> {
   const token = await args.mintToken();
-  await axios.post(`${args.endpointBase}/api/v2/session/files`, data, {
+  await axios.post(`${args.endpointBase}/api/v2/session/inputs`, data, {
     headers: {
       [token.headerName]: token.token,
       ...microvmPortHeaders(config.port),
-      [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
       'Content-Type': 'application/x-gtar',
     },
     maxBodyLength: config.maxBytes,
     timeout: config.timeoutMs,
+    signal: args.signal,
   });
 }
 

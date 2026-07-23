@@ -18,7 +18,8 @@ import {
   bindSessionWorkspace,
   parseSessionBindingFromHeader,
 } from '../session-workspace';
-import { streamSessionCheckpoint, restoreSessionCheckpoint, receiveSessionFiles } from '../session-checkpoint';
+import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
+import { hasCachedInput, pruneInputCache, storeCachedInputs } from '../session-inputs';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
@@ -273,7 +274,7 @@ function manifestErrorStatus(error: ExecutionManifestError): number {
 router.use((req: Request, res: Response, next: NextFunction) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   /* Checkpoint restore and additive file delivery stream tar.gz bodies, not JSON. */
-  if (req.path === '/session/restore' || req.path === '/session/files') return next();
+  if (req.path === '/session/restore' || req.path === '/session/inputs') return next();
   if (!req.headers['content-type']?.startsWith('application/json')) {
     return res.status(415).json({ message: 'requests must be of type application/json' });
   }
@@ -520,11 +521,46 @@ router.post('/session/restore', (req: Request, res: Response, next: NextFunction
   }
   return restoreSessionCheckpoint(req, res).catch(next);
 });
-router.post('/session/files', (req: Request, res: Response, next: NextFunction) => {
-  if (!bindSessionFromHeader(req)) {
-    return res.status(409).json({ message: 'Missing runtime session header' });
+/**
+ * Input delivery for backends whose sandbox cannot reach the file server.
+ *
+ * These are deliberately NOT session-scoped: the cache they fill is keyed by
+ * (storage session, object id) and lives outside any workspace, so the same
+ * mechanism serves stateful sessions and stateless one-shots alike. The
+ * workspace is still only ever written by the normal priming path.
+ */
+router.post('/session/inputs/probe', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const refs = (req.body as { refs?: Array<{ storage_session_id?: unknown; id?: unknown }> })?.refs;
+    if (!Array.isArray(refs)) {
+      return res.status(400).json({ message: 'refs must be an array' });
+    }
+    const missing: Array<{ storage_session_id: string; id: string }> = [];
+    for (const ref of refs) {
+      if (typeof ref?.storage_session_id !== 'string' || typeof ref?.id !== 'string') {
+        return res.status(400).json({ message: 'each ref requires storage_session_id and id' });
+      }
+      if (!(await hasCachedInput(ref.storage_session_id, ref.id))) {
+        missing.push({ storage_session_id: ref.storage_session_id, id: ref.id });
+      }
+    }
+    return res.status(200).json({ missing });
+  } catch (error) {
+    return next(error);
   }
-  return receiveSessionFiles(req, res).catch(next);
+});
+
+router.post('/session/inputs', async (req: Request, res: Response) => {
+  try {
+    const stored = await storeCachedInputs(req);
+    await pruneInputCache(config.input_cache_max_bytes).catch((err) => {
+      logger.warn({ err }, 'Failed to prune session input cache');
+    });
+    return res.status(200).json({ stored });
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to store session inputs');
+    return res.status(500).json({ message: 'session input delivery failed' });
+  }
 });
 
 export default router;

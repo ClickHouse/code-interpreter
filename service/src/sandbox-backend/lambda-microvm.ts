@@ -7,8 +7,8 @@ import type { CheckpointConfig } from '../runtime-session/checkpoint';
 import type { CheckpointStore } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmApiError, microvmPortHeaders } from '../runtime-session/lambda-client';
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
-import { checkpointSession, pushFiles, restoreSession } from '../runtime-session/checkpoint';
-import { buildSessionFilesArchive, sessionFileRefKey, sessionFileRefs } from '../runtime-session/files';
+import { checkpointSession, probeInputs, pushInputs, restoreSession } from '../runtime-session/checkpoint';
+import { buildInputBatch, sessionFileRefs } from '../runtime-session/files';
 import {
   RUNTIME_SESSION_LOCK_TTL_MS,
   allocateRuntimeSessionGeneration,
@@ -25,7 +25,6 @@ import {
   microvmLaunchDuration,
   microvmTerminations,
   microvmThrottleEvents,
-  runtimeSessionFallback,
   runtimeSessionLockContention,
 } from '../metrics';
 import { injectTraceHeaders, withSpan } from '../telemetry';
@@ -151,6 +150,9 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     });
     let terminateReason = 'stateless';
     try {
+      /* Stateless one-shots take by-reference inputs too, and their guest is
+       * just as unable to pull them. Same cache, same priming path. */
+      await this.deliverInputs(client, vm, req, ctx);
       return await this.proxyExecute(client, vm, req, ctx);
     } catch (error) {
       terminateReason = ctx.signal.aborted ? 'timeout' : 'error';
@@ -174,24 +176,18 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     const lockToken = await waitForRuntimeSessionLock(runtimeSessionId, { waitMs: this.config.lockWaitMs });
     if (!lockToken) {
       runtimeSessionLockContention.inc({ mode: ctx.runtimeSessionMode });
-      if (ctx.runtimeSessionMode === 'strict') {
-        throw new SandboxBackendError('RUNTIME_SESSION_BUSY', `Runtime session ${runtimeSessionId} is busy`);
-      }
-      /* A stateless one-shot has no session workspace, so the push-delivery leg
-       * never runs and the runner would have to PULL the refs — which is
-       * exactly what it cannot do on this backend (internet-only egress). Fail
-       * retryably instead of running the code without its inputs. Requests
-       * with no by-reference inputs still take the fallback: they lose warm
-       * workspace state (an optimization) but nothing they asked for. */
-      if (sessionFileRefs(req.body.files).length > 0) {
-        throw new SandboxBackendError(
-          'RUNTIME_SESSION_BUSY',
-          `Runtime session ${runtimeSessionId} is busy and the request carries input files`,
-        );
-      }
-      runtimeSessionFallback.inc();
-      return this.executeStateless(client, req, ctx);
+      /* A session-bound request depends on that session's workspace — files,
+       * installed packages, database state built by earlier turns. Running it
+       * on a cold one-shot would silently answer from an environment the
+       * caller never asked for, so contention is a retryable BUSY in every
+       * session mode. (A lossy fallback, if ever wanted, belongs behind its
+       * own explicit mode rather than as a silent default.) */
+      throw new SandboxBackendError(
+        'RUNTIME_SESSION_BUSY',
+        `Runtime session ${runtimeSessionId} is busy`,
+      );
     }
+
 
     /* Heartbeat the lock for as long as we hold it so an arbitrarily long
      * critical path (launch throttle + readiness/restore + execute + checkpoint,
@@ -230,17 +226,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
       const { vm, reused, restored } = await this.findOrLaunchSession(client, sessionCtx, runtimeSessionId, existing, lockToken);
-      /* Refs already delivered into the live workspace. Valid on warm reuse;
-       * after a relaunch only when the restored checkpoint post-dates the last
-       * delivery (a budget-skipped checkpoint would not contain those files —
-       * treating them as delivered would silently drop inputs). */
-      const checkpointCoversDeliveries = existing?.delivered_at != null
-        && existing?.checkpointed_at != null
-        && existing.checkpointed_at >= existing.delivered_at;
-      const deliveredBefore = reused || (restored && checkpointCoversDeliveries)
-        ? existing?.delivered_files ?? []
-        : [];
-      await this.pushSessionInputFiles(client, vm, req, sessionCtx, runtimeSessionId, lockToken, deliveredBefore, fence.signal);
+      await this.deliverInputs(client, vm, req, sessionCtx, async () => {
+        /* A session VM whose delivery transport failed is not trustworthy for
+         * reuse: recycle so the next call relaunches and restores. */
+        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
+        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+      });
       const result = await this.executeOnSessionVm(client, vm, req, sessionCtx, runtimeSessionId, lockToken, reused, fence.signal);
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
@@ -617,106 +608,55 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
   }
 
   /**
-   * Delivers the request's by-reference input files into the session workspace
-   * before the execute. The MicroVM's only egress is the public internet, so
-   * the runner's own pull-based priming has nothing reachable to pull from —
-   * the control plane fetches the bytes from the internal file server and
-   * pushes them over the same authed proxy channel as a restore. The archive's
-   * manifest member makes the runner register them as primed, so the execute's
-   * priming reuses the on-disk copies instead of fetching.
+   * Ensures the VM holds every by-reference input this request declares,
+   * BEFORE the execute. The guest cannot reach the file server, so the control
+   * plane fetches the bytes and pushes them into the runner's input cache; the
+   * runner's normal priming then resolves refs from that cache.
    *
-   * Writable refs recorded as already delivered are skipped: re-pushing them
-   * would overwrite in-place modifications the sandbox made on a prior turn.
-   * Newly delivered writable refs are recorded on the session (with
-   * `delivered_at`) under the held lock before the execute runs.
+   * Dedupe is a probe, not bookkeeping: the VM reports what it is missing, so
+   * a lost session record (recycle, failover, flush) can never cause a needed
+   * input to be skipped — and a re-push can never revert a sandbox edit,
+   * because this path does not write the workspace at all.
    *
-   * Archive build failures (unsafe name, file-server fetch error, blown
-   * size/count budget) throw before any bytes reach the VM — the workspace is
-   * untouched, so the warm VM survives for the next call. A failed or aborted
-   * push after transfer began leaves the workspace possibly-partial, exactly
-   * like a failed push-restore: recycle so the next call relaunches + restores
-   * clean rather than executing against a truncated input. The one exception
-   * is a fence abort — the lock now belongs to another worker that may be
-   * using this VM, so cease without touching it.
+   * Applies to session AND stateless executions alike: the cache is keyed by
+   * (storage session, object), not by session.
    */
-  private async pushSessionInputFiles(
+  private async deliverInputs(
     client: LambdaMicrovmClient,
     vm: MicrovmDescription,
     req: SandboxTransportRequest,
     ctx: SandboxExecuteContext,
-    runtimeSessionId: string,
-    lockToken: string,
-    deliveredBefore: string[],
-    fenceSignal: AbortSignal,
+    onUnhealthy?: () => Promise<void>,
   ): Promise<void> {
-    const deliveredSet = new Set(deliveredBefore);
-    const refs = sessionFileRefs(req.body.files)
-      .filter((ref) => !deliveredSet.has(sessionFileRefKey(ref)));
-    if (refs.length === 0) {
-      await this.recordDeliveredFiles(runtimeSessionId, lockToken, deliveredBefore, []);
-      return;
-    }
-    const archive = await buildSessionFilesArchive(refs, {
-      timeoutMs: this.config.checkpoint.timeoutMs,
-      maxBytes: this.config.checkpoint.maxBytes,
-      signal: ctx.signal,
-    });
-    if (!archive) return;
+    const refs = sessionFileRefs(req.body.files);
+    if (refs.length === 0) return;
+    const endpointBase = normalizeMicrovmEndpoint(vm.endpoint ?? '');
+    const mintToken = () => this.mintAuthToken(client, vm.microvmId);
     try {
-      await pushFiles({
-        mintToken: () => this.mintAuthToken(client, vm.microvmId),
-        endpointBase: normalizeMicrovmEndpoint(vm.endpoint ?? ''),
-        runtimeSessionId,
-      }, archive.data, this.config.checkpoint);
+      const missing = await probeInputs(
+        { mintToken, endpointBase, signal: ctx.signal },
+        refs.map((ref) => ({ storage_session_id: ref.storage_session_id, id: ref.id })),
+        this.config.checkpoint,
+      );
+      if (missing.length === 0) return;
+      const wanted = new Set(missing.map((ref) => `${ref.storage_session_id}/${ref.id}`));
+      const batch = await buildInputBatch(
+        refs.filter((ref) => wanted.has(`${ref.storage_session_id}/${ref.id}`)),
+        {
+          timeoutMs: this.config.checkpoint.timeoutMs,
+          maxBytes: this.config.checkpoint.maxBytes,
+          signal: ctx.signal,
+        },
+      );
+      if (!batch) return;
+      await pushInputs({ mintToken, endpointBase, signal: ctx.signal }, batch.data, this.config.checkpoint);
     } catch (error) {
-      if (fenceSignal.aborted) {
-        throw new SandboxBackendError(
-          'MICROVM_FENCED',
-          `Lost session lock for ${runtimeSessionId} during file delivery`,
-          error,
-        );
-      }
-      await this.terminate(client, vm.microvmId, 'error').catch(() => {});
-      await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
-      throw new SandboxBackendError(
-        'MICROVM_UNHEALTHY',
-        'Session input file delivery failed',
-        error,
-      );
-    }
-    await this.recordDeliveredFiles(runtimeSessionId, lockToken, deliveredBefore, archive.deliveredKeys);
-  }
-
-  /**
-   * Reconciles the session record with the set of refs the LIVE workspace now
-   * holds. Must run even when every ref was skipped: a relaunch writes a fresh
-   * RUNNING record that carries no delivery metadata, so the carried-forward
-   * `deliveredBefore` (validated against the restore) would otherwise be lost
-   * and the next warm call would re-push originals over restored edits.
-   */
-  private async recordDeliveredFiles(
-    runtimeSessionId: string,
-    lockToken: string,
-    deliveredBefore: string[],
-    newlyDelivered: string[],
-  ): Promise<void> {
-    const effective = Array.from(new Set([...deliveredBefore, ...newlyDelivered]));
-    if (effective.length === 0) return;
-    const current = await readRuntimeSessionRecord(runtimeSessionId);
-    if (!current) return;
-    const existing = current.delivered_files ?? [];
-    const unchanged = existing.length === effective.length
-      && effective.every((key) => existing.includes(key));
-    if (unchanged) return;
-    const persisted = await writeRuntimeSessionRecord(
-      { ...current, delivered_files: effective, delivered_at: Date.now() },
-      lockToken,
-    );
-    if (!persisted) {
-      throw new SandboxBackendError(
-        'MICROVM_FENCED',
-        `Lost session lock for ${runtimeSessionId} after file delivery`,
-      );
+      /* The cache is additive and idempotent, so a failed delivery leaves no
+       * partial workspace state — but the execute must not proceed without
+       * inputs it declared. Let the caller decide whether the VM is still
+       * reusable (a session VM whose transport failed is recycled). */
+      await onUnhealthy?.();
+      throw new SandboxBackendError('MICROVM_UNHEALTHY', 'Session input delivery failed', error);
     }
   }
 

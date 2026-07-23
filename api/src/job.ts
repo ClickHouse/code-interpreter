@@ -40,6 +40,7 @@ import {
   validateFilePath,
   isValidFilePath,
 } from './validation';
+import { cachedInputResponse, openCachedInput } from './session-inputs';
 
 export {
   DIRKEEP,
@@ -1063,9 +1064,7 @@ export class Job {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const response = await fetch(this.buildDownloadUrl(file), {
-          headers: this.fileEgressHeaders(),
-        });
+        const response = await this.fetchInputObject(file);
 
         if (response.status === 404 && attempt < maxRetries) {
           const delay = retryDelay * Math.pow(2, attempt - 1);
@@ -1147,6 +1146,31 @@ export class Job {
     this.log.error({ fileId: file.id, maxRetries, err: lastError }, 'Failed to download file');
     try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
     return null;
+  }
+
+  /**
+   * Resolves an input object's bytes, preferring the runner-local cache the
+   * control plane pushes into on backends whose sandbox cannot reach the file
+   * server (see session-inputs.ts). A cache hit is presented as the very
+   * `Response` a fetch would have produced, so name resolution, read-only
+   * protection, hashing, ownership and priming all run identically for pushed
+   * and pulled inputs — there is exactly one workspace writer.
+   */
+  private async fetchInputObject(file: TFile): Promise<Response> {
+    const cached = await openCachedInput(file.storage_session_id!, file.id!);
+    if (cached) {
+      this.log.debug({ fileId: file.id }, 'Priming input from pushed cache');
+      return cachedInputResponse(cached);
+    }
+    if (!this.fileEgressBaseUrl()) {
+      /* Push-model deployment with nothing pushed for this ref: fetching would
+       * hit an unreachable (or unset) file server and surface as a confusing
+       * transport error. Say what actually went wrong. */
+      throw new Error(
+        `Input ${file.id} was not delivered to the sandbox and no file server is reachable`,
+      );
+    }
+    return fetch(this.buildDownloadUrl(file), { headers: this.fileEgressHeaders() });
   }
 
   /**

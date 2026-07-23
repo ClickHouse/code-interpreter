@@ -33,6 +33,9 @@ let sessionFilesStatus = 200;
 let lastSessionFilesBody: Buffer | null = null;
 let stealSessionLockOnExecute = false;
 let fileReadOnly = false;
+/** Models the runner's input cache so probe/push behave like the real VM. */
+let lastProbedRefs: Array<{ storage_session_id: string; id: string }> = [];
+const vmInputCache = new Set<string>();
 const fileObjectBytes = 'csv,bytes\n1,2\n';
 let mock: InstanceType<typeof RedisMock>;
 const checkpointBlob = 'FAKE_TAR_GZ_BYTES';
@@ -67,9 +70,24 @@ beforeAll(() => {
           headers: fileReadOnly ? { 'X-Read-Only': 'true' } : {},
         });
       }
-      if (path === '/api/v2/session/files') {
+      if (path === '/api/v2/session/inputs/probe') {
+        const refs = (JSON.parse(raw.toString()) as {
+          refs: Array<{ storage_session_id: string; id: string }>;
+        }).refs;
+        lastProbedRefs = refs;
+        const missing = refs.filter((r) => !vmInputCache.has(`${r.storage_session_id}/${r.id}`));
+        return new Response(JSON.stringify({ missing }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (path === '/api/v2/session/inputs') {
         lastSessionFilesBody = raw;
-        return new Response(JSON.stringify({ status: 'received' }), {
+        if (sessionFilesStatus === 200) {
+          /* Model the runner cache: everything just pushed is now held. */
+          for (const ref of lastProbedRefs) vmInputCache.add(`${ref.storage_session_id}/${ref.id}`);
+        }
+        return new Response(JSON.stringify({ stored: lastProbedRefs.length }), {
           status: sessionFilesStatus,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -125,6 +143,8 @@ beforeEach(async () => {
   lastSessionFilesBody = null;
   stealSessionLockOnExecute = false;
   fileReadOnly = false;
+  lastProbedRefs = [];
+  vmInputCache.clear();
 });
 
 afterEach(() => {
@@ -226,7 +246,9 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     expect(executeReq).toBeDefined();
     expect(executeReq?.rawBody).toBe(JSON.stringify(req.body));
     const vm = [...fake.vms.values()][0];
-    expect(executeReq?.headers['x-aws-proxy-auth']).toBe(vm.mintedTokens[0]);
+    /* Input delivery mints its own tokens before the execute, so assert the
+     * execute carried one of THIS VM's tokens rather than a fixed index. */
+    expect(vm.mintedTokens).toContain(executeReq?.headers['x-aws-proxy-auth'] as string);
 
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
     expect(vm.state).toBe('TERMINATED');
@@ -413,112 +435,93 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
-  test('delivers by-ref input files to the session VM before the execute', async () => {
+
+
+
+
+
+
+
+  test('probes the VM and pushes only what it is missing', async () => {
     const fake = fakeClient();
-    await makeBackend(fake).execute(request(), sessionContext());
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
 
     const paths = captured.map((c) => c.path);
-    expect(paths.indexOf('/sessions/sess_store_1/objects/file_1')).toBeGreaterThanOrEqual(0);
-    expect(paths.indexOf('/api/v2/session/files')).toBeGreaterThanOrEqual(0);
-    expect(paths.indexOf('/api/v2/session/files')).toBeLessThan(paths.indexOf('/api/v2/execute'));
-
-    const filesReq = captured.find((c) => c.path === '/api/v2/session/files');
-    expect(filesReq?.headers['x-runtime-session-id']).toBe('rt_session_1');
-    expect(filesReq?.headers['content-type']).toBe('application/x-gtar');
-
-    /* Real tar.gz on the wire: member paths and the primed-files manifest are
-     * visible in the decompressed stream. */
-    const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
-    expect(untarred).toContain('session/inputs/data.csv');
-    expect(untarred).toContain(fileObjectBytes);
-    expect(untarred).toContain('codeapi.session-files.v1');
-    expect(untarred).toContain('"id":"file_1"');
-    expect(untarred).toContain('"storage_session_id":"sess_store_1"');
-  });
-
-  test('a ref already delivered to the warm session is not re-pushed', async () => {
-    const fake = fakeClient();
-    const backend = makeBackend(fake);
-    await backend.execute(request(), sessionContext());
-    await backend.execute(request(), sessionContext());
-
-    /* One push, not two: re-delivering the same writable ref would overwrite
-     * any in-place modification the first exec made to the file. */
-    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(1);
-    const record = await readRuntimeSessionRecord('rt_session_1');
-    expect(record?.delivered_files).toEqual(['sess_store_1/file_1@inputs/data.csv']);
-    expect(record?.delivered_at).toBeGreaterThan(0);
-  });
-
-  test('read-only refs are re-delivered on every exec and never recorded', async () => {
-    fileReadOnly = true;
-    const fake = fakeClient();
-    const backend = makeBackend(fake);
-    await backend.execute(request(), sessionContext());
-    await backend.execute(request(), sessionContext());
-
-    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(2);
-    const record = await readRuntimeSessionRecord('rt_session_1');
-    expect(record?.delivered_files ?? []).toEqual([]);
-    /* The manifest carries the read-only bit so the runner primes accordingly. */
-    const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
-    expect(untarred).toContain('"read_only":true');
-  });
-
-  test('the same object under a NEW filename is still delivered', async () => {
-    const fake = fakeClient();
-    const backend = makeBackend(fake);
-    await backend.execute(request(), sessionContext());
-
-    const renamed = request();
-    renamed.body.files = [
-      { id: 'file_1', storage_session_id: 'sess_store_1', name: 'inputs/copy.csv' },
-    ];
-    await backend.execute(renamed, sessionContext());
-
-    /* Same (storage session, id) but a path the workspace does not have yet:
-     * skipping it would leave the exec without the file it asked for. */
-    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(2);
-    const record = await readRuntimeSessionRecord('rt_session_1');
-    expect(record?.delivered_files).toContain('sess_store_1/file_1@inputs/data.csv');
-    expect(record?.delivered_files).toContain('sess_store_1/file_1@inputs/copy.csv');
-  });
-
-  test('lock contention with by-ref inputs fails retryably instead of losing them', async () => {
-    const fake = fakeClient();
-    const backend = makeBackend(fake, { lockWaitMs: 10 });
-    /* Hold the session lock so the execute cannot acquire it. */
-    const held = await acquireRuntimeSessionLock('rt_session_1');
-    expect(held).toBeTruthy();
-
-    /* The stateless fallback has no session workspace, so push delivery never
-     * runs and the runner would have to pull the refs — impossible on this
-     * backend. BUSY is retryable; running without inputs is silently wrong. */
-    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
-      'carries input files',
+    expect(paths.indexOf('/api/v2/session/inputs/probe')).toBeGreaterThanOrEqual(0);
+    expect(paths.indexOf('/api/v2/session/inputs')).toBeGreaterThan(
+      paths.indexOf('/api/v2/session/inputs/probe'),
     );
-    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(paths.indexOf('/api/v2/session/inputs')).toBeLessThan(paths.indexOf('/api/v2/execute'));
+    /* Objects are pushed under runner-computed digests; the caller's path is
+     * carried only as metadata the runner hands to priming, never as a member
+     * name the extraction could act on. */
+    const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
+    expect(untarred).toMatch(/[0-9a-f]{64}/);
+    expect(untarred).toContain('"name":"inputs/data.csv"');
   });
 
-  test('a failed file delivery recycles the VM instead of executing partial inputs', async () => {
+  test('a second execution pushes nothing when the VM already holds the object', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    captured = [];
+    await backend.execute(request(), sessionContext());
+
+    /* Dedupe is the VM's answer, not control-plane bookkeeping — so it stays
+     * correct across record loss, and a re-push could never revert an edit
+     * anyway (this path does not write the workspace). */
+    expect(captured.filter((c) => c.path === '/api/v2/session/inputs/probe')).toHaveLength(1);
+    expect(captured.filter((c) => c.path === '/api/v2/session/inputs')).toHaveLength(0);
+  });
+
+  test('a stateless one-shot receives its by-ref inputs too', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), context());
+
+    /* The cache is keyed by object, not session, so the same mechanism serves
+     * stateless execution — which previously ran with its inputs missing. */
+    const paths = captured.map((c) => c.path);
+    expect(paths.indexOf('/api/v2/session/inputs')).toBeGreaterThanOrEqual(0);
+    expect(paths.indexOf('/api/v2/session/inputs')).toBeLessThan(paths.indexOf('/api/v2/execute'));
+  });
+
+  test('a failed input delivery recycles the session VM and never executes', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
     sessionFilesStatus = 500;
 
     await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
-      'Session input file delivery failed',
+      'Session input delivery failed',
     );
     expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
     expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
   });
 
-  test('a payload with no by-ref files skips the delivery leg entirely', async () => {
+  test('a payload with no by-ref inputs skips probe and push entirely', async () => {
     const fake = fakeClient();
     const req = request();
     req.body.files = [{ name: 'inline.txt', content: 'inline' }];
     await makeBackend(fake).execute(req, sessionContext());
-    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(0);
+    expect(captured.filter((c) => c.path.startsWith('/api/v2/session/inputs'))).toHaveLength(0);
+  });
+
+  test('lock contention is retryable BUSY, never a cold one-shot', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, { lockWaitMs: 10 });
+    await acquireRuntimeSessionLock('rt_session_1', 60_000);
+
+    /* A session-bound request depends on workspace state a fresh VM lacks —
+     * packages, files, database state — so answering from one would be
+     * silently wrong regardless of whether THIS payload carries refs. */
+    for (const mode of ['affinity', 'strict'] as const) {
+      await expect(
+        backend.execute(request(), sessionContext({ runtimeSessionMode: mode })),
+      ).rejects.toThrow('busy');
+    }
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
   });
 
   test('a fresh session VM returning a proxy 502 is recycled immediately', async () => {
@@ -603,24 +606,6 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     }
   });
 
-  test('affinity mode falls back to a stateless one-shot when the lock is held', async () => {
-    const fake = fakeClient();
-    const backend = makeBackend(fake, { lockWaitMs: 100 });
-    await acquireRuntimeSessionLock('rt_session_1', 60_000);
-
-    /* No by-reference inputs: the fallback costs only warm workspace state (an
-     * optimization). A request WITH refs must fail retryably instead — see
-     * 'lock contention with by-ref inputs'. */
-    const inline = request();
-    inline.body.files = [{ name: 'main.py', content: 'print(1)' }];
-    const result = await backend.execute(inline, sessionContext({ runtimeSessionMode: 'affinity' }));
-    expect(result).toEqual(EXECUTE_RESPONSE);
-    /* Stateless fallback: launched a one-shot VM and terminated it. */
-    const runArgs = fake.callsFor('runMicrovm')[0].args as { runHookPayload?: string; clientToken: string };
-    expect(runArgs.runHookPayload).toBeUndefined();
-    expect(runArgs.clientToken.startsWith('exec-')).toBe(true);
-    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
-  });
 
   test('stateless mode ignores a runtime session id', async () => {
     const fake = fakeClient();
