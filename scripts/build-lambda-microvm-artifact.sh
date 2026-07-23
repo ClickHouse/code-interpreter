@@ -128,14 +128,16 @@ do_upload() {
   require_ecr
   [ -n "$S3_URI" ] || { echo "S3_URI is required for upload" >&2; exit 1; }
   resolve_image_digest
-  [ -f "$OUT_DIR/artifact.zip" ] \
-    && [ -f "$OUT_DIR/artifact-image-repository" ] \
-    && [ -f "$OUT_DIR/artifact-image-tag" ] \
-    && [ -f "$OUT_DIR/artifact-image-digest" ] \
-    && [ -f "$OUT_DIR/artifact-sha256" ] || {
-      echo "No provenance-bound artifact found; run the zip stage first." >&2
-      exit 1
-    }
+  if ! {
+    [ -f "$OUT_DIR/artifact.zip" ] \
+      && [ -f "$OUT_DIR/artifact-image-repository" ] \
+      && [ -f "$OUT_DIR/artifact-image-tag" ] \
+      && [ -f "$OUT_DIR/artifact-image-digest" ] \
+      && [ -f "$OUT_DIR/artifact-sha256" ]
+  }; then
+    echo "No provenance-bound artifact found; run the zip stage first." >&2
+    exit 1
+  fi
   local artifact_repository artifact_tag artifact_digest artifact_hash actual_hash
   artifact_repository="$(sed -n '1p' "$OUT_DIR/artifact-image-repository")"
   artifact_tag="$(sed -n '1p' "$OUT_DIR/artifact-image-tag")"
