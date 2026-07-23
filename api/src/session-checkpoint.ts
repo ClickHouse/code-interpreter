@@ -10,7 +10,9 @@ import {
   SANDBOX_WORKSPACE_ROOT,
   SESSION_WORKSPACE_ID,
   applyReadOnlyInputPermissions,
+  ensureDirNoFollow,
 } from './workspace-isolation';
+import { validateFilePath } from './validation';
 import type { SessionMetaSnapshot, SessionWorkspace } from './session-workspace';
 import { SESSION_META_FILE, SESSION_META_MARKER, getBoundSessionWorkspace } from './session-workspace';
 
@@ -249,14 +251,22 @@ export async function receiveSessionFiles(req: Request, res: Response): Promise<
 }
 
 /**
- * Moves an extracted delivery into the live workspace, preserving sandbox
- * modifications to writable inputs (see {@link receiveSessionFiles}) and
- * registering every entry as primed + freshly delivered so the next execute
- * reuses the on-disk copy instead of attempting an unreachable pull.
+ * Commits an extracted delivery into the live workspace.
  *
- * Every failure here is a REAL delivery failure — priming is what makes the
- * pushed files usable — so this throws rather than acknowledging a push the
- * next execute cannot use.
+ * Two-phase by construction: EVERYTHING is validated before the first byte of
+ * live state changes, because a half-applied delivery leaves a workspace whose
+ * contents match neither the checkpoint nor the request. Phase 1 proves the
+ * archive is exactly what the manifest claims — canonical relative names, a
+ * unique one-to-one correspondence between manifest entries and staged regular
+ * files (no missing, duplicate, or extra members), and no path escaping the
+ * workspace. Phase 2 commits, and any failure there marks the workspace
+ * indeterminate so the runner refuses further work until the control plane
+ * recycles the VM (see {@link SessionWorkspace.poisonDelivery}).
+ *
+ * Writes go through {@link ensureDirNoFollow}, the same no-follow ancestor walk
+ * the pull path uses: a prior turn's sandbox code can plant a symlink inside
+ * the persistent workspace, and `mkdir -p`/`rename` would happily follow it and
+ * write outside the workspace as root.
  */
 async function mergeDeliveredFiles(
   session: SessionWorkspace,
@@ -266,60 +276,102 @@ async function mergeDeliveredFiles(
   gid: number,
 ): Promise<void> {
   const manifest = await readDeliveryManifest(staging);
-  const entries = new Map(manifest.map((entry) => [entry.name, entry]));
-  const applied = new Set<string>();
+  const staged = await listFilesRecursive(staging);
 
-  for (const rel of await listFilesRecursive(staging)) {
-    if (rel === SESSION_FILES_MANIFEST_FILE) continue;
-    const target = path.resolve(dir, rel);
-    if (target !== dir && !target.startsWith(dir + path.sep)) {
-      throw new SessionCheckpointError(`Session delivery escapes the workspace: ${rel}`);
+  /* ---- Phase 1: validate, mutating nothing ---- */
+  const entries = new Map<string, DeliveredFileEntry>();
+  for (const entry of manifest) {
+    if (entries.has(entry.name)) {
+      throw new SessionCheckpointError(`Duplicate session files manifest entry: ${entry.name}`);
     }
-    const entry = entries.get(rel);
-    const readOnly = entry?.read_only === true;
-
-    /* Writable input the sandbox changed since it was primed: keep THEIR
-     * version. Re-pushing the original bytes here is what would silently
-     * revert a user's in-place edit on a later turn. Read-only inputs skip
-     * the check — restoring pristine bytes is their contract. */
-    if (!readOnly && (await isModifiedSincePrimed(session, dir, rel))) {
-      logger.info({ file: rel }, 'Keeping sandbox-modified input over re-delivered original');
-      session.markDelivered(rel);
-      applied.add(rel);
-      continue;
+    /* Same canonical-name rules the pull path enforces, so manifest keys,
+     * on-disk paths, and the output scanner's relative paths always agree. */
+    try {
+      validateFilePath(entry.name, dir);
+    } catch (error) {
+      throw new SessionCheckpointError(
+        `Invalid session files manifest name "${entry.name}": ${error instanceof Error ? error.message : 'invalid'}`,
+      );
     }
-
-    await fsp.mkdir(path.dirname(target), { recursive: true });
-    /* Replace atomically-ish: rename over an existing 0444 root-owned
-     * read-only input succeeds because the runner owns the directory. */
-    await fsp.rm(target, { force: true });
-    await fsp.rename(path.join(staging, rel), target);
-    await fsp.lchown(target, uid, gid).catch(() => {});
-    if (readOnly) {
-      /* Same defense-in-depth as the pull path: root-owned 0444 so the sandbox
-       * UID can read an infrastructure file but cannot chmod it writable.
-       * Best-effort exactly like the pull path (an unprivileged runner outside
-       * hardened mode cannot chown). */
-      await applyReadOnlyInputPermissions(target).catch((err) => {
-        logger.warn({ file: rel, err }, 'Failed to protect read-only delivered input');
-      });
+    const target = path.resolve(dir, entry.name);
+    if (target === dir || !target.startsWith(dir + path.sep)) {
+      throw new SessionCheckpointError(`Session delivery escapes the workspace: ${entry.name}`);
     }
-    if (entry) {
-      session.markPrimed(rel, entry.id, readOnly, await sha256File(target), entry.storage_session_id);
-    }
-    session.markDelivered(rel);
-    applied.add(rel);
+    entries.set(entry.name, entry);
   }
 
-  /* Every manifest entry must correspond to a delivered file. A name that
-   * never materialized means the archive was incomplete or the entry named a
-   * path tar refused to extract (traversal, symlink): acknowledging it would
-   * strand the execute on the unreachable pull path. */
+  const stagedFiles = staged.filter((rel) => rel !== SESSION_FILES_MANIFEST_FILE);
+  for (const rel of stagedFiles) {
+    if (!entries.has(rel)) {
+      throw new SessionCheckpointError(`Session delivery contains an unlisted file: ${rel}`);
+    }
+  }
   for (const name of entries.keys()) {
-    if (!applied.has(name)) {
+    if (!stagedFiles.includes(name)) {
       throw new SessionCheckpointError(`Session files manifest names an undelivered file: ${name}`);
     }
   }
+
+  /* ---- Phase 2: commit ---- */
+  try {
+    for (const rel of stagedFiles) {
+      const entry = entries.get(rel) as DeliveredFileEntry;
+      const readOnly = entry.read_only === true;
+      const target = path.join(dir, rel);
+
+      /* Keep a sandbox edit ONLY when the incoming ref is the same file the
+       * edit was made to. A different id/storage session at the same path is a
+       * different file the caller asked for: it must land, and re-prime, or
+       * the execute would run against stale bytes whose identity no longer
+       * matches anything the request declared. Read-only refs never preserve —
+       * restoring pristine bytes is their contract. */
+      if (!readOnly && isSameWritablePrime(session, rel, entry)
+        && (await isModifiedSincePrimed(session, dir, rel))) {
+        logger.info({ file: rel }, 'Keeping sandbox-modified input over re-delivered original');
+        session.markDelivered(rel);
+        continue;
+      }
+
+      await ensureDirNoFollow(dir, path.dirname(target), { uid, gid, slot: -1, perJobUid: false });
+      /* `rename` replaces a file or symlink atomically and never follows the
+       * final component; only a directory in the way needs removing first. */
+      const existing = await fsp.lstat(target).catch(() => null);
+      if (existing?.isDirectory()) {
+        await fsp.rm(target, { recursive: true, force: true });
+      }
+      await fsp.rename(path.join(staging, rel), target);
+      await fsp.lchown(target, uid, gid).catch(() => {});
+      if (readOnly) {
+        /* Same defense-in-depth as the pull path: root-owned 0444 so the
+         * sandbox UID can read an infrastructure file but cannot chmod it
+         * writable. Best-effort exactly like the pull path (an unprivileged
+         * runner outside hardened mode cannot chown). */
+        await applyReadOnlyInputPermissions(target).catch((err) => {
+          logger.warn({ file: rel, err }, 'Failed to protect read-only delivered input');
+        });
+      }
+      session.markPrimed(rel, entry.id, readOnly, await sha256File(target), entry.storage_session_id);
+      session.markDelivered(rel);
+    }
+  } catch (error) {
+    /* Renames already committed cannot be rolled back reliably (the bytes they
+     * replaced are gone), so quarantine instead: every later request fails
+     * until the control plane recycles this VM and restores from the last
+     * checkpoint. */
+    session.poisonDelivery(error instanceof Error ? error.message : 'delivery failed mid-commit');
+    throw error;
+  }
+}
+
+/** Whether `entry` names the exact writable prime currently recorded at `rel`
+ *  — the only case where preserving a sandbox edit is correct. */
+function isSameWritablePrime(
+  session: SessionWorkspace,
+  rel: string,
+  entry: DeliveredFileEntry,
+): boolean {
+  return session.primedInputId(rel) === entry.id
+    && session.primedSessionId(rel) === entry.storage_session_id;
 }
 
 /** True when `rel` exists on disk with content differing from the primed

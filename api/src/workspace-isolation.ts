@@ -5,6 +5,7 @@ import * as path from 'path';
 import type { Dirent } from 'fs';
 import { config } from './config';
 import { logger } from './logger';
+import { SANDBOX_DIR_MODE } from './validation';
 
 export const SANDBOX_WORKSPACE_ROOT = '/tmp/sandbox';
 /* NsJail's bind-mount setup needs execute permission on the source path and
@@ -580,4 +581,59 @@ export function fallbackSandboxIdentity(): SandboxJobIdentity {
     gid: SANDBOX_INSIDE_GID,
     perJobUid: false,
   };
+}
+
+/**
+ * Creates every directory from `root` (exclusive) to `target` (inclusive) one
+ * component at a time, refusing to descend through a symlink.
+ * `fsp.mkdir(dir, { recursive: true })` would instead follow a symlinked
+ * ancestor a prior session turn planted and create directories OUTSIDE the
+ * workspace as root — so any privileged write into a PERSISTENT session
+ * workspace (input priming, pushed file delivery) must build the path with
+ * no-follow semantics first. Fresh per-job workspaces can never contain such a
+ * link, so callers may skip it there.
+ *
+ * Pass `identity` to give directories this call creates the sandbox dir mode
+ * and ownership; without it they inherit the runner's (root) ownership, which
+ * would leave the sandbox UID unable to write inside them.
+ */
+export async function ensureDirNoFollow(
+  root: string,
+  target: string,
+  identity?: SandboxJobIdentity,
+): Promise<void> {
+  const rel = path.relative(root, target);
+  if (!rel || rel === '.') return;
+  if (rel === '..' || rel.startsWith('..' + path.sep)) {
+    throw new SandboxWorkspaceIsolationError(`Workspace path escapes the sandbox: ${target}`);
+  }
+  let cursor = root;
+  for (const part of rel.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    const st = await fsp.lstat(cursor).catch(() => null);
+    if (st == null) {
+      /* Parent is already validated as a real dir; create just this component
+       * (non-recursive, so it can't follow a link). Tolerate a concurrent
+       * sibling prime having just created it. */
+      let created = true;
+      await fsp.mkdir(cursor).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== 'EEXIST') throw err;
+        created = false;
+      });
+      if (created && identity) {
+        await applySandboxPathPermissions(cursor, identity, SANDBOX_DIR_MODE);
+      }
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new SandboxWorkspaceIsolationError(
+        `Refusing to write through symlinked workspace path: ${path.relative(root, cursor)}`,
+      );
+    }
+    if (!st.isDirectory()) {
+      throw new SandboxWorkspaceIsolationError(
+        `Workspace ancestor is not a directory: ${path.relative(root, cursor)}`,
+      );
+    }
+  }
 }

@@ -122,15 +122,87 @@ describe('receiveSessionFiles (additive delivery)', () => {
     const { dir } = await session!.ownership();
     await fsp.writeFile(path.join(dir, 'existing.txt'), 'already-here');
 
-    const archive = await makeArchive({ 'upload.csv': 'a,b\n1,2\n', 'nested/notes.md': '# hi' });
+    const archive = await makeArchive({
+      'upload.csv': 'a,b\n1,2\n',
+      'nested/notes.md': '# hi',
+      [SESSION_FILES_MANIFEST_FILE]: JSON.stringify({
+        marker: SESSION_FILES_MANIFEST_MARKER,
+        files: [
+          { name: 'upload.csv', id: 'file_1', storage_session_id: 'store_1' },
+          { name: 'nested/notes.md', id: 'file_2', storage_session_id: 'store_1' },
+        ],
+      }),
+    });
     const res = fakeStreamRes();
     await receiveSessionFiles(Readable.from(archive) as never, res as never);
 
     expect(res.statusCode).toBe(200);
     expect(await fsp.readFile(path.join(dir, 'upload.csv'), 'utf8')).toBe('a,b\n1,2\n');
+    /* Nested destinations are created no-follow and owned by the session, so
+     * the sandbox UID can write beside them. */
     expect(await fsp.readFile(path.join(dir, 'nested/notes.md'), 'utf8')).toBe('# hi');
     /* The additive contract: pre-existing session state survives. */
     expect(await fsp.readFile(path.join(dir, 'existing.txt'), 'utf8')).toBe('already-here');
+  });
+
+  test('a delivery whose members do not match the manifest 1:1 is refused before mutating', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_mismatch' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'existing.txt'), 'untouched');
+
+    /* An extra member the manifest never declared: priming would miss it, so
+     * the execute would fall to the unreachable pull path for that file. */
+    const res = fakeStreamRes();
+    await receiveSessionFiles(
+      Readable.from(await makeArchive({
+        'listed.csv': 'a\n',
+        'stowaway.sh': 'echo hi\n',
+        [SESSION_FILES_MANIFEST_FILE]: JSON.stringify({
+          marker: SESSION_FILES_MANIFEST_MARKER,
+          files: [{ name: 'listed.csv', id: 'file_1', storage_session_id: 'store_1' }],
+        }),
+      })) as never,
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(500);
+    /* Validation runs before any commit, so nothing landed. */
+    expect(await fsp.lstat(path.join(dir, 'listed.csv')).catch(() => null)).toBeNull();
+    expect(await fsp.lstat(path.join(dir, 'stowaway.sh')).catch(() => null)).toBeNull();
+    expect(await fsp.readFile(path.join(dir, 'existing.txt'), 'utf8')).toBe('untouched');
+    /* A rejected (never-started) delivery must NOT quarantine the workspace. */
+    expect(session!.quarantineReason).toBeUndefined();
+  });
+
+  test('a delivery through a symlinked ancestor is refused', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_symlink' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+
+    /* Sandbox code from a prior turn plants a link where the delivery wants a
+     * directory; `mkdir -p`/`rename` would follow it and write outside the
+     * workspace as root. */
+    const outside = await fsp.mkdtemp(path.join(os.tmpdir(), 'escape-'));
+    await fsp.symlink(outside, path.join(dir, 'inputs'));
+
+    const res = fakeStreamRes();
+    await receiveSessionFiles(
+      Readable.from(await makeArchive({
+        'inputs/pwned.txt': 'escaped\n',
+        [SESSION_FILES_MANIFEST_FILE]: JSON.stringify({
+          marker: SESSION_FILES_MANIFEST_MARKER,
+          files: [{ name: 'inputs/pwned.txt', id: 'file_1', storage_session_id: 'store_1' }],
+        }),
+      })) as never,
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(500);
+    expect(await fsp.lstat(path.join(outside, 'pwned.txt')).catch(() => null)).toBeNull();
+    await fsp.rm(outside, { recursive: true, force: true });
   });
 
   test('a manifest member primes delivered files and never reaches the workspace', async () => {

@@ -121,6 +121,8 @@ export class SessionWorkspace {
    *  (see {@link consumeFreshDelivery}). Never checkpointed: it describes a
    *  single turn's delivery, not durable workspace state. */
   private readonly delivered = new Set<string>();
+  /** Set when a delivery failed mid-commit (see {@link poisonDelivery}). */
+  private poisoned: string | undefined;
 
   constructor(binding: SessionBinding) {
     this.runtimeSessionId = binding.runtimeSessionId;
@@ -186,6 +188,23 @@ export class SessionWorkspace {
   /** Records that the control plane delivered `relPath` for the next execute. */
   markDelivered(relPath: string): void {
     this.delivered.add(relPath);
+  }
+
+  /**
+   * Marks the workspace indeterminate after a file delivery failed PART-WAY
+   * through committing. Some files are the new bytes, some the old, and the
+   * replaced bytes are gone — so the workspace matches neither the checkpoint
+   * nor the request. Every later request on this runner fails until the
+   * control plane recycles the VM, which restores the last good checkpoint.
+   */
+  poisonDelivery(reason: string): void {
+    this.poisoned = reason;
+    logger.error({ runtimeSessionId: this.runtimeSessionId, reason }, 'Session workspace quarantined');
+  }
+
+  /** The quarantine reason, or undefined while the workspace is usable. */
+  get quarantineReason(): string | undefined {
+    return this.poisoned;
   }
 
   /** Whether `relPath` was primed as an input on any earlier turn (regardless

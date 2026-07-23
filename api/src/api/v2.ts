@@ -195,6 +195,13 @@ function getJob(
     if (!session) {
       throw { status: 409, message: 'Runner is bound to a different runtime session' };
     }
+    /* A delivery that failed mid-commit left the workspace matching neither
+     * the checkpoint nor the request. Refuse every execute until the control
+     * plane recycles this VM and restores the last good checkpoint. */
+    const quarantined = session.quarantineReason;
+    if (quarantined) {
+      throw { status: 409, message: `Session workspace is quarantined: ${quarantined}` };
+    }
   }
 
   return new Job({

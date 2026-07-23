@@ -22,6 +22,7 @@ import {
   applySandboxPathPermissionsNoFollow,
   cleanupSandboxWorkspace,
   createSandboxWorkspace,
+  ensureDirNoFollow,
   fallbackSandboxIdentity,
   retainWorkspaceCleanupUntilRemoved,
   sandboxJobUidPool,
@@ -804,32 +805,12 @@ export class Job {
    * workspace as root — so a persistent-session prime must build the path with
    * no-follow semantics before writing.
    */
-  private async ensureDirNoFollow(target: string): Promise<void> {
-    const rel = path.relative(this.submissionDir, target);
-    if (!rel || rel === '.') return;
-    if (rel === '..' || rel.startsWith('..' + path.sep)) {
-      throw new Error(`Workspace path escapes the sandbox: ${target}`);
-    }
-    let cursor = this.submissionDir;
-    for (const part of rel.split(path.sep).filter(Boolean)) {
-      cursor = path.join(cursor, part);
-      const st = await fsp.lstat(cursor).catch(() => null);
-      if (st == null) {
-        /* Parent is already validated as a real dir; create just this component
-         * (non-recursive, so it can't follow a link). Tolerate a concurrent
-         * sibling prime having just created it. */
-        await fsp.mkdir(cursor).catch((err: NodeJS.ErrnoException) => {
-          if (err.code !== 'EEXIST') throw err;
-        });
-        continue;
-      }
-      if (st.isSymbolicLink()) {
-        throw new Error(`Refusing to prime through symlinked workspace path: ${path.relative(this.submissionDir, cursor)}`);
-      }
-      if (!st.isDirectory()) {
-        throw new Error(`Workspace ancestor is not a directory: ${path.relative(this.submissionDir, cursor)}`);
-      }
-    }
+  private ensureDirNoFollow(target: string): Promise<void> {
+    /* Shared with the pushed-delivery merge (session-checkpoint.ts) so both
+     * privileged writers into a persistent workspace enforce identical
+     * no-follow semantics. `secureAncestors` applies the ownership pass here,
+     * so no identity is handed to the shared helper. */
+    return ensureDirNoFollow(this.submissionDir, target);
   }
 
   private async secureAncestors(leaf: string): Promise<void> {
