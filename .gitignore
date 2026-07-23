@@ -7,6 +7,7 @@ node_modules
 /file-server-logs/**/*
 /service-logs/**/*
 /tool-call-server-logs/**/*
+/.build-lambda-microvm/
 
 # Helm artifacts
 helm/*/charts/*.tgz

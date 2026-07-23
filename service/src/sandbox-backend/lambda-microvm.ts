@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { nanoid } from 'nanoid';
+import * as fs from 'fs';
 import type { LambdaMicrovmClient, MicrovmAuthToken, MicrovmDescription, MicrovmIdlePolicy } from '../runtime-session/lambda-client';
 import type { SandboxBackend, SandboxExecuteContext, SandboxRawResponse, SandboxTransportRequest } from './types';
 import type { RuntimeSessionRecord } from '../runtime-session/registry';
@@ -8,7 +9,11 @@ import type { CheckpointStore } from '../runtime-session/checkpoint-store';
 import { LambdaMicrovmApiError, microvmPortHeaders } from '../runtime-session/lambda-client';
 import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../runtime-session/throttle';
 import { checkpointSession, probeInputs, pushInputs, restoreSession } from '../runtime-session/checkpoint';
-import { buildInputBatch, sessionFileRefs } from '../runtime-session/files';
+import {
+  SESSION_INPUTS_MAX_COUNT,
+  buildInputBatch,
+  sessionFileRefs,
+} from '../runtime-session/files';
 import {
   RUNTIME_SESSION_LOCK_TTL_MS,
   allocateRuntimeSessionGeneration,
@@ -16,10 +21,10 @@ import {
   releaseRuntimeSessionLock,
   removeRuntimeSession,
   renewRuntimeSessionLock,
-  touchRuntimeSessionActive,
   waitForRuntimeSessionLock,
   writeRuntimeSessionRecord,
 } from '../runtime-session/registry';
+import { startRuntimeSessionLockHeartbeat } from '../runtime-session/lock-heartbeat';
 import {
   microvmLaunches,
   microvmLaunchDuration,
@@ -30,6 +35,7 @@ import {
 import { injectTraceHeaders, withSpan } from '../telemetry';
 import { SandboxBackendError } from './types';
 import { Jobs } from '../enum';
+import { checkpointPipelineBudgetMs } from '../config';
 import logger from '../logger';
 
 /** Header that opts a proxied /execute into the runner's persistent session
@@ -65,6 +71,27 @@ export interface LambdaMicrovmBackendConfig {
   checkpoint: CheckpointConfig;
 }
 
+/** Order-independent fingerprint of every immutable launch/security input. */
+export function runtimeSessionLaunchFingerprint(config: LambdaMicrovmBackendConfig): string {
+  const ingress = [...(config.ingressConnectorArns ?? [])].sort();
+  const egress = [...(config.egressConnectorArns ?? [])].sort();
+  return JSON.stringify({
+    imageArn: config.imageArn,
+    imageVersion: config.imageVersion,
+    executionRoleArn: config.executionRoleArn ?? '',
+    logGroup: config.logGroup ?? '',
+    ingress,
+    egress,
+    port: config.port,
+    maximumDurationSeconds: config.maxDurationSeconds,
+    idlePolicy: {
+      maxIdleSeconds: config.idleSeconds,
+      suspendedSeconds: config.suspendedSeconds,
+      autoResume: true,
+    },
+  });
+}
+
 interface LambdaMicrovmBackendDeps {
   clientFactory: () => Promise<LambdaMicrovmClient>;
   config: LambdaMicrovmBackendConfig;
@@ -73,7 +100,21 @@ interface LambdaMicrovmBackendDeps {
   checkpointStore?: CheckpointStore;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+  if (signal?.aborted) {
+    reject(signal.reason instanceof Error ? signal.reason : new Error('Operation aborted'));
+    return;
+  }
+  const timer = setTimeout(() => {
+    signal?.removeEventListener('abort', onAbort);
+    resolve();
+  }, ms);
+  const onAbort = (): void => {
+    clearTimeout(timer);
+    reject(signal?.reason instanceof Error ? signal.reason : new Error('Operation aborted'));
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+});
 
 /** AWS returns the endpoint as a bare host; docs samples do `https://${endpoint}`. */
 export function normalizeMicrovmEndpoint(endpoint: string): string {
@@ -126,9 +167,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
   }
 
   async execute(req: SandboxTransportRequest, ctx: SandboxExecuteContext): Promise<SandboxRawResponse> {
+    /* Production supplies the worker-owned deadline, captured before egress
+     * grant and request setup. Keep a backend-entry fallback for direct/test
+     * callers that do not own a worker timer. Capture it before lazy client
+     * initialization so that setup is counted too. */
+    const deadlineAtMs = ctx.deadlineAtMs ?? Date.now() + this.config.jobTimeoutMs;
     const client = await this.client();
     if (ctx.runtimeSessionId && ctx.runtimeSessionMode !== 'stateless') {
-      return this.executeSession(client, req, ctx, ctx.runtimeSessionId);
+      return this.executeSession(client, req, ctx, ctx.runtimeSessionId, deadlineAtMs);
     }
     return this.executeStateless(client, req, ctx);
   }
@@ -150,10 +196,16 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     });
     let terminateReason = 'stateless';
     try {
+      await this.waitForRunnerReady(
+        client,
+        vm.microvmId,
+        normalizeMicrovmEndpoint(vm.endpoint ?? ''),
+        ctx,
+      );
       /* Stateless one-shots take by-reference inputs too, and their guest is
        * just as unable to pull them. Same cache, same priming path. */
       await this.deliverInputs(client, vm, req, ctx);
-      return await this.proxyExecute(client, vm, req, ctx);
+      return await this.proxyExecute(client, vm, req, ctx, undefined, true);
     } catch (error) {
       terminateReason = ctx.signal.aborted ? 'timeout' : 'error';
       throw error;
@@ -167,13 +219,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     req: SandboxTransportRequest,
     ctx: SandboxExecuteContext,
     runtimeSessionId: string,
+    deadlineAtMs: number,
   ): Promise<SandboxRawResponse> {
-    /* Approximate the JOB_TIMEOUT budget consumed so we don't push the result
-     * past the router's `waitUntilFinished(JOB_TIMEOUT)` with an optional
-     * checkpoint (below). Captured before the lock wait so lock-wait + launch +
-     * execute all count. */
-    const startedAt = Date.now();
-    const lockToken = await waitForRuntimeSessionLock(runtimeSessionId, { waitMs: this.config.lockWaitMs });
+    const lockToken = await waitForRuntimeSessionLock(runtimeSessionId, {
+      waitMs: this.config.lockWaitMs,
+      signal: ctx.signal,
+    });
     if (!lockToken) {
       runtimeSessionLockContention.inc({ mode: ctx.runtimeSessionMode });
       /* A session-bound request depends on that session's workspace — files,
@@ -189,50 +240,45 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     }
 
 
-    /* Heartbeat the lock for as long as we hold it so an arbitrarily long
-     * critical path (launch throttle + readiness/restore + execute + checkpoint,
-     * each with its own I/O and token-mint waits) can't outlive a fixed TTL and
-     * let a second worker fence us and run concurrently. Fenced renew stops
-     * itself; the interval is a third of the TTL so a couple of missed ticks are
-     * survivable. */
-    /* A LOST renewal is positive evidence another worker fenced us and now owns
-     * the session — merely stopping the heartbeat would let this worker keep
-     * mutating a VM the new holder is using. Abort the in-flight critical path
-     * instead. A transient renew ERROR does not abort: the TTL is three
-     * intervals, so the next tick retries long before expiry. */
     const fence = new AbortController();
-    /* Persistent renew ERRORS are as dangerous as an explicit fence: once the
-     * lease can no longer be proven held past its TTL, another worker may have
-     * taken it. Track the last confirmed renewal and fence on lease expiry. */
-    let lastHeldAt = Date.now();
-    const heartbeat = setInterval(() => {
-      void renewRuntimeSessionLock(runtimeSessionId, lockToken).then((renewal) => {
-        if (renewal === 'held') {
-          lastHeldAt = Date.now();
-          return;
-        }
-        const leaseExpired = Date.now() - lastHeldAt >= RUNTIME_SESSION_LOCK_TTL_MS;
-        if (renewal === 'lost' || leaseExpired) {
-          clearInterval(heartbeat);
-          fence.abort();
-        }
-      });
-    }, Math.floor(RUNTIME_SESSION_LOCK_TTL_MS / 3));
+    const heartbeat = startRuntimeSessionLockHeartbeat({
+      renew: () => renewRuntimeSessionLock(runtimeSessionId, lockToken),
+      fence,
+      ttlMs: RUNTIME_SESSION_LOCK_TTL_MS,
+    });
     const sessionCtx: SandboxExecuteContext = {
       ...ctx,
       signal: AbortSignal.any([ctx.signal, fence.signal]),
     };
+    let sessionVm: MicrovmDescription | undefined;
 
     try {
       const existing = await readRuntimeSessionRecord(runtimeSessionId);
-      const { vm, reused, restored } = await this.findOrLaunchSession(client, sessionCtx, runtimeSessionId, existing, lockToken);
+      const { vm } = await this.findOrLaunchSession(
+        client,
+        sessionCtx,
+        runtimeSessionId,
+        existing,
+        lockToken,
+      );
+      sessionVm = vm;
       await this.deliverInputs(client, vm, req, sessionCtx, async () => {
         /* A session VM whose delivery transport failed is not trustworthy for
          * reuse: recycle so the next call relaunches and restores. */
-        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
-        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+        const terminated = await this.terminate(client, vm.microvmId, 'error');
+        if (terminated) {
+          await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+        }
       });
-      const result = await this.executeOnSessionVm(client, vm, req, sessionCtx, runtimeSessionId, lockToken, reused, fence.signal);
+      const result = await this.executeOnSessionVm(
+        client,
+        vm,
+        req,
+        sessionCtx,
+        runtimeSessionId,
+        lockToken,
+        fence.signal,
+      );
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
@@ -241,33 +287,58 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * budget won't fit a full checkpoint, so a run that already succeeded
        * isn't timed out at the router by the checkpoint's latency — the next
        * relaunch restores the prior checkpoint, one exec staler. */
-      const remainingBudgetMs = this.config.jobTimeoutMs - (now - startedAt);
-      /* Reserve the WHOLE checkpoint path, not just one timeout: it can spend a
-       * token-budget wait (up to launchTimeoutMs) + the checkpoint GET + the
-       * object-store sequence/list (only on counter reset/first write) + the
-       * object-store put (each up to checkpoint.timeoutMs). Guarding on a
-       * single timeout let a run finishing with barely more than that still
-       * block long enough to blow the router's waitUntilFinished(JOB_TIMEOUT)
-       * after the sandbox work already succeeded. */
-      const worstCaseCheckpointMs =
-        this.config.launchTimeoutMs + 3 * this.config.checkpoint.timeoutMs;
+      const remainingBudgetMs = deadlineAtMs - now;
+      /* Reserve the WHOLE checkpoint path, not just one transfer timeout:
+       * token-budget wait + guest GET + object-store list + object upload +
+       * durable marker. Metadata calls use their tighter cap; the two archive
+       * transfers receive the configured checkpoint timeout. */
+      const worstCaseCheckpointMs = checkpointPipelineBudgetMs(
+        this.config.launchTimeoutMs,
+        this.config.checkpoint.timeoutMs,
+      );
       const canCheckpoint = !sessionCtx.signal.aborted && remainingBudgetMs > worstCaseCheckpointMs;
       const settled = await readRuntimeSessionRecord(runtimeSessionId);
-      const nextRecord = settled
-        ? canCheckpoint
-          ? await this.checkpointUnderLock(client, settled, runtimeSessionId, now, lockToken)
-          : { ...settled, state: 'RUNNING' as const, last_seen_at: now }
-        : undefined;
-      if (nextRecord) {
-        const persisted = await writeRuntimeSessionRecord(nextRecord, lockToken);
-        if (!persisted) {
-          throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after execute`);
-        }
+      if (!settled) {
+        /* Returning success here would strand the known live VM without a
+         * registry record: no later caller could reuse or clean it up. Treat
+         * disappearance as fencing so the catch path terminates this VM. */
+        throw new SandboxBackendError(
+          'MICROVM_FENCED',
+          `Runtime session record disappeared for ${runtimeSessionId} after execute`,
+        );
       }
-      await touchRuntimeSessionActive(runtimeSessionId, now);
+      const nextRecord = canCheckpoint
+        ? await this.checkpointUnderLock(
+          client,
+          settled,
+          runtimeSessionId,
+          now,
+          lockToken,
+          sessionCtx.signal,
+        )
+        : { ...settled, state: 'RUNNING' as const, last_seen_at: now };
+      const persisted = await writeRuntimeSessionRecord(nextRecord, lockToken);
+      if (!persisted) {
+        throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after execute`);
+      }
       return result;
+    } catch (error) {
+      /* Fencing can happen after proxyExecute returns — during checkpoint,
+       * the final registry read, or the final liveness write. At that point a
+       * newer holder may already be using the recorded VM. Kill it so the new
+       * holder fails fast and restores, rather than letting two workers touch
+       * one persistent workspace concurrently. The stale lock token cannot
+       * safely remove the new holder's record, so termination is the only
+       * mutation here. */
+      const fenced =
+        fence.signal.aborted ||
+        (error instanceof SandboxBackendError && error.code === 'MICROVM_FENCED');
+      if (fenced && sessionVm) {
+        await this.terminate(client, sessionVm.microvmId, 'fenced');
+      }
+      throw error;
     } finally {
-      clearInterval(heartbeat);
+      heartbeat.stop();
       await releaseRuntimeSessionLock(runtimeSessionId, lockToken);
     }
   }
@@ -292,11 +363,13 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     runtimeSessionId: string,
     lockToken: string,
-    reused: boolean,
     fenceSignal?: AbortSignal,
   ): Promise<SandboxRawResponse> {
     try {
-      return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId, reused);
+      /* Fresh sessions passed readiness before their PENDING record became
+       * RUNNING. Reused sessions intentionally let probe/execute trigger
+       * auto-resume under the full job budget. */
+      return await this.proxyExecute(client, vm, req, ctx, runtimeSessionId, true);
     } catch (error) {
       /* Recycle the VM ONLY on positive evidence it's unreachable or dirty:
        *  - abort: the runner keeps NsJail running after the socket closes, so a
@@ -326,7 +399,6 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * no-op under our stale token, which is fine — the reuse path already
        * recycles records pointing at dead VMs. */
       if (fenceSignal?.aborted === true) {
-        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
         throw new SandboxBackendError(
           'MICROVM_FENCED',
           `Lost session lock for ${runtimeSessionId} during execute`,
@@ -336,21 +408,33 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       const transportFailure = axios.isAxiosError(error) && error.response == null;
       const unhealthy = error instanceof SandboxBackendError && error.code === 'MICROVM_UNHEALTHY';
       const gatewayUnreachable = status >= 502 && status <= 504;
-      if (ctx.signal.aborted || transportFailure || unhealthy || gatewayUnreachable) {
-        await this.terminate(client, vm.microvmId, ctx.signal.aborted ? 'timeout' : 'error').catch(() => {});
-        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+      const sessionWorkspaceDirty =
+        axios.isAxiosError(error) &&
+        error.response?.status === 409 &&
+        (error.response.data as { error?: unknown } | undefined)?.error === 'session_workspace_dirty';
+      if (
+        ctx.signal.aborted ||
+        transportFailure ||
+        unhealthy ||
+        gatewayUnreachable ||
+        sessionWorkspaceDirty
+      ) {
+        const terminated = await this.terminate(
+          client,
+          vm.microvmId,
+          ctx.signal.aborted ? 'timeout' : 'error',
+        );
+        if (terminated) {
+          await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+        }
       }
       throw error;
     }
   }
 
-  /** Order-independent fingerprint of the ingress/egress connector ARNs the
-   *  current config would launch a VM with, recorded on the session so a
-   *  connector config change makes an existing VM non-reusable. */
-  private connectorFingerprint(): string {
-    const ingress = [...(this.config.ingressConnectorArns ?? [])].sort();
-    const egress = [...(this.config.egressConnectorArns ?? [])].sort();
-    return JSON.stringify({ ingress, egress });
+  /** Order-independent fingerprint of every immutable launch/security input. */
+  private launchFingerprint(): string {
+    return runtimeSessionLaunchFingerprint(this.config);
   }
 
   private async findOrLaunchSession(
@@ -359,7 +443,13 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     runtimeSessionId: string,
     record: RuntimeSessionRecord | null,
     lockToken: string,
-  ): Promise<{ vm: MicrovmDescription; reused: boolean; restored: boolean }> {
+  ): Promise<{ vm: MicrovmDescription; restored: boolean }> {
+    if (!this.config.imageVersion) {
+      throw new SandboxBackendError(
+        'MICROVM_LAUNCH_FAILED',
+        'Stateful runtime sessions require a pinned LAMBDA_MICROVM_IMAGE_VERSION',
+      );
+    }
     const deadlineHeadroomMs = this.config.jobTimeoutMs + 30_000;
     /* A record whose image/version/port no longer match the current config was
      * launched by an older deploy — relaunch on the current config rather than
@@ -369,7 +459,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       && record.image_arn === this.config.imageArn
       && record.image_version === this.config.imageVersion
       && record.port === this.config.port
-      && (record.connectors ?? '') === this.connectorFingerprint();
+      && record.launch_fingerprint === this.launchFingerprint();
     /* Past idle+suspended, AWS auto-terminates the suspended VM while the record
      * still reads RUNNING until the 8h hard deadline. Treat that as non-reusable
      * so the first request after idle expiry relaunches + restores, instead of
@@ -388,35 +478,73 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * transparently auto-resumes it (idlePolicy.autoResume). */
       return {
         vm: { microvmId: record.microvm_id as string, state: 'RUNNING', endpoint: record.endpoint },
-        reused: true,
         restored: false,
       };
     }
 
-    /* We're relaunching. If the recorded VM is a live-but-non-reusable one
-     * (config/version/port drift, or deadline too close for this job) it would
-     * otherwise leak — running/suspended and billing until idle/max-duration
-     * expiry — once we overwrite the record below. Terminate it first. Skip
-     * when likelyIdleTerminated: AWS already killed it, so that's positive
-     * evidence it's gone and terminate would be a wasted not-found call. */
-    if (record?.microvm_id && !likelyIdleTerminated) {
-      await this.terminate(client, record.microvm_id, 'superseded').catch(() => {});
+    /* We're relaunching. Always terminate a recorded VM before replacing it.
+     * `last_seen_at` is only advanced after a successful execute; a failed
+     * delivery/proxy request can nevertheless auto-resume and touch the VM.
+     * Therefore "past idle+suspended" is enough to reject reuse, but NOT proof
+     * AWS already killed it. Skipping termination on that assumption leaks a
+     * live resumed VM after the record is overwritten. Provider not-found is
+     * already treated as successful cleanup, so the safe path is unconditional. */
+    if (record?.microvm_id) {
+      const terminated = await this.terminate(client, record.microvm_id, 'superseded');
+      if (!terminated) {
+        throw new SandboxBackendError(
+          'MICROVM_UNHEALTHY',
+          `Could not terminate non-reusable MicroVM ${record.microvm_id}`,
+        );
+      }
     }
 
-    const generation = await allocateRuntimeSessionGeneration(runtimeSessionId);
-    const pendingOk = await writeRuntimeSessionRecord({
+    /* RunMicrovm is idempotent by clientToken, but a worker can die after AWS
+     * accepts the call and before its response (and MicroVM id) reaches us.
+     * Persist the complete launch intent first. A successor on the same config
+     * replays that generation/token and recovers the already-running VM instead
+     * of allocating a new generation and leaving the first VM billable. */
+    const canReplayPendingLaunch = Boolean(
+      record
+      && record.state === 'PENDING'
+      && !record.microvm_id
+      && configMatches
+      && Number.isSafeInteger(record.generation)
+      && record.generation > 0
+      && record.launched_at != null
+      && record.hard_deadline_at != null
+      && record.hard_deadline_at - Date.now() > deadlineHeadroomMs,
+    );
+    const generation = canReplayPendingLaunch && record
+      ? record.generation
+      : await allocateRuntimeSessionGeneration(runtimeSessionId);
+    const launchedAt = canReplayPendingLaunch && record?.launched_at != null
+      ? record.launched_at
+      : Date.now();
+    const hardDeadlineAt = canReplayPendingLaunch && record?.hard_deadline_at != null
+      ? record.hard_deadline_at
+      : launchedAt + this.config.maxDurationSeconds * 1_000 - 60_000;
+    const launchIntent: RuntimeSessionRecord = {
       runtime_session_id: runtimeSessionId,
       tenant_id: ctx.tenantId ?? '',
       canonical_user_id: ctx.canonicalUserId ?? '',
+      port: this.config.port,
+      image_arn: this.config.imageArn,
+      image_version: this.config.imageVersion,
+      launch_fingerprint: this.launchFingerprint(),
       state: 'PENDING',
       generation,
+      launched_at: launchedAt,
       last_seen_at: Date.now(),
-    }, lockToken);
+      hard_deadline_at: hardDeadlineAt,
+      workspace_checkpoint: record?.workspace_checkpoint,
+      checkpointed_at: record?.checkpointed_at,
+    };
+    const pendingOk = await writeRuntimeSessionRecord(launchIntent, lockToken);
     if (!pendingOk) {
       throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} before launch`);
     }
 
-    const launchedAt = Date.now();
     const vm = await this.launch(client, ctx, {
       clientToken: `sess-${runtimeSessionId}-${generation}`,
       idlePolicy: {
@@ -427,77 +555,74 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       maxDurationSeconds: this.config.maxDurationSeconds,
     });
 
-    const runningOk = await writeRuntimeSessionRecord({
-      runtime_session_id: runtimeSessionId,
-      tenant_id: ctx.tenantId ?? '',
-      canonical_user_id: ctx.canonicalUserId ?? '',
+    const launchedRecord: RuntimeSessionRecord = {
+      ...launchIntent,
       microvm_id: vm.microvmId,
       endpoint: vm.endpoint,
-      port: this.config.port,
-      image_arn: this.config.imageArn,
-      image_version: this.config.imageVersion,
-      connectors: this.connectorFingerprint(),
-      state: 'RUNNING',
-      generation,
-      launched_at: launchedAt,
+      image_arn: vm.imageArn ?? this.config.imageArn,
+      image_version: vm.imageVersion ?? this.config.imageVersion,
       last_seen_at: Date.now(),
-      hard_deadline_at: launchedAt + this.config.maxDurationSeconds * 1_000 - 60_000,
-    }, lockToken);
-    if (!runningOk) {
-      await this.terminate(client, vm.microvmId, 'error');
-      throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after launch`);
-    }
+    };
 
-    /* Fresh VM: restore the predecessor's workspace before the first execute so
-     * an 8h rollover / eviction is invisible. Attempt whenever checkpoints are
-     * active, NOT only when a Redis record exists — the checkpoint lives under a
-     * deterministic S3 key that can outlive/repair a lost record, and
-     * restoreSession treats a missing object as `absent` (a truly new session
-     * just no-ops one stat). */
-    if (this.checkpointStore && this.checkpointsActive()) {
-      const endpointBase = normalizeMicrovmEndpoint(vm.endpoint ?? '');
-      /* Wait for the runner's API listener before restoring. RUNNING is a
-       * control-plane state — the endpoint can be allocated while the app is
-       * still booting, and pushRestore is intentionally non-fatal, so a restore
-       * that raced the boot would silently drop the checkpoint and run the first
-       * execute on an empty workspace. If the runner never comes up, tear the VM
-       * down so the next call relaunches instead of reusing a dead endpoint. */
-      try {
-        await this.waitForRunnerReady(client, vm.microvmId, endpointBase, ctx);
-      } catch (error) {
-        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
-        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
-        throw error;
-      }
-      const restoreResult = await restoreSession({
-        mintToken: (microvmId) => this.mintAuthToken(client, microvmId),
-        store: this.checkpointStore,
-        runtimeSessionId,
-        microvmId: vm.microvmId,
-        endpointBase,
-        config: this.config.checkpoint,
-      });
-      /* Fail closed on BOTH failure shapes:
-       *  - push_failed: the runner may hold a partially-extracted workspace.
-       *  - fetch_failed: the workspace is clean but EMPTY. Executing anyway
-       *    used to look like a harmless degraded run, but the post-run
-       *    checkpoint then writes a higher-sequence snapshot of that empty
-       *    workspace and prunes the last good one — a transient S3 blip
-       *    becoming permanent data loss. A retryable 503 is strictly better.
-       * (An absent checkpoint stays fine: a genuinely new session no-ops.) */
-      if (restoreResult === 'push_failed' || restoreResult === 'fetch_failed') {
-        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
-        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+    let restored = false;
+    try {
+      /* Publish the launched VM as PENDING before readiness/restore. A worker
+       * crash leaves enough information for the successor to terminate it,
+       * while never advertising a partial workspace as reusable. */
+      const tracked = await writeRuntimeSessionRecord(launchedRecord, lockToken);
+      if (!tracked) {
         throw new SandboxBackendError(
-          'MICROVM_UNHEALTHY',
-          restoreResult === 'push_failed'
-            ? 'Checkpoint restore left the workspace in an unknown state'
-            : 'Checkpoint fetch failed; refusing to run against an empty workspace',
+          'MICROVM_FENCED',
+          `Lost session lock for ${runtimeSessionId} after launch`,
         );
       }
-      return { vm, reused: false, restored: restoreResult === 'restored' };
+
+      const endpointBase = normalizeMicrovmEndpoint(vm.endpoint ?? '');
+      await this.waitForRunnerReady(client, vm.microvmId, endpointBase, ctx);
+
+      /* Fresh VM: restore the predecessor's workspace before the first execute
+       * so an 8h rollover / eviction is invisible. Attempt even after Redis
+       * record loss because the object-store key is deterministic. */
+      if (this.checkpointStore && this.checkpointsActive()) {
+        const restoreResult = await restoreSession({
+          mintToken: (microvmId) => this.mintAuthToken(client, microvmId, ctx.signal),
+          store: this.checkpointStore,
+          runtimeSessionId,
+          microvmId: vm.microvmId,
+          endpointBase,
+          config: this.config.checkpoint,
+          signal: ctx.signal,
+          checkpointKey: record?.workspace_checkpoint,
+        });
+        if (restoreResult === 'push_failed' || restoreResult === 'fetch_failed') {
+          throw new SandboxBackendError(
+            'MICROVM_UNHEALTHY',
+            restoreResult === 'push_failed'
+              ? 'Checkpoint restore left the workspace in an unknown state'
+              : 'Checkpoint fetch failed; refusing to run against an empty workspace',
+          );
+        }
+        restored = restoreResult === 'restored';
+      }
+
+      const runningOk = await writeRuntimeSessionRecord(
+        { ...launchedRecord, state: 'RUNNING', last_seen_at: Date.now() },
+        lockToken,
+      );
+      if (!runningOk) {
+        throw new SandboxBackendError(
+          'MICROVM_FENCED',
+          `Lost session lock for ${runtimeSessionId} after restore`,
+        );
+      }
+      return { vm, restored };
+    } catch (error) {
+      const terminated = await this.terminate(client, vm.microvmId, 'error');
+      if (terminated) {
+        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+      }
+      throw error;
     }
-    return { vm, reused: false, restored: false };
   }
 
   /** Polls the runner's health endpoint until it responds, bounded by the
@@ -508,19 +633,28 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     base: string,
     ctx: SandboxExecuteContext,
   ): Promise<void> {
-    const token = await this.mintAuthToken(client, microvmId);
     const deadline = Date.now() + this.config.launchTimeoutMs;
+    const refreshSkewMs = this.config.healthTimeoutMs + this.pollIntervalMs;
+    let token: MicrovmAuthToken | undefined;
     let lastError: unknown;
     while (Date.now() < deadline) {
-      if (ctx.signal.aborted) {
-        throw new SandboxBackendError('MICROVM_LAUNCH_FAILED', 'Execution aborted while waiting for runner readiness');
+      ctx.signal.throwIfAborted();
+      /* Readiness can legitimately outlive one proxy token under a custom
+       * launch timeout. Refresh just before expiry instead of repeatedly
+       * probing with a credential AWS will reject. A newly minted token is
+       * still used once even when a test/fake gives it an unusually short
+       * lifetime, avoiding a mint-only loop. */
+      if (token === undefined || token.expiresAtMs <= Date.now() + refreshSkewMs) {
+        token = await this.mintAuthToken(client, microvmId, ctx.signal);
       }
       try {
         await this.assertHealthy(base, token.token, ctx);
         return;
       } catch (error) {
+        ctx.signal.throwIfAborted();
         lastError = error;
-        await sleep(this.pollIntervalMs);
+        if (Date.now() + this.pollIntervalMs >= deadline) break;
+        await sleep(this.pollIntervalMs, ctx.signal);
       }
     }
     throw lastError instanceof SandboxBackendError
@@ -532,7 +666,9 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
    * Pulls a checkpoint from the still-warm VM while the exec lock is held and
    * stores it, returning the record to persist (with the checkpoint pointer)
    * or the liveness-only update if checkpoints are off/failed. Never throws —
-   * a missed checkpoint degrades to file-ref recovery.
+   * a missed post-exec checkpoint does not rewrite the prior durable pointer.
+   * The current warm VM remains authoritative until the next successful
+   * checkpoint; a later replacement restores the last committed snapshot.
    */
   private async checkpointUnderLock(
     client: LambdaMicrovmClient,
@@ -540,18 +676,20 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     runtimeSessionId: string,
     now: number,
     lockToken: string,
+    signal?: AbortSignal,
   ): Promise<RuntimeSessionRecord> {
     const base: RuntimeSessionRecord = { ...record, state: 'RUNNING', last_seen_at: now };
     if (!this.checkpointStore || !this.checkpointsActive() || !record.microvm_id || !record.endpoint) {
       return base;
     }
     const result = await checkpointSession({
-      mintToken: (microvmId) => this.mintAuthToken(client, microvmId),
+      mintToken: (microvmId) => this.mintAuthToken(client, microvmId, signal),
       store: this.checkpointStore,
       runtimeSessionId,
       config: this.config.checkpoint,
       normalizeEndpoint: normalizeMicrovmEndpoint,
       lockToken,
+      signal,
     });
     /* checkpointSession wrote the pointer under our lock on success; re-read so
      * we keep it, but re-apply `last_seen_at: now` — that record was built from
@@ -572,11 +710,16 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
    *  `throttled` poisons the bucket for backoff, and `not_found` (the VM was
    *  evicted/terminated) surfaces as MICROVM_UNHEALTHY so the caller tears down
    *  the stale record and relaunches instead of retrying a dead VM. */
-  private async mintAuthToken(client: LambdaMicrovmClient, microvmId: string): Promise<MicrovmAuthToken> {
+  private async mintAuthToken(
+    client: LambdaMicrovmClient,
+    microvmId: string,
+    signal?: AbortSignal,
+  ): Promise<MicrovmAuthToken> {
     try {
       await acquireOpBudget('token', {
         limitPerSecond: this.config.tokenTps,
         budgetMs: this.config.launchTimeoutMs,
+        signal,
       });
     } catch (error) {
       if (error instanceof MicrovmOpThrottledError) {
@@ -590,7 +733,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         microvmId,
         port: this.config.port,
         ttlSeconds: this.config.authTokenTtlSeconds,
-      });
+      }, signal);
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
         await poisonOpBucket('token');
@@ -628,40 +771,171 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     onUnhealthy?: () => Promise<void>,
   ): Promise<void> {
-    const refs = sessionFileRefs(req.body.files);
+    const refs = req.inputDelivery ?? sessionFileRefs(req.body.files);
     if (refs.length === 0) return;
-    const endpointBase = normalizeMicrovmEndpoint(vm.endpoint ?? '');
-    const mintToken = () => this.mintAuthToken(client, vm.microvmId);
-    try {
-      const missing = await probeInputs(
-        { mintToken, endpointBase, signal: ctx.signal },
-        refs.map((ref) => ({ storage_session_id: ref.storage_session_id, id: ref.id })),
-        this.config.checkpoint,
+    if (refs.length > SESSION_INPUTS_MAX_COUNT) {
+      throw new SandboxBackendError(
+        'MICROVM_UNHEALTHY',
+        `Session delivery of ${refs.length} objects exceeds the ${SESSION_INPUTS_MAX_COUNT} limit`,
       );
-      logger.info('Session input delivery', {
-        microvmId: vm.microvmId,
-        refs: refs.length,
-        missing: missing.length,
-      });
-      if (missing.length === 0) return;
-      const wanted = new Set(missing.map((ref) => `${ref.storage_session_id}/${ref.id}`));
-      const batch = await buildInputBatch(
-        refs.filter((ref) => wanted.has(`${ref.storage_session_id}/${ref.id}`)),
+    }
+    const endpointBase = normalizeMicrovmEndpoint(vm.endpoint ?? '');
+    const mintToken = () => this.mintAuthToken(client, vm.microvmId, ctx.signal);
+    const deliveryConfig = {
+      ...this.config.checkpoint,
+      /* A probe can be the request that auto-resumes a suspended VM. Give that
+       * operation the worker's full budget; the shared abort signal still
+       * enforces the actual remaining JOB_TIMEOUT. */
+      timeoutMs: this.config.jobTimeoutMs,
+    };
+    let missing: Array<{ cache_key: string }>;
+    try {
+      missing = await this.probeInputsWithRetry(
+        { mintToken, endpointBase, signal: ctx.signal },
+        refs.map((ref) => ({ cache_key: ref.cache_key })),
+        deliveryConfig,
+      );
+    } catch (error) {
+      return await this.rethrowInputDeliveryFailure(
+        error,
+        ctx.signal,
+        onUnhealthy,
+        'Session input delivery failed',
+      );
+    }
+    logger.info('Session input delivery', {
+      microvmId: vm.microvmId,
+      refs: refs.length,
+      missing: missing.length,
+    });
+    if (missing.length === 0) return;
+
+    /* Source fetch/authorization/size failures say nothing about VM health.
+     * Keep a warm session intact so a caller error cannot discard workspace
+     * changes newer than the last checkpoint. */
+    const wanted = new Set(missing.map((ref) => ref.cache_key));
+    let batch: Awaited<ReturnType<typeof buildInputBatch>>;
+    try {
+      batch = await buildInputBatch(
+        refs.filter((ref) => wanted.has(ref.cache_key)),
         {
           timeoutMs: this.config.checkpoint.timeoutMs,
           maxBytes: this.config.checkpoint.maxBytes,
           signal: ctx.signal,
         },
       );
-      if (!batch) return;
-      await pushInputs({ mintToken, endpointBase, signal: ctx.signal }, batch.data, this.config.checkpoint);
     } catch (error) {
-      /* The cache is additive and idempotent, so a failed delivery leaves no
-       * partial workspace state — but the execute must not proceed without
-       * inputs it declared. Let the caller decide whether the VM is still
-       * reusable (a session VM whose transport failed is recycled). */
+      throw new SandboxBackendError('MICROVM_UNHEALTHY', 'Session input source fetch failed', error);
+    }
+    if (!batch) {
+      throw new SandboxBackendError(
+        'MICROVM_UNHEALTHY',
+        'Runner requested an empty session input batch',
+      );
+    }
+
+    try {
+      await pushInputs(
+        { mintToken, endpointBase, signal: ctx.signal },
+        () => fs.createReadStream(batch.path),
+        deliveryConfig,
+        batch.size,
+        batch.expandedSize,
+      );
+    } catch (error) {
+      return await this.rethrowInputDeliveryFailure(
+        error,
+        ctx.signal,
+        onUnhealthy,
+        'Session input push failed',
+      );
+    } finally {
+      await batch.cleanup().catch(() => {});
+    }
+
+    /* Pruning happens as part of the push. Re-probe the ENTIRE working set so
+     * an undersized runner cache cannot ACK the batch and then execute with an
+     * older, currently-required ref evicted. */
+    let stillMissing: Array<{ cache_key: string }>;
+    try {
+      stillMissing = await this.probeInputsWithRetry(
+        { mintToken, endpointBase, signal: ctx.signal },
+        refs.map((ref) => ({ cache_key: ref.cache_key })),
+        deliveryConfig,
+      );
+    } catch (error) {
+      return await this.rethrowInputDeliveryFailure(
+        error,
+        ctx.signal,
+        onUnhealthy,
+        'Session input verification failed',
+      );
+    }
+    if (stillMissing.length > 0) {
+      throw new SandboxBackendError(
+        'MICROVM_UNHEALTHY',
+        `Runner input cache cannot hold the ${refs.length}-object working set`,
+      );
+    }
+  }
+
+  /**
+   * Input delivery is control-plane/cache work and has not started an NsJail
+   * execution. Recycle a warm VM only when the failure positively says that VM
+   * is gone or unreachable. Token throttles, other Lambda API failures, live
+   * runner 4xx/5xx responses, validation errors, and caller aborts do not make
+   * the VM unsafe to reuse.
+   */
+  private inputDeliveryProvesVmUnhealthy(error: unknown, signal: AbortSignal): boolean {
+    if (signal.aborted) return false;
+    if (error instanceof SandboxBackendError) {
+      return error.code === 'MICROVM_UNHEALTHY';
+    }
+    if (!axios.isAxiosError(error)) return false;
+    if (error.response == null) return true;
+    return error.response.status >= 502 && error.response.status <= 504;
+  }
+
+  private async rethrowInputDeliveryFailure(
+    error: unknown,
+    signal: AbortSignal,
+    onUnhealthy: (() => Promise<void>) | undefined,
+    message: string,
+  ): Promise<never> {
+    if (this.inputDeliveryProvesVmUnhealthy(error, signal)) {
       await onUnhealthy?.();
-      throw new SandboxBackendError('MICROVM_UNHEALTHY', 'Session input delivery failed', error);
+    }
+    /* Preserve mapped control-plane codes (especially throttling) so callers
+     * can apply their normal retry/backpressure policy. */
+    if (error instanceof SandboxBackendError) {
+      throw error;
+    }
+    throw new SandboxBackendError('MICROVM_UNHEALTHY', message, error);
+  }
+
+  private async probeInputsWithRetry(
+    args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; signal?: AbortSignal },
+    refs: Array<{ cache_key: string }>,
+    config: CheckpointConfig,
+  ): Promise<Array<{ cache_key: string }>> {
+    const deadline = Date.now() + config.timeoutMs;
+    for (;;) {
+      try {
+        return await probeInputs(args, refs, config);
+      } catch (error) {
+        const status = axios.isAxiosError(error) ? error.response?.status ?? 0 : 0;
+        /* A suspended endpoint can reset/refuse the connection while AWS
+         * auto-resumes it, before the proxy is ready to return a 502/503/504.
+         * Retry both transport-level failures and gateway transients under the
+         * caller's full bounded delivery budget. */
+        const transient =
+          axios.isAxiosError(error)
+          && (error.response == null || status === 502 || status === 503 || status === 504);
+        if (!transient || args.signal?.aborted || Date.now() + this.pollIntervalMs >= deadline) {
+          throw error;
+        }
+        await sleep(this.pollIntervalMs, args.signal);
+      }
     }
   }
 
@@ -671,10 +945,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     req: SandboxTransportRequest,
     ctx: SandboxExecuteContext,
     runtimeSessionId?: string,
-    reused = false,
+    readinessSatisfied = false,
   ): Promise<SandboxRawResponse> {
     const base = normalizeMicrovmEndpoint(vm.endpoint ?? '');
-    const token = await this.mintAuthToken(client, vm.microvmId);
+    const token = await this.mintAuthToken(client, vm.microvmId, ctx.signal);
     /* Skip the preflight health check on a REUSED session VM: AWS may be
      * auto-resuming it from a suspend, and that resume can exceed the short
      * healthTimeoutMs (it scales with suspended-state size) — a slow-but-valid
@@ -682,7 +956,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * execute itself carries the resume under the full job budget, a
      * genuinely-evicted VM already fails token minting with not_found, and a
      * freshly-launched VM (reused=false) still gets the readiness probe. */
-    if (!reused) {
+    if (!readinessSatisfied) {
       /* A freshly-launched VM's runner may still be booting (RUNNING is a
        * control-plane state). When checkpoints are active the launch path
        * already polled readiness; when they are disabled/stateless this is the
@@ -761,6 +1035,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       await acquireOpBudget('run', {
         limitPerSecond: this.config.launchTps,
         budgetMs: this.config.launchTimeoutMs,
+        signal: ctx.signal,
       });
     } catch (error) {
       if (error instanceof MicrovmOpThrottledError) {
@@ -783,7 +1058,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         maximumDurationSeconds: opts.maxDurationSeconds,
         idlePolicy: opts.idlePolicy,
         clientToken: opts.clientToken,
-      });
+      }, ctx.signal);
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
         await poisonOpBucket('run');
@@ -806,7 +1081,14 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       return ready;
     } catch (error) {
       microvmLaunches.inc({ outcome: 'failed' });
-      await this.terminate(client, vm.microvmId, 'error');
+      const terminated = await this.terminate(client, vm.microvmId, 'error');
+      if (!terminated) {
+        throw new SandboxBackendError(
+          'MICROVM_LAUNCH_FAILED',
+          `MicroVM ${vm.microvmId} failed during boot and could not be terminated`,
+          error,
+        );
+      }
       /* waitUntilRunning throws SandboxBackendError for its own conditions, but
        * the GetMicrovm poll it makes can throw a raw LambdaMicrovmApiError
        * (throttle/transient control-plane error). Map it like runMicrovm so it
@@ -853,8 +1135,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           `MicroVM ${current.microvmId} did not reach RUNNING within ${this.config.launchTimeoutMs}ms`,
         );
       }
-      await sleep(this.pollIntervalMs);
-      current = await client.getMicrovm(current.microvmId);
+      await sleep(this.pollIntervalMs, ctx.signal);
+      current = await client.getMicrovm(current.microvmId, ctx.signal);
     }
     return current;
   }
@@ -878,12 +1160,27 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     }
   }
 
-  private async terminate(client: LambdaMicrovmClient, microvmId: string, reason: string): Promise<void> {
+  private async terminate(
+    client: LambdaMicrovmClient,
+    microvmId: string,
+    reason: string,
+  ): Promise<boolean> {
     try {
-      await client.terminateMicrovm(microvmId);
+      await client.terminateMicrovm(
+        microvmId,
+        AbortSignal.timeout(this.config.launchTimeoutMs),
+      );
       microvmTerminations.inc({ reason });
+      return true;
     } catch (error) {
+      if (error instanceof LambdaMicrovmApiError && error.kind === 'not_found') {
+        /* The desired terminal state already holds. Treat provider not-found as
+         * successful cleanup so a stale registry record cannot wedge relaunch. */
+        microvmTerminations.inc({ reason });
+        return true;
+      }
       logger.error('Failed to terminate MicroVM', { microvmId, reason, error });
+      return false;
     }
   }
 }

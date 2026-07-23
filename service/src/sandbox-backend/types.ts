@@ -9,6 +9,19 @@ import { getAxiosErrorDetails } from '../utils';
 export interface SandboxTransportRequest {
   body: t.PayloadBody;
   headers: Record<string, string>;
+  /**
+   * Control-plane-only fetch refs. These retain authorized storage IDs while
+   * `body.files` may contain per-grant sandbox handles. Backends must never
+   * serialize this field to the sandbox.
+   */
+  inputDelivery?: SandboxInputDeliveryRef[];
+}
+
+export interface SandboxInputDeliveryRef {
+  id: string;
+  storage_session_id: string;
+  name: string;
+  cache_key: string;
 }
 
 export interface SandboxExecuteContext {
@@ -17,6 +30,11 @@ export interface SandboxExecuteContext {
   isSynthetic: boolean;
   /** Worker-owned JOB_TIMEOUT abort signal. */
   signal: AbortSignal;
+  /** Absolute deadline anchored to BullMQ enqueue time when available. Unlike
+   * a backend-local timer, this includes queue wait, egress-grant creation, and
+   * request setup. Direct backend callers may omit it and receive a
+   * backend-entry fallback. */
+  deadlineAtMs?: number;
   tenantId?: string;
   canonicalUserId?: string;
   /** Absent ⇒ stateless execution (no runtime session affinity). */

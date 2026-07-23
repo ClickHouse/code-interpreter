@@ -40,10 +40,37 @@ export interface OpBudgetOptions {
   /** Total time the caller is willing to wait for a slot. */
   budgetMs: number;
   now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  signal?: AbortSignal;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Lambda MicroVM operation budget aborted');
+}
+
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => new Promise(
+  (resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortReason(signal));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortReason(signal as AbortSignal));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  },
+);
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
 
 /**
  * Reserves one control-plane call slot for `op`, waiting across second
@@ -56,10 +83,12 @@ export async function acquireOpBudget(op: ThrottledOp, options: OpBudgetOptions)
   const deadline = now() + options.budgetMs;
 
   for (;;) {
+    throwIfAborted(options.signal);
     const poisoned = await redis.pttl(`${POISON_PREFIX}${op}`);
+    throwIfAborted(options.signal);
     if (poisoned > 0) {
       if (now() + poisoned > deadline) throw new MicrovmOpThrottledError(op, options.budgetMs);
-      await sleep(poisoned);
+      await sleep(poisoned, options.signal);
       continue;
     }
 
@@ -67,8 +96,10 @@ export async function acquireOpBudget(op: ThrottledOp, options: OpBudgetOptions)
     const second = Math.floor(nowMs / 1_000);
     const key = `${BUCKET_PREFIX}${op}:${second}`;
     const count = await redis.incr(key);
+    throwIfAborted(options.signal);
     if (count === 1) {
       await redis.pexpire(key, BUCKET_TTL_MS);
+      throwIfAborted(options.signal);
     }
     if (count <= options.limitPerSecond) return;
 
@@ -76,7 +107,7 @@ export async function acquireOpBudget(op: ThrottledOp, options: OpBudgetOptions)
     const jitter = Math.floor(Math.random() * 100);
     const waitMs = nextSecondMs + jitter;
     if (nowMs + waitMs > deadline) throw new MicrovmOpThrottledError(op, options.budgetMs);
-    await sleep(waitMs);
+    await sleep(waitMs, options.signal);
   }
 }
 

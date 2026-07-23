@@ -4,7 +4,12 @@ import type { TFile } from '../job';
 import { getLatestRuntimeMatchingLanguageVersion, getRuntimes } from '../runtime';
 import { logger } from '../logger';
 import { config } from '../config';
-import { Job, ValidationError } from '../job';
+import {
+  Job,
+  SessionWorkspaceDirtyError,
+  ValidationError,
+  validateFilePath,
+} from '../job';
 import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError, type ExecutionManifestClaims } from '../execution-manifest';
 import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 import { EGRESS_GRANT_HEADER } from '../egress';
@@ -19,10 +24,104 @@ import {
   parseSessionBindingFromHeader,
 } from '../session-workspace';
 import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
-import { hasCachedInput, pruneInputCache, storeCachedInputs } from '../session-inputs';
+import { ensureToolCallSocketProxyReady } from '../tool-call-socket-process';
+import {
+  SESSION_INPUT_CACHE_MAX_OBJECTS,
+  hasCachedInput,
+  pruneInputCache,
+  storeCachedInputs,
+} from '../session-inputs';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
+
+function existingDestinationConflictMessage(existing: string, destination: string): string {
+  return existing === destination
+    ? `files contains duplicate destination "${destination}"`
+    : `files contains conflicting destinations "${existing}" and "${destination}"`;
+}
+
+export function validateExecuteFiles(files: TFile[]): void {
+  if (files.length > config.max_input_files) {
+    throw { message: `files cannot contain more than ${config.max_input_files} destinations` };
+  }
+  const destinations = new Set<string>();
+  for (const [i, value] of files.entries()) {
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+      throw { message: `files[${i}] must be an object` };
+    }
+    const file = value as TFile;
+    const inline = typeof file.content === 'string';
+    const byRef = typeof file.id === 'string' && file.id.length > 0;
+    if (inline === byRef) {
+      throw {
+        message: `files[${i}] must contain exactly one of non-empty id or string content`,
+      };
+    }
+    if (file.id !== undefined && !byRef) {
+      throw { message: `files[${i}].id must be a non-empty string if provided` };
+    }
+    if (byRef) {
+      if (typeof file.storage_session_id !== 'string' || file.storage_session_id.length === 0) {
+        throw { message: `files[${i}].storage_session_id is required as a non-empty string for file refs` };
+      }
+    } else if (file.storage_session_id !== undefined || file.input_cache_key !== undefined) {
+      throw {
+        message: `files[${i}] inline content cannot include storage_session_id or input_cache_key`,
+      };
+    }
+    if (file.name !== undefined && typeof file.name !== 'string') {
+      throw { message: `files[${i}].name must be a string if provided` };
+    }
+    if (
+      file.encoding !== undefined
+      && !(['base64', 'hex', 'utf8'] as const).includes(file.encoding)
+    ) {
+      throw { message: `files[${i}].encoding must be base64, hex, or utf8 if provided` };
+    }
+    if (file.entity_id !== undefined && typeof file.entity_id !== 'string') {
+      throw { message: `files[${i}].entity_id must be a string if provided` };
+    }
+    if (
+      file.input_cache_key !== undefined &&
+      (
+        typeof file.input_cache_key !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(file.input_cache_key)
+      )
+    ) {
+      throw { message: `files[${i}].input_cache_key must be a 64-character lowercase hex digest` };
+    }
+    const destination = file.name || `file${i}.code`;
+    try {
+      validateFilePath(destination, '/tmp/codeapi-request-validation');
+    } catch (error) {
+      throw {
+        message: error instanceof Error
+          ? `files[${i}].name is invalid: ${error.message}`
+          : `files[${i}].name is invalid`,
+      };
+    }
+    const conflict = [...destinations].find(
+      existing =>
+        existing === destination ||
+        existing.startsWith(`${destination}/`) ||
+        destination.startsWith(`${existing}/`),
+    );
+    if (conflict) {
+      throw { message: existingDestinationConflictMessage(conflict, destination) };
+    }
+    destinations.add(destination);
+  }
+}
+
+export function validateExecuteArguments(args: unknown, stdin: unknown): void {
+  if (args !== undefined && (!Array.isArray(args) || args.some(value => typeof value !== 'string'))) {
+    throw { message: 'args must be an array of strings if provided' };
+  }
+  if (stdin !== undefined && typeof stdin !== 'string') {
+    throw { message: 'stdin must be a string if provided' };
+  }
+}
 
 export interface ExecuteRequestBody {
   /** Top-level execution session id (one sandbox `/exec` invocation).
@@ -160,11 +259,8 @@ function getJob(
   if (body.tool_call_socket !== undefined && typeof body.tool_call_socket !== 'boolean') {
     throw { message: 'tool_call_socket must be a boolean if specified' };
   }
-  for (const [i, file] of files.entries()) {
-    if (typeof file.content !== 'string' && typeof file.id !== 'string') {
-      throw { message: `files[${i}].content is required as a string if no id is provided` };
-    }
-  }
+  validateExecuteArguments(args, stdin);
+  validateExecuteFiles(files);
 
   const rt = getLatestRuntimeMatchingLanguageVersion(language, version);
   if (!rt) {
@@ -196,12 +292,12 @@ function getJob(
     if (!session) {
       throw { status: 409, message: 'Runner is bound to a different runtime session' };
     }
-    /* A delivery that failed mid-commit left the workspace matching neither
-     * the checkpoint nor the request. Refuse every execute until the control
-     * plane recycles this VM and restores the last good checkpoint. */
-    const quarantined = session.quarantineReason;
-    if (quarantined) {
-      throw { status: 409, message: `Session workspace is quarantined: ${quarantined}` };
+    if (session.dirtyReason) {
+      throw {
+        status: 409,
+        code: 'session_workspace_dirty',
+        message: 'Session workspace must be restored before another execute',
+      };
     }
   }
 
@@ -296,6 +392,7 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
   let activeExecution = false;
   let metricsLanguage = 'unknown';
   let metricsOutcome: Parameters<typeof recordSandboxExecution>[0]['outcome'] = 'execution_error';
+  let primeCompleted = false;
 
   const cleanupHandler = async (): Promise<void> => {
     if (!job || cleanedUp) return;
@@ -381,15 +478,23 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
        * own status so the control plane can tell "bad request" from "this VM
        * belongs to another session, recycle me". */
       const status = (error as { status?: unknown })?.status;
+      const code = (error as { code?: unknown })?.code;
       return res
         .status(typeof status === 'number' ? status : 400)
-        .json({ message: message || 'Bad request' });
+        .json({
+          ...(typeof code === 'string' ? { error: code } : {}),
+          message: message || 'Bad request',
+        });
     }
 
     try {
+      if (toolCallSocketEnabled) {
+        await ensureToolCallSocketProxyReady();
+      }
       await withSpan('codeapi.sandbox.prime', {
         'codeapi.language': job.runtime.language,
       }, () => job!.prime());
+      primeCompleted = true;
       const result = await withSpan('codeapi.sandbox.run', {
         'codeapi.language': job.runtime.language,
       }, () => job!.execute());
@@ -431,6 +536,22 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       metricsOutcome = 'success';
       return res.status(200).json(result);
     } catch (error) {
+      if (primeCompleted && job?.markSessionDirty('execution failed after input priming')) {
+        metricsOutcome = 'execution_error';
+        logger.error({ job: job.uuid, err: error }, 'Session execution left workspace state unknown');
+        return res.status(409).json({
+          error: 'session_workspace_dirty',
+          message: 'Session workspace must be restored before another execute',
+        });
+      }
+      if (error instanceof SessionWorkspaceDirtyError) {
+        metricsOutcome = 'execution_error';
+        logger.error({ job: job?.uuid, err: error }, 'Session input priming left a partial workspace');
+        return res.status(409).json({
+          error: error.code,
+          message: error.message,
+        });
+      }
       if (error instanceof ValidationError) {
         metricsOutcome = 'validation_error';
         return res.status(400).json({ message: error.message });
@@ -527,42 +648,93 @@ router.post('/session/restore', (req: Request, res: Response, next: NextFunction
  * These are deliberately NOT session-scoped: the cache they fill is keyed by
  * (storage session, object id) and lives outside any workspace, so the same
  * mechanism serves stateful sessions and stateless one-shots alike. The
- * workspace is still only ever written by the normal priming path.
+ * workspace is still only ever written by the normal priming path. The routes
+ * are nevertheless Lambda-runner-only: Lambda's Runtime API supplies the
+ * external bearer boundary, while ordinary shared runners must not expose an
+ * unauthenticated cache-write surface.
  */
+function requireSessionInputDeliveryTarget(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Response | void {
+  if (!config.session_workspace_enabled) {
+    return res.status(404).json({ message: 'Not Found' });
+  }
+  next();
+}
+
 /* No global body parser exists (see index.ts), so the probe installs its own.
  * A ref list is tiny — a few hundred bytes per entry — but bound it anyway. */
-router.post('/session/inputs/probe', express.json({ limit: '1mb' }), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const refs = (req.body as { refs?: Array<{ storage_session_id?: unknown; id?: unknown }> })?.refs;
-    if (!Array.isArray(refs)) {
-      return res.status(400).json({ message: 'refs must be an array' });
-    }
-    const missing: Array<{ storage_session_id: string; id: string }> = [];
-    for (const ref of refs) {
-      if (typeof ref?.storage_session_id !== 'string' || typeof ref?.id !== 'string') {
-        return res.status(400).json({ message: 'each ref requires storage_session_id and id' });
+router.post(
+  '/session/inputs/probe',
+  requireSessionInputDeliveryTarget,
+  express.json({ limit: '1mb' }),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const refs = (req.body as { refs?: Array<{ cache_key?: unknown }> })?.refs;
+      if (!Array.isArray(refs)) {
+        return res.status(400).json({ message: 'refs must be an array' });
       }
-      if (!(await hasCachedInput(ref.storage_session_id, ref.id))) {
-        missing.push({ storage_session_id: ref.storage_session_id, id: ref.id });
+      if (refs.length > SESSION_INPUT_CACHE_MAX_OBJECTS) {
+        return res.status(400).json({
+          message: `refs exceeds the ${SESSION_INPUT_CACHE_MAX_OBJECTS}-object limit`,
+        });
       }
+      const missing: Array<{ cache_key: string }> = [];
+      const seen = new Set<string>();
+      for (const ref of refs) {
+        if (typeof ref?.cache_key !== 'string' || !/^[0-9a-f]{64}$/.test(ref.cache_key)) {
+          return res.status(400).json({ message: 'each ref requires a valid cache_key' });
+        }
+        if (seen.has(ref.cache_key)) {
+          return res.status(400).json({ message: 'refs contains a duplicate cache_key' });
+        }
+        seen.add(ref.cache_key);
+        if (!(await hasCachedInput('', '', ref.cache_key))) {
+          missing.push({ cache_key: ref.cache_key });
+        }
+      }
+      return res.status(200).json({ missing });
+    } catch (error) {
+      return next(error);
     }
-    return res.status(200).json({ missing });
-  } catch (error) {
-    return next(error);
-  }
-});
+  },
+);
 
-router.post('/session/inputs', async (req: Request, res: Response) => {
-  try {
-    const stored = await storeCachedInputs(req);
-    await pruneInputCache(config.input_cache_max_bytes).catch((err) => {
-      logger.warn({ err }, 'Failed to prune session input cache');
-    });
-    return res.status(200).json({ stored });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to store session inputs');
-    return res.status(500).json({ message: 'session input delivery failed' });
-  }
-});
+router.post(
+  '/session/inputs',
+  requireSessionInputDeliveryTarget,
+  async (req: Request, res: Response) => {
+    try {
+      const expandedHeader = req.get('x-codeapi-input-expanded-bytes');
+      let expectedBytes: number | undefined;
+      if (expandedHeader !== undefined) {
+        if (!/^(0|[1-9][0-9]*)$/.test(expandedHeader)) {
+          return res.status(400).json({ message: 'invalid expanded input byte count' });
+        }
+        expectedBytes = Number(expandedHeader);
+        if (
+          !Number.isSafeInteger(expectedBytes)
+          || expectedBytes > config.input_cache_max_bytes
+        ) {
+          return res.status(400).json({ message: 'invalid expanded input byte count' });
+        }
+      }
+      const stored = await storeCachedInputs(
+        req,
+        config.input_cache_max_bytes,
+        expectedBytes,
+      );
+      await pruneInputCache(config.input_cache_max_bytes).catch((err) => {
+        logger.warn({ err }, 'Failed to prune session input cache');
+      });
+      return res.status(200).json({ stored });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to store session inputs');
+      return res.status(500).json({ message: 'session input delivery failed' });
+    }
+  },
+);
 
 export default router;

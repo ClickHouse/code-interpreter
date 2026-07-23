@@ -40,16 +40,14 @@ const ref = (n: number | string) => ({
   id: `f${n}`,
   storage_session_id: 's1',
   name: `file-${n}.txt`,
+  cache_key: inputCacheKey('s1', `f${n}`),
 });
 
 /** Lists member names of a produced batch. */
-async function membersOf(data: Buffer): Promise<string[]> {
+async function membersOf(archive: string): Promise<string[]> {
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'batch-check-'));
   try {
-    const archive = path.join(tmp, 'b.tgz');
-    await fsp.writeFile(archive, data);
     spawnSync('tar', ['-xzf', archive, '-C', tmp]);
-    await fsp.rm(archive);
     return (await fsp.readdir(tmp)).sort();
   } finally {
     await fsp.rm(tmp, { recursive: true, force: true });
@@ -88,26 +86,40 @@ describe('sessionFileRefs', () => {
 describe('buildInputBatch', () => {
   test('packs digest-named members with metadata the runner can serve', async () => {
     const batch = await buildInputBatch([ref(1)], opts());
-    expect(batch?.count).toBe(1);
-    const key = inputCacheKey('s1', 'f1');
-    expect(await membersOf(batch!.data)).toEqual([key, `${key}.json`].sort());
+    try {
+      expect(batch?.count).toBe(1);
+      expect(batch?.expandedSize).toBe(
+        10 + Buffer.byteLength(JSON.stringify({ readOnly: false })),
+      );
+      const key = inputCacheKey('s1', 'f1');
+      expect(await membersOf(batch!.path)).toEqual([key, `${key}.json`].sort());
+    } finally {
+      await batch?.cleanup();
+    }
   });
 
   test('carries only object-level metadata (read-only), never a name', async () => {
     const batch = await buildInputBatch(
-      [{ id: 'ro', storage_session_id: 's1', name: 'skill.md' }],
+      [{
+        id: 'ro',
+        storage_session_id: 's1',
+        name: 'skill.md',
+        cache_key: inputCacheKey('s1', 'ro'),
+      }],
       opts(),
     );
     const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'meta-check-'));
-    const archive = path.join(tmp, 'b.tgz');
-    await fsp.writeFile(archive, batch!.data);
-    spawnSync('tar', ['-xzf', archive, '-C', tmp]);
-    const meta = JSON.parse(
-      await fsp.readFile(path.join(tmp, `${inputCacheKey('s1', 'ro')}.json`), 'utf8'),
-    );
-    await fsp.rm(tmp, { recursive: true, force: true });
-    /* A name here would override every requesting ref's destination. */
-    expect(meta).toEqual({ readOnly: true });
+    try {
+      spawnSync('tar', ['-xzf', batch!.path, '-C', tmp]);
+      const meta = JSON.parse(
+        await fsp.readFile(path.join(tmp, `${inputCacheKey('s1', 'ro')}.json`), 'utf8'),
+      );
+      /* A name here would override every requesting ref's destination. */
+      expect(meta).toEqual({ readOnly: true });
+    } finally {
+      await batch?.cleanup();
+      await fsp.rm(tmp, { recursive: true, force: true });
+    }
   });
 
   test('rejects deliveries above the object-count cap before any fetch', async () => {

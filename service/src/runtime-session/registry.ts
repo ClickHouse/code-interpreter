@@ -11,7 +11,6 @@ import logger from '../logger';
  *   rtsx:sess:<id>   JSON RuntimeSessionRecord            (TTL: record TTL)
  *   rtsx:lock:<id>   per-session mutex token               (SET NX PX)
  *   rtsx:gen:<id>    monotonic generation counter (INCR)   (TTL: record TTL)
- *   rtsx:active      zset of session ids by last_seen_at   (sweeper-pruned)
  *
  * Fencing: every record mutation runs through a Lua script that checks the
  * caller still holds the session lock. A `false` return means the caller was
@@ -31,11 +30,9 @@ export interface RuntimeSessionRecord {
   port?: number;
   image_arn?: string;
   image_version?: string;
-  /** Fingerprint of the ingress/egress network connector ARNs the VM launched
-   *  with — connectors are only applied at RunMicrovm, so a config change must
-   *  make an existing session non-reusable (else a tightened egress policy is
-   *  bypassed by warm reuse). */
-  connectors?: string;
+  /** Fingerprint of every immutable launch/security input. A deploy that
+   * changes one must not reuse a VM launched under the old policy. */
+  launch_fingerprint?: string;
   state: RuntimeSessionState;
   generation: number;
   launched_at?: number;
@@ -44,25 +41,12 @@ export interface RuntimeSessionRecord {
   workspace_checkpoint?: string;
   checkpointed_at?: number;
   last_error?: string;
-  /** Writable by-ref inputs (`<storage_session_id>/<id>`) already delivered
-   *  into the session workspace. Push delivery skips these so a later turn
-   *  re-sending the same ref cannot overwrite in-place modifications the
-   *  sandbox made to the file (read-only refs are never recorded — they are
-   *  re-delivered every exec, mirroring the pull model's re-download rule).
-   *  Only meaningful for the live workspace: after a relaunch the list is
-   *  trusted solely when the restored checkpoint post-dates `delivered_at`,
-   *  since a budget-skipped checkpoint would not contain the delivered files. */
-  delivered_files?: string[];
-  /** When `delivered_files` last changed — compared against `checkpointed_at`
-   *  on restore to decide whether the checkpoint captured the deliveries. */
-  delivered_at?: number;
 }
 
 const SESS_PREFIX = 'rtsx:sess:';
 const LOCK_PREFIX = 'rtsx:lock:';
 const GEN_PREFIX = 'rtsx:gen:';
 const CKPT_SEQ_PREFIX = 'rtsx:ckptseq:';
-const ACTIVE_ZSET = 'rtsx:active';
 
 /** The session lock is held across the WHOLE `executeSession` critical path
  * (launch throttle, readiness/restore, execute, post-run checkpoint), which sums
@@ -96,9 +80,12 @@ type RedisWithScripts = Redis & {
   removeRuntimeSessionScript(
     sessKey: string,
     lockKey: string,
-    activeKey: string,
     token: string,
-    member: string,
+  ): Promise<number>;
+  allocateCheckpointSequenceScript(
+    sequenceKey: string,
+    retainedMax: string,
+    ttlSeconds: string,
   ): Promise<number>;
 };
 
@@ -125,14 +112,22 @@ else
 end`,
   });
   client.defineCommand('removeRuntimeSessionScript', {
-    numberOfKeys: 3,
+    numberOfKeys: 2,
     lua: `if redis.call('get', KEYS[2]) == ARGV[1] then
   redis.call('del', KEYS[1])
-  redis.call('zrem', KEYS[3], ARGV[2])
   return 1
 else
   return 0
 end`,
+  });
+  client.defineCommand('allocateCheckpointSequenceScript', {
+    numberOfKeys: 1,
+    lua: `local current = tonumber(redis.call('get', KEYS[1]) or '0')
+local retained = tonumber(ARGV[1])
+if retained > current then current = retained end
+local sequence = current + 1
+redis.call('set', KEYS[1], tostring(sequence), 'EX', ARGV[2])
+return sequence`,
   });
   tagged[SCRIPTS_REGISTERED] = true;
   return client as RedisWithScripts;
@@ -159,27 +154,60 @@ export async function acquireRuntimeSessionLock(
 }
 
 /** Polls for the session mutex; returns null once `waitMs` is exhausted.
- *  Callers decide mode policy (affinity ⇒ stateless fallback, strict ⇒ 409). */
+ *  Stateful callers surface contention as HTTP 409 instead of executing cold. */
 export async function waitForRuntimeSessionLock(
   runtimeSessionId: string,
-  args: { waitMs: number; pollMs?: number; ttlMs?: number },
+  args: { waitMs: number; pollMs?: number; ttlMs?: number; signal?: AbortSignal },
 ): Promise<string | null> {
   const pollMs = args.pollMs ?? 250;
   const deadline = Date.now() + args.waitMs;
   for (;;) {
+    args.signal?.throwIfAborted();
     const token = await acquireRuntimeSessionLock(runtimeSessionId, args.ttlMs);
+    if (args.signal?.aborted) {
+      if (token != null) await releaseRuntimeSessionLock(runtimeSessionId, token);
+      args.signal.throwIfAborted();
+    }
     if (token != null) return token;
     if (Date.now() + pollMs > deadline) return null;
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        args.signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, pollMs);
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(args.signal?.reason instanceof Error
+          ? args.signal.reason
+          : new Error('Runtime session lock wait aborted'));
+      };
+      args.signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }
 
 export async function releaseRuntimeSessionLock(runtimeSessionId: string, token: string): Promise<void> {
-  try {
-    await redis.releaseRuntimeSessionLockScript(`${LOCK_PREFIX}${runtimeSessionId}`, token);
-  } catch (err) {
-    logger.warn('Failed to release runtime session lock', { runtimeSessionId, err });
+  const retryDelaysMs = [50, 200] as const;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    try {
+      await redis.releaseRuntimeSessionLockScript(`${LOCK_PREFIX}${runtimeSessionId}`, token);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < retryDelaysMs.length) {
+        await new Promise(resolve => setTimeout(resolve, retryDelaysMs[attempt]));
+      }
+    }
   }
+  /* Release runs from finally blocks. Do not mask either a successful execute
+   * or its primary error, but heal brief Redis failovers before accepting that
+   * the token-guarded lease must age out. The Lua release is idempotent, so a
+   * retry is safe even if Redis deleted the key but lost the first response. */
+  logger.warn('Failed to release runtime session lock after retries', {
+    runtimeSessionId,
+    err: lastError,
+  });
 }
 
 /** Fenced heartbeat: extend the lock's TTL only while we still hold the token.
@@ -252,51 +280,31 @@ export async function allocateRuntimeSessionGeneration(runtimeSessionId: string)
   return generation;
 }
 
-/** Monotonic per-checkpoint sequence via INCR. Bounded by the record TTL, so it
- *  can reset after a long idle; the caller re-seeds it above any retained
- *  objects (see reseedCheckpointSequence). A pure counter — no wall clock — so
- *  ordering is unaffected by cross-pod clock skew. */
-export async function allocateCheckpointSequence(runtimeSessionId: string): Promise<number> {
+/** Atomically reserves a monotonic checkpoint sequence above both the Redis
+ *  counter and the highest object retained in durable storage. Combining the
+ *  high-water reseed and increment in one Lua operation is required for
+ *  fencing: a stale holder that resumes after another worker acquired the
+ *  session lock can consume a distinct sequence, but can never reset the
+ *  counter and overwrite the newer holder's immutable object key. */
+export async function allocateCheckpointSequence(
+  runtimeSessionId: string,
+  retainedMax = 0,
+): Promise<number> {
   const key = `${CKPT_SEQ_PREFIX}${runtimeSessionId}`;
-  const sequence = await redis.incr(key);
-  await redis.expire(key, RUNTIME_SESSION_RECORD_TTL_SECONDS);
-  return sequence;
+  return redis.allocateCheckpointSequenceScript(
+    key,
+    String(retainedMax),
+    String(RUNTIME_SESSION_RECORD_TTL_SECONDS),
+  );
 }
 
-/** Force the checkpoint counter up to `value` after a TTL reset dropped it below
- *  the sequences still retained in the object store, so the next INCR continues
- *  above them and restore never picks a stale higher-sequence object. */
-export async function reseedCheckpointSequence(runtimeSessionId: string, value: number): Promise<void> {
-  const key = `${CKPT_SEQ_PREFIX}${runtimeSessionId}`;
-  await redis.set(key, String(value), 'EX', RUNTIME_SESSION_RECORD_TTL_SECONDS);
-}
-
-export async function touchRuntimeSessionActive(runtimeSessionId: string, lastSeenAtMs: number): Promise<void> {
-  await redis.zadd(ACTIVE_ZSET, lastSeenAtMs, runtimeSessionId);
-}
-
-/** Fenced removal: deletes the record and active-zset member while the caller
- *  holds the mutex. Returns false when fenced. */
+/** Fenced removal: deletes the record while the caller holds the mutex.
+ *  Returns false when fenced. */
 export async function removeRuntimeSession(runtimeSessionId: string, lockToken: string): Promise<boolean> {
   const result = await redis.removeRuntimeSessionScript(
     `${SESS_PREFIX}${runtimeSessionId}`,
     `${LOCK_PREFIX}${runtimeSessionId}`,
-    ACTIVE_ZSET,
     lockToken,
-    runtimeSessionId,
   );
   return result === 1;
-}
-
-/** Unfenced zset repair for sweeper use (record already gone). */
-export async function forgetRuntimeSessionActive(runtimeSessionId: string): Promise<void> {
-  await redis.zrem(ACTIVE_ZSET, runtimeSessionId);
-}
-
-export async function listIdleRuntimeSessions(idleBeforeMs: number, limit = 100): Promise<string[]> {
-  return redis.zrangebyscore(ACTIVE_ZSET, '-inf', idleBeforeMs, 'LIMIT', 0, limit);
-}
-
-export async function countActiveRuntimeSessions(): Promise<number> {
-  return redis.zcard(ACTIVE_ZSET);
 }

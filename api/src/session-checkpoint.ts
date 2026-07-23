@@ -1,10 +1,11 @@
 import { spawn } from 'child_process';
-import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as fsp from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
 import type { Request, Response } from 'express';
+import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
+import { config } from './config';
 import { logger } from './logger';
 import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID } from './workspace-isolation';
 import type { SessionMetaSnapshot, SessionWorkspace } from './session-workspace';
@@ -24,11 +25,56 @@ import { SESSION_META_FILE, SESSION_META_MARKER, getBoundSessionWorkspace } from
  */
 
 const CHECKPOINT_CONTENT_TYPE = 'application/x-gtar';
+/** Runner-only top-level archive member. It is a sibling of `session/`, never
+ * a path inside the user workspace, so user code cannot collide with it. Keep
+ * this as ONE top-level file: pre-control-namespace restores use
+ * `--strip-components=1`, which safely skips a one-component member but would
+ * extract `control-dir/file` as a user-visible `file` during rollback. */
+const CHECKPOINT_CONTROL_FILE = '.codeapi-checkpoint-control.v2.json';
+/** Primed-input state is correctness-critical: losing it can overwrite
+ * sandbox-modified inputs after restore. Keep the full control record whenever
+ * it fits this bounded parse budget. Only beyond the hard limit may expendable
+ * surfaced-output signatures be dropped; primed state is never discarded. */
+const CHECKPOINT_CONTROL_MAX_BYTES = 16 * 1024 * 1024;
 
 export class SessionCheckpointError extends Error {}
 
 function currentUid(): number | undefined {
   return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+/**
+ * Serializes best-effort control metadata without making an otherwise valid
+ * workspace impossible to checkpoint. Surfaced-output signatures are only a
+ * dedup optimization, so discard them first. Primed-input state protects
+ * sandbox edits from being overwritten after restore, so it is never silently
+ * discarded. An extreme session that exceeds the bounded metadata budget must
+ * fail its checkpoint instead of persisting a corrupt recovery point.
+ */
+function checkpointControlBytes(session: SessionWorkspace): Buffer {
+  const snapshot = session.snapshotMeta();
+  const encode = (meta: SessionMetaSnapshot): Buffer =>
+    Buffer.from(JSON.stringify({ marker: SESSION_META_MARKER, ...meta }));
+
+  const full = encode(snapshot);
+  if (full.length <= CHECKPOINT_CONTROL_MAX_BYTES) return full;
+
+  const withoutSurfaced = encode({ primed: snapshot.primed, surfaced: [] });
+  logger.warn(
+    {
+      fullBytes: full.length,
+      reducedBytes: withoutSurfaced.length,
+      maxBytes: CHECKPOINT_CONTROL_MAX_BYTES,
+    },
+    'Checkpoint control metadata is oversized; dropping surfaced-output state',
+  );
+  if (withoutSurfaced.length <= CHECKPOINT_CONTROL_MAX_BYTES) {
+    return withoutSurfaced;
+  }
+
+  throw new SessionCheckpointError(
+    `checkpoint primed-input metadata exceeds ${CHECKPOINT_CONTROL_MAX_BYTES} bytes`,
+  );
 }
 
 /** Streams `tar -czf -` of the session workspace to the response. */
@@ -38,48 +84,48 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     res.status(409).json({ message: 'No session workspace is bound' });
     return;
   }
-  const { dir } = await session.ownership();
+  if (session.dirtyReason) {
+    res.status(409).json({
+      error: 'session_workspace_dirty',
+      message: 'Session workspace must be restored before checkpointing',
+    });
+    return;
+  }
+  await session.ownership();
 
-  /* Carry the priming/output-diff state into the archive so a relaunched VM
-   * rebuilds it (see restoreSessionCheckpoint). Written under the held session
-   * lock, so no concurrent user code sees it, and removed once tar has read it.
-   * The path is a collision point:
-   *  - a prior exec's sandbox code can squat it as a symlink OR a directory
-   *    (attack — remove it; `recursive` clears a dir else the write fails
-   *    EISDIR, `force` ignores absence, and neither follows a symlink), or
-   *  - user code can legitimately create a regular file with this name (their
-   *    data — do NOT delete it; skip metadata persistence this turn so their
-   *    file tars as normal workspace content).
-   * We only ever remove/restore a sidecar we actually wrote. */
-  const metaPath = path.join(dir, SESSION_META_FILE);
-  const squat = await fsp.lstat(metaPath).catch(() => null);
-  let wroteSidecar = false;
-  if (squat?.isFile()) {
-    logger.warn('Session meta sidecar path holds a user file; skipping metadata persistence this checkpoint');
-  } else {
-    await fsp.rm(metaPath, { force: true, recursive: true });
+  /* Carry priming/output-diff state in a separate top-level archive member.
+   * The old format temporarily wrote SESSION_META_FILE into `/mnt/data`, which
+   * either deleted a symlink/directory with that user-visible name or skipped
+   * metadata for a legitimate regular file. A sibling archive member has no
+   * collision with any path user code can create and never mutates the live
+   * workspace. Restore still understands the legacy in-workspace sidecar. */
+  let controlStage: string | undefined;
+  try {
+    controlStage = await fsp.mkdtemp(path.join(os.tmpdir(), 'codeapi-checkpoint-control-'));
+    const controlBytes = checkpointControlBytes(session);
     await fsp.writeFile(
-      metaPath,
-      JSON.stringify({ marker: SESSION_META_MARKER, ...session.snapshotMeta() }),
+      path.join(controlStage, CHECKPOINT_CONTROL_FILE),
+      controlBytes,
       { flag: 'wx', mode: 0o600 },
     );
-    wroteSidecar = true;
-  }
 
-  res.status(200);
-  res.setHeader('Content-Type', CHECKPOINT_CONTENT_TYPE);
-  const tar = spawn('tar', ['-czf', '-', '-C', SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'checkpoint tar'));
-  try {
+    res.status(200);
+    res.setHeader('Content-Type', CHECKPOINT_CONTENT_TYPE);
+    const tar = spawn('tar', [
+      '-czf', '-',
+      '-C', SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID,
+      '-C', controlStage, CHECKPOINT_CONTROL_FILE,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    });
+    tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'checkpoint tar'));
     /* Register the 'close' listener BEFORE awaiting the pipeline: for a small
      * workspace tar can exit and emit 'close' before pipeline resolves, and a
-     * listener attached only afterward would miss it and hang here forever —
-     * the finally never runs, leaving the runner sidecar in the workspace for
-     * the next /execute to mis-scan as user output. The 'error' listener turns
-     * a spawn failure (e.g. tar missing from PATH) into a rejected promise
-     * instead of an unhandled ChildProcess 'error' crashing the runner. */
+     * listener attached only afterward would miss it and hang here forever.
+     * The 'error' listener turns a spawn failure (e.g. tar missing from PATH)
+     * into a rejected promise instead of an unhandled ChildProcess 'error'
+     * crashing the runner. */
     const closed: Promise<number> = new Promise((resolve, reject) => {
       tar.on('close', resolve);
       tar.on('error', reject);
@@ -97,34 +143,82 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
     if (!res.headersSent) res.status(500).json({ message: 'checkpoint failed' });
     else res.destroy();
   } finally {
-    if (wroteSidecar) await fsp.rm(metaPath, { force: true }).catch(() => {});
+    if (controlStage) {
+      await fsp.rm(controlStage, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
-/** Extracts a `tar.gz` from the request body into the session workspace and
- *  re-owns it to the session's pinned UID. */
-export async function restoreSessionCheckpoint(req: Request, res: Response): Promise<void> {
+export interface SessionCheckpointOwnershipOps {
+  lchown(target: string, uid: number, gid: number): Promise<void>;
+  chown(target: string, uid: number, gid: number): Promise<void>;
+}
+
+export interface SessionCheckpointRestoreOptions {
+  /** Test seam for deterministic ownership-failure coverage. */
+  ownershipOps?: SessionCheckpointOwnershipOps;
+  /** Non-root local development cannot chown to the compatibility sandbox UID.
+   * Production hardened/per-job-UID mode never enables this fallback. */
+  allowUnprivilegedOwnershipFallback?: boolean;
+}
+
+const DEFAULT_OWNERSHIP_OPS: SessionCheckpointOwnershipOps = {
+  lchown: (target, uid, gid) => fsp.lchown(target, uid, gid),
+  chown: (target, uid, gid) => fsp.chown(target, uid, gid),
+};
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
+function checkpointUploadLimit(maxBytes: number): Transform {
+  let received = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      callback(
+        received > maxBytes
+          ? new SessionCheckpointError(`checkpoint upload exceeds ${maxBytes} bytes`)
+          : null,
+        chunk,
+      );
+    },
+  });
+}
+
+/** Extracts a `tar.gz` into a staging tree, validates its allowed top-level
+ * members, re-owns the workspace, then replaces the live session directory.
+ * Staging keeps a corrupt archive or ownership failure from ever becoming an
+ * executable workspace. */
+export async function restoreSessionCheckpoint(
+  req: Request,
+  res: Response,
+  options: SessionCheckpointRestoreOptions = {},
+): Promise<void> {
   const session = getBoundSessionWorkspace();
   if (!session) {
     res.status(409).json({ message: 'No session workspace is bound' });
     return;
   }
   const { dir, uid, gid } = await session.ownership();
-
-  /* Start from a clean workspace so a restore is a full replace, not a merge. */
-  await fsp.rm(dir, { recursive: true, force: true });
-  await fsp.mkdir(dir, { recursive: true });
-
-  /* Archives are created with relative `session/...` members (see the create
-   * side). Strip that leading component and extract straight into the session
-   * `dir`, so a poisoned archive member (`../x`, `ws_other/x`, `rootfile`) can
-   * never escape the workspace into shared runner space — every member lands
-   * under `dir`. Production hardening: verify/scan the archive before trusting a
-   * restore from shared storage. */
-  const tar = spawn('tar', ['-xzf', '-', '--strip-components=1', '-C', dir], {
+  const restoreStage = await fsp.mkdtemp(
+    path.join(SANDBOX_WORKSPACE_ROOT, '.session-restore-'),
+  );
+  const restoredWorkspace = path.join(restoreStage, SESSION_WORKSPACE_ID);
+  const restoredControl = path.join(restoreStage, CHECKPOINT_CONTROL_FILE);
+  const tar = spawn('tar', ['-xzf', '-', '-C', restoreStage], {
     stdio: ['pipe', 'ignore', 'pipe'],
+    env: { ...process.env, COPYFILE_DISABLE: '1' },
   });
   tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'restore tar'));
+  const closed: Promise<number> = new Promise((resolve, reject) => {
+    tar.on('close', resolve);
+    tar.on('error', reject);
+  });
+  /* Observe immediately: a spawn failure may reject the input pipeline first. */
+  closed.catch(() => {});
   try {
     /* Register the 'close' listener before awaiting the pipeline (see the create
      * side): a small upload can finish and 'close' can fire before pipeline
@@ -132,43 +226,136 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
      * 200 — the control plane would then hit the restore timeout and recycle a
      * freshly-launched VM even though the archive was valid. 'error' guards the
      * spawn-failure case (see the create side). */
-    const closed: Promise<number> = new Promise((resolve, reject) => {
-      tar.on('close', resolve);
-      tar.on('error', reject);
-    });
-    /* Observe the rejection immediately: when `tar` fails to spawn, `pipeline`
-     * below rejects first and we never reach `await closed` — an unobserved
-     * rejection would then take the whole runner down after we already
-     * answered 500. The later `await closed` still sees the same rejection. */
-    closed.catch(() => {});
-    await pipeline(req, tar.stdin);
+    await pipeline(req, checkpointUploadLimit(config.checkpoint_max_bytes), tar.stdin);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
-    await applyRestoredMeta(session, dir);
-    await chownRecursive(dir, uid, gid);
+
+    const topLevel = await fsp.readdir(restoreStage, { withFileTypes: true });
+    const allowed = new Set([SESSION_WORKSPACE_ID, CHECKPOINT_CONTROL_FILE]);
+    const unexpected = topLevel.find(entry => !allowed.has(entry.name));
+    if (unexpected) {
+      throw new SessionCheckpointError(
+        `checkpoint contains unexpected top-level member: ${unexpected.name}`,
+      );
+    }
+    const workspaceStat = await fsp.lstat(restoredWorkspace).catch(() => null);
+    if (!workspaceStat?.isDirectory() || workspaceStat.isSymbolicLink()) {
+      throw new SessionCheckpointError('checkpoint session workspace is not a real directory');
+    }
+    const controlStat = await fsp.lstat(restoredControl).catch(() => null);
+    if (controlStat && (!controlStat.isFile() || controlStat.isSymbolicLink())) {
+      throw new SessionCheckpointError('checkpoint control metadata is not a regular file');
+    }
+
+    await applyRestoredMeta(
+      session,
+      restoredWorkspace,
+      controlStat ? restoredControl : undefined,
+    );
+    const runnerUid = currentUid();
+    const allowUnprivilegedFallback =
+      options.allowUnprivilegedOwnershipFallback
+      ?? (
+        runnerUid !== undefined
+        && runnerUid !== 0
+        && !config.hardened_sandbox_mode
+        && !config.per_job_uids
+      );
+    await chownRecursive(
+      restoredWorkspace,
+      uid,
+      gid,
+      options.ownershipOps ?? DEFAULT_OWNERSHIP_OPS,
+      allowUnprivilegedFallback,
+    );
+
+    /* Commit only after extraction, metadata validation and ownership all
+     * succeeded. There is no merge: the checkpoint is authoritative. */
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.rename(restoredWorkspace, dir);
     res.status(200).json({ status: 'restored', dir: path.basename(dir) });
   } catch (error) {
+    if (tar.exitCode === null && tar.signalCode === null) tar.kill('SIGKILL');
+    await closed.catch(() => {});
     logger.error({ err: error }, 'Failed to restore session checkpoint');
     /* A corrupt archive or cut-off upload can leave partially-extracted members
-     * behind. The control plane treats restore failure as non-fatal and runs the
-     * job anyway, so wipe the workspace to a clean slate — otherwise the job runs
-     * against a mix of stale checkpoint files instead of an empty workspace. */
+     * behind. Wipe the workspace to a clean slate before returning failure; the
+     * control plane then recycles this VM and refuses to execute against either
+     * a partial restore or an empty replacement workspace. */
     await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     await fsp.mkdir(dir, { recursive: true }).catch(() => {});
+    session.loadMeta({ primed: [], surfaced: [] });
+    session.markDirty('checkpoint restore failed');
     if (!res.headersSent) res.status(500).json({ message: 'restore failed' });
+  } finally {
+    await fsp.rm(restoreStage, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-/** Applies the restored priming/output-diff sidecar to the bound session and
- *  removes it from disk so user code never sees it. Absent (older checkpoint)
- *  or malformed metadata is non-fatal — the session just re-primes/re-surfaces
- *  as if warmth were lost. */
-async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promise<void> {
-  const metaPath = path.join(dir, SESSION_META_FILE);
+function isSessionMetaSnapshot(value: unknown): value is SessionMetaSnapshot {
+  if (value == null || typeof value !== 'object') return false;
+  const snapshot = value as SessionMetaSnapshot;
+  if (snapshot.marker !== SESSION_META_MARKER) return false;
+  if (!Array.isArray(snapshot.primed) || !Array.isArray(snapshot.surfaced)) return false;
+  const validPrimed = snapshot.primed.every(entry =>
+    Array.isArray(entry)
+    && entry.length === 2
+    && typeof entry[0] === 'string'
+    && entry[1] != null
+    && typeof entry[1] === 'object'
+    && typeof entry[1].id === 'string'
+    && typeof entry[1].readOnly === 'boolean'
+    && (entry[1].hash === undefined || typeof entry[1].hash === 'string'));
+  const validSurfaced = snapshot.surfaced.every(entry =>
+    Array.isArray(entry)
+    && entry.length === 2
+    && typeof entry[0] === 'string'
+    && typeof entry[1] === 'string');
+  return validPrimed && validSurfaced;
+}
+
+/** Applies runner control metadata. New checkpoints carry it outside
+ * `session/`; old checkpoints are read from the legacy in-workspace sidecar.
+ * Presence of a new control member is authoritative: invalid metadata rejects
+ * the restore, and a user file at the legacy name is never reinterpreted or
+ * deleted. */
+async function applyRestoredMeta(
+  session: SessionWorkspace,
+  workspaceDir: string,
+  controlPath?: string,
+): Promise<void> {
+  /* A restore fully replaces disk state, so in-memory state must also be a
+   * replace. Clear first; absent legacy metadata means cold priming/output-diff
+   * state, while invalid new-format control metadata fails the whole restore. */
+  session.loadMeta({ primed: [], surfaced: [] });
+  if (controlPath) {
+    const stat = await fsp.lstat(controlPath).catch(() => null);
+    if (!stat?.isFile() || stat.isSymbolicLink()) {
+      throw new SessionCheckpointError('checkpoint control metadata is not a regular file');
+    }
+    if (stat.size > CHECKPOINT_CONTROL_MAX_BYTES) {
+      throw new SessionCheckpointError(
+        `checkpoint control metadata exceeds ${CHECKPOINT_CONTROL_MAX_BYTES} bytes`,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await fsp.readFile(controlPath, 'utf8')) as unknown;
+    } catch {
+      throw new SessionCheckpointError('checkpoint control metadata is not valid JSON');
+    }
+    if (!isSessionMetaSnapshot(parsed)) {
+      throw new SessionCheckpointError('checkpoint control metadata is malformed or incompatible');
+    }
+    session.loadMeta(parsed);
+    return;
+  }
+
+  const metaPath = path.join(workspaceDir, SESSION_META_FILE);
   try {
-    /* Only trust a regular file: a restored archive is untrusted, so never
-     * follow a symlinked sidecar (it would read an arbitrary file into the
-     * loaded metadata). lstat does not follow the link. */
+    /* Backward compatibility for checkpoints created by the pre-control-
+     * namespace format. Only trust a runner-owned writable regular file:
+     * user-created and read-only-input collisions remain ordinary user data. */
     const stat = await fsp.lstat(metaPath).catch(() => null);
     if (!stat?.isFile()) return;
     const trustedOwner = currentUid();
@@ -178,13 +365,22 @@ async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promis
       logger.warn('Ignoring untrusted session meta sidecar from restored workspace');
       return;
     }
-    const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as SessionMetaSnapshot;
-    /* Require the runner-owned sidecar shape plus marker: a user file sharing
-     * the reserved name is never loaded as metadata nor deleted, even if it
-     * happens to contain primed/surfaced arrays. */
-    if (parsed?.marker === SESSION_META_MARKER
-      && Array.isArray(parsed?.primed) && Array.isArray(parsed?.surfaced)) {
+    const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as unknown;
+    if (isSessionMetaSnapshot(parsed)) {
       session.loadMeta(parsed);
+      await fsp.rm(metaPath, { force: true }).catch(() => {});
+    } else if (
+      typeof (parsed as { marker?: unknown })?.marker === 'string' &&
+      (parsed as { marker: string }).marker.startsWith('codeapi.session-meta.v')
+    ) {
+      /* This is a runner-owned sidecar from an incompatible pre-release image,
+       * not a user file. Never load it under the current schema and never leave
+       * it in the workspace to be surfaced as a generated artifact. Rollouts
+       * that change this marker must drain/recycle old development sessions. */
+      logger.warn(
+        { marker: (parsed as { marker: string }).marker, expected: SESSION_META_MARKER },
+        'Ignoring incompatible session checkpoint metadata',
+      );
       await fsp.rm(metaPath, { force: true }).catch(() => {});
     }
   } catch (error) {
@@ -192,20 +388,60 @@ async function applyRestoredMeta(session: SessionWorkspace, dir: string): Promis
   }
 }
 
-async function chownRecursive(dir: string, uid: number, gid: number): Promise<void> {
-  await fsp.lchown(dir, uid, gid).catch(() => {});
+async function applyOwnership(
+  operation: () => Promise<void>,
+  allowUnprivilegedFallback: boolean,
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    const code = errorCode(error);
+    if (allowUnprivilegedFallback && (code === 'EPERM' || code === 'EACCES')) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function chownRecursive(
+  dir: string,
+  uid: number,
+  gid: number,
+  ownershipOps: SessionCheckpointOwnershipOps,
+  allowUnprivilegedFallback: boolean,
+): Promise<void> {
+  await applyOwnership(
+    () => ownershipOps.lchown(dir, uid, gid),
+    allowUnprivilegedFallback,
+  );
   const entries = await fsp.readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     /* A restored checkpoint is untrusted content: never follow symlinks. A
      * `session/x -> /etc/passwd` entry would otherwise have `chown` re-own the
-     * target outside the workspace. `lchown` the link itself and never recurse
-     * through it (Dirent reports the link type, so `isDirectory()` is false). */
-    if (entry.isSymbolicLink()) {
-      await fsp.lchown(full, uid, gid).catch(() => {});
+     * target outside the workspace. Do not trust Dirent.d_type here because
+     * some filesystems report DT_UNKNOWN; lstat every member, lchown links, and
+     * never recurse through them. */
+    const stat = await fsp.lstat(full);
+    if (stat.isSymbolicLink()) {
+      await applyOwnership(
+        () => ownershipOps.lchown(full, uid, gid),
+        allowUnprivilegedFallback,
+      );
       continue;
     }
-    await fsp.chown(full, uid, gid).catch(() => {});
-    if (entry.isDirectory()) await chownRecursive(full, uid, gid);
+    await applyOwnership(
+      () => ownershipOps.chown(full, uid, gid),
+      allowUnprivilegedFallback,
+    );
+    if (stat.isDirectory()) {
+      await chownRecursive(
+        full,
+        uid,
+        gid,
+        ownershipOps,
+        allowUnprivilegedFallback,
+      );
+    }
   }
 }

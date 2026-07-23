@@ -157,6 +157,17 @@ export interface FileObject {
 }
 
 export type PayloadFile = { name: string; content: string };
+export type PayloadFileRef = {
+  id: string;
+  storage_session_id: string;
+  name: string;
+  /**
+   * Stable opaque identity for runner-local input caching. The worker derives
+   * it from the authorized raw ref before hardened egress replaces the raw
+   * identifiers with per-grant handles.
+   */
+  input_cache_key?: string;
+};
 
 export interface PayloadBody {
   language: string;
@@ -170,7 +181,7 @@ export interface PayloadBody {
    * are sessionKey-derivation inputs at the service entry, never
    * consumed by the sandbox, so they're intentionally not on this
    * shape. */
-  files: Array<PayloadFile | { id: string; storage_session_id: string; name: string }>;
+  files: Array<PayloadFile | PayloadFileRef>;
   /** Top-level execution session id (passed to sandbox to seed Job.uuid). */
   session_id?: string;
   /** Output storage session id/handle used for generated file uploads. */

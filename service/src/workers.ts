@@ -5,11 +5,12 @@ import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails, sandbo
 import { jobProcessingDuration, jobsCompleted, jobsFailed, activeJobs, workerRunning } from './metrics';
 import { Queues } from './enum';
 import { connection } from './queue';
-import { env } from './config';
+import { env, jobDeadlineAtMs } from './config';
 import { summarizeSandboxResponse, summarizeText } from './execution-log';
 import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgressGrant } from './egress-gateway-client';
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
+import { prepareInputDelivery } from './runtime-session/input-delivery';
 import { getSandboxBackend, SandboxBackendError } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
 import { withSpan, withTraceContext } from './telemetry';
@@ -39,12 +40,20 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
   activeJobs.inc({ language });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), env.JOB_TIMEOUT);
+  const deadlineAtMs = jobDeadlineAtMs(job.timestamp, env.JOB_TIMEOUT);
+  const remainingBudgetMs = Math.max(0, deadlineAtMs - Date.now());
+  const timer = remainingBudgetMs > 0
+    ? setTimeout(() => controller.abort(), remainingBudgetMs)
+    : undefined;
+  if (remainingBudgetMs === 0) controller.abort();
   let egressGrantId: string | undefined;
   let egressGrantTokenForRestore: string | undefined;
   let revokeReason = 'completed';
 
   try {
+    if (controller.signal.aborted) {
+      throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
+    }
     let sandboxPayload = payload;
     let executionManifestClaims = job.data.executionManifestClaims;
     let egressGrantToken = job.data.egressGrantToken;
@@ -66,8 +75,9 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         : undefined;
     }
 
+    const delivery = prepareInputDelivery(payload, sandboxPayload);
     const sandboxRequest = buildSandboxExecuteRequest({
-      payload: sandboxPayload,
+      payload: delivery.payload,
       egressGrantToken,
       executionManifestClaims,
       executionManifestPrivateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,
@@ -85,12 +95,17 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     }
 
     const responseRaw = await getSandboxBackend().execute(
-      { body: sandboxRequest.body, headers: sandboxRequest.headers },
+      {
+        body: sandboxRequest.body,
+        headers: sandboxRequest.headers,
+        inputDelivery: delivery.refs,
+      },
       {
         executionId: job.data.executionId ?? '',
         language,
         isSynthetic: isSyntheticJob,
         signal: controller.signal,
+        deadlineAtMs,
         tenantId: job.data.tenantId,
         canonicalUserId: job.data.canonicalUserId,
         runtimeSessionId: job.data.runtimeSessionId,
@@ -150,11 +165,13 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
     return result;
   } catch (error) {
-    revokeReason = isAbortError(error) ? 'timeout' : 'failed';
+    revokeReason = controller.signal.aborted || isAbortError(error) ? 'timeout' : 'failed';
     const errorDetails = getAxiosErrorDetails(error);
     logger.error('Error processing job', errorDetails);
 
-    if (error instanceof SandboxBackendError) {
+    if (controller.signal.aborted) {
+      throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
+    } else if (error instanceof SandboxBackendError) {
       throw new Error(`${error.code}: ${error.message}`);
     } else if (isAbortError(error)) {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
@@ -176,7 +193,7 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         logger.error('Failed to revoke egress grant', { grantId: egressGrantId, error: getAxiosErrorDetails(error) });
       });
     }
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     endTimer();
     activeJobs.dec({ language });
   }

@@ -86,4 +86,18 @@ describe('acquireOpBudget', () => {
     await mock.del('rtsx:tps:poison:run');
     await acquireOpBudget('run', { limitPerSecond: 4, budgetMs: 200, now: clock.now, sleep: clock.sleep });
   });
+
+  test('cancellation interrupts a real throttle wait immediately', async () => {
+    await poisonOpBucket('run', 60_000);
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(new Error('job deadline')), 10);
+
+    await expect(acquireOpBudget('run', {
+      limitPerSecond: 4,
+      budgetMs: 120_000,
+      signal: controller.signal,
+    })).rejects.toThrow('job deadline');
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
 });

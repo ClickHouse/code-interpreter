@@ -7,13 +7,18 @@ output "artifact_bucket" {
   value       = local.artifact_bucket
 }
 
+output "runner_ecr_repository_url" {
+  description = "Set as ECR_URI for scripts/build-lambda-microvm-artifact.sh. Null when private_ecr is false."
+  value       = local.runner_repository_url
+}
+
 output "checkpoint_bucket" {
   description = "S3 bucket for session checkpoints (CODEAPI_CHECKPOINT_BUCKET)."
   value       = aws_s3_bucket.checkpoint.id
 }
 
 output "build_role_arn" {
-  description = "Pass to create-microvm-image as --build-role-arn."
+  description = "Pass to create-microvm-image.ts as --build-role."
   value       = aws_iam_role.build.arn
 }
 
@@ -31,14 +36,18 @@ output "runtime_log_group" {
 }
 
 output "checkpoint_access_policy_arn" {
-  description = <<-EOT
-    IAM policy for checkpoint S3 access. NOTE: the checkpoint client reads static
-    MINIO_ACCESS_KEY/SECRET and does not yet load task-role/IRSA credentials, so
-    attaching this to a task role alone does not grant access today — use
-    create_checkpoint_access_user (static keys). This output is for when
-    IRSA-capable credential loading lands in the checkpoint client.
-  EOT
+  description = "Attach to the CodeAPI worker/task role for checkpoint S3 access."
   value       = aws_iam_policy.checkpoint_access.arn
+}
+
+output "worker_microvm_control_policy_arn" {
+  description = "Attach to the CodeAPI worker/task role for Run/Get/CreateToken/Terminate plus PassRole/PassNetworkConnector."
+  value       = aws_iam_policy.worker_microvm_control.arn
+}
+
+output "microvm_image_arn" {
+  description = "Expected image ARN for image_name; create-microvm-image.ts creates this resource."
+  value       = local.microvm_image_arn
 }
 
 output "checkpoint_access_key_id" {

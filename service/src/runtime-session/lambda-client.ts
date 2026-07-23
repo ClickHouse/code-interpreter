@@ -86,14 +86,14 @@ export function microvmPortHeaders(port: number): Record<string, string> {
 }
 
 export interface LambdaMicrovmClient {
-  runMicrovm(args: RunMicrovmArgs): Promise<MicrovmDescription>;
-  getMicrovm(microvmId: string): Promise<MicrovmDescription>;
-  suspendMicrovm(microvmId: string): Promise<void>;
-  resumeMicrovm(microvmId: string): Promise<MicrovmDescription>;
-  terminateMicrovm(microvmId: string): Promise<void>;
+  runMicrovm(args: RunMicrovmArgs, signal?: AbortSignal): Promise<MicrovmDescription>;
+  getMicrovm(microvmId: string, signal?: AbortSignal): Promise<MicrovmDescription>;
+  suspendMicrovm(microvmId: string, signal?: AbortSignal): Promise<void>;
+  resumeMicrovm(microvmId: string, signal?: AbortSignal): Promise<MicrovmDescription>;
+  terminateMicrovm(microvmId: string, signal?: AbortSignal): Promise<void>;
   createMicrovmAuthToken(args: {
     microvmId: string;
     port: number;
     ttlSeconds: number;
-  }): Promise<MicrovmAuthToken>;
+  }, signal?: AbortSignal): Promise<MicrovmAuthToken>;
 }

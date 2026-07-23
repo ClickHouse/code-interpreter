@@ -36,21 +36,22 @@ import {
 /** Wire contract with the Lambda backend (`service/src/sandbox-backend`). */
 export const RUNTIME_SESSION_ID_HEADER = 'x-runtime-session-id';
 
-/** Sidecar file the checkpoint tar carries so a relaunched VM rebuilds the
- *  in-memory priming/output-diff state a warm VM would have kept. Written into
- *  the workspace only while the session lock is held (no concurrent user code),
- *  and removed from disk again before any execute runs. */
+/** Legacy checkpoint-sidecar path used before runner control metadata moved to
+ *  its own top-level archive member. Restore still accepts this format for
+ *  rolling compatibility; new checkpoints never create or alter this path. */
 export const SESSION_META_FILE = '.codeapi-session-meta.json';
 
-/** Marker embedded in the runner-owned sidecar so restore can tell OUR metadata
- *  from a user file that merely shares the reserved name and happens to contain
- *  primed/surfaced arrays — without it, restore would loadMeta (poisoning the
- *  priming maps) and delete a legitimate user file. */
-export const SESSION_META_MARKER = 'codeapi.session-meta.v1';
+/** Marker embedded in runner-owned checkpoint control metadata so restore can
+ *  distinguish it from a user file that merely shares the legacy reserved name
+ *  and happens to contain primed/surfaced arrays. */
+/* Bump whenever the meaning of a persisted field changes. v1 stored
+ * per-execution masked object handles; v2 stores the stable input-cache digest.
+ * Treating a v1 id as a v2 digest would re-prime over edited session inputs. */
+export const SESSION_META_MARKER = 'codeapi.session-meta.v2';
 
 export interface SessionMetaSnapshot {
   marker?: string;
-  primed: Array<[string, { id: string; readOnly: boolean; hash?: string; sessionId?: string }]>;
+  primed: Array<[string, { id: string; readOnly: boolean; hash?: string }]>;
   surfaced: Array<[string, string]>;
 }
 
@@ -58,6 +59,15 @@ const RUNTIME_SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface SessionBinding {
   runtimeSessionId: string;
+}
+
+export class SessionWorkspaceBindingError extends Error {
+  readonly status = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'SessionWorkspaceBindingError';
+  }
 }
 
 /** Shape of the `/run` runHookPayload the control plane delivers per VM. */
@@ -92,11 +102,13 @@ export function parseSessionBindingFromHeader(
   headerValue: string | string[] | undefined,
 ): SessionBinding | undefined {
   if (!config.session_workspace_enabled) return undefined;
-  if (typeof headerValue !== 'string') return undefined;
+  if (headerValue === undefined) return undefined;
+  if (typeof headerValue !== 'string') {
+    throw new SessionWorkspaceBindingError('X-Runtime-Session-Id must appear exactly once');
+  }
   const runtimeSessionId = headerValue.trim();
   if (!RUNTIME_SESSION_ID_PATTERN.test(runtimeSessionId)) {
-    if (runtimeSessionId.length > 0) logger.warn('Ignoring malformed X-Runtime-Session-Id header');
-    return undefined;
+    throw new SessionWorkspaceBindingError('X-Runtime-Session-Id is malformed');
   }
   return { runtimeSessionId };
 }
@@ -116,13 +128,12 @@ export class SessionWorkspace {
    *  protection. `hash` is the ORIGINAL upload hash, kept as the modification
    *  baseline on reuse so a writable input mutated by a prior turn is reported
    *  as modified-from-original rather than re-hashed as if it were pristine. */
-  private readonly primed = new Map<string, { id: string; readOnly: boolean; hash?: string; sessionId?: string }>();
-  /** relPaths the control plane pushed into the workspace for the NEXT execute
-   *  (see {@link consumeFreshDelivery}). Never checkpointed: it describes a
-   *  single turn's delivery, not durable workspace state. */
-  private readonly delivered = new Set<string>();
-  /** Set when a delivery failed mid-commit (see {@link poisonDelivery}). */
-  private poisoned: string | undefined;
+  private readonly primed = new Map<string, { id: string; readOnly: boolean; hash?: string }>();
+  /** A failed multi-file prime may have committed only part of the request.
+   * Keep the runner fail-closed until the control plane recycles it and restores
+   * the last committed checkpoint. This is intentionally in-memory only: a
+   * dirty workspace must never be checkpointed as a new recovery point. */
+  private dirty: string | undefined;
 
   constructor(binding: SessionBinding) {
     this.runtimeSessionId = binding.runtimeSessionId;
@@ -169,44 +180,6 @@ export class SessionWorkspace {
     return entry.id;
   }
 
-  /**
-   * Consumes the "the control plane just pushed this exact ref" marker for
-   * `relPath`. Push-model backends (MicroVM) deliver inputs over the authed
-   * proxy immediately before the execute, so the on-disk copy is pristine and
-   * trusted for THIS run — including read-only refs, which `primedInputId`
-   * deliberately reports as unprimed. Without this the runner would fall
-   * through to the pull path, which has nothing reachable to pull from.
-   * One-shot by design: a later exec that does not re-push gets the normal
-   * (id, storage session) reuse rules back.
-   */
-  consumeFreshDelivery(relPath: string, id: string, storageSessionId?: string): boolean {
-    if (!this.delivered.delete(relPath)) return false;
-    const entry = this.primed.get(relPath);
-    return entry?.id === id && entry?.sessionId === storageSessionId;
-  }
-
-  /** Records that the control plane delivered `relPath` for the next execute. */
-  markDelivered(relPath: string): void {
-    this.delivered.add(relPath);
-  }
-
-  /**
-   * Marks the workspace indeterminate after a file delivery failed PART-WAY
-   * through committing. Some files are the new bytes, some the old, and the
-   * replaced bytes are gone — so the workspace matches neither the checkpoint
-   * nor the request. Every later request on this runner fails until the
-   * control plane recycles the VM, which restores the last good checkpoint.
-   */
-  poisonDelivery(reason: string): void {
-    this.poisoned = reason;
-    logger.error({ runtimeSessionId: this.runtimeSessionId, reason }, 'Session workspace quarantined');
-  }
-
-  /** The quarantine reason, or undefined while the workspace is usable. */
-  get quarantineReason(): string | undefined {
-    return this.poisoned;
-  }
-
   /** Whether `relPath` was primed as an input on any earlier turn (regardless
    *  of read-only). Such a file persists in the workspace, so a later turn that
    *  doesn't re-send it must not mistake it for a newly generated output. */
@@ -220,18 +193,20 @@ export class SessionWorkspace {
     return this.primed.get(relPath)?.readOnly === true;
   }
 
-  markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string, sessionId?: string): void {
-    this.primed.set(relPath, { id: storageFileId, readOnly, hash, sessionId });
+  markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string): void {
+    this.primed.set(relPath, { id: storageFileId, readOnly, hash });
   }
 
-  /** The storage session id recorded when `relPath` was primed (undefined for
-   *  read-only primes, mirroring primedInputId). A reuse must match BOTH id and
-   *  storage session: the sandbox addresses file refs by (storage_session_id,
-   *  id), so id alone can collide across storage sessions and serve stale bytes. */
-  primedSessionId(relPath: string): string | undefined {
-    const entry = this.primed.get(relPath);
-    if (!entry || entry.readOnly) return undefined;
-    return entry.sessionId;
+  markDirty(reason: string): void {
+    this.dirty = reason;
+    logger.error(
+      { runtimeSessionId: this.runtimeSessionId, reason },
+      'Session workspace marked dirty',
+    );
+  }
+
+  get dirtyReason(): string | undefined {
+    return this.dirty;
   }
 
   /** The original upload hash recorded when `relPath` was first primed, or
@@ -240,8 +215,8 @@ export class SessionWorkspace {
     return this.primed.get(relPath)?.hash;
   }
 
-  /** Serializes the priming + output-diff state into the checkpoint so a
-   *  relaunched VM restores it (see {@link SESSION_META_FILE}). */
+  /** Serializes the priming + output-diff state into checkpoint control
+   *  metadata so a relaunched VM restores the same in-memory state. */
   snapshotMeta(): SessionMetaSnapshot {
     return {
       primed: [...this.primed.entries()],
@@ -249,7 +224,7 @@ export class SessionWorkspace {
     };
   }
 
-  /** Rebuilds priming + output-diff state from a restored checkpoint sidecar.
+  /** Rebuilds priming + output-diff state from restored checkpoint metadata.
    *  Without it a relaunched VM would re-download every input ref, overwriting a
    *  restored in-place-modified input with its original, and re-upload every
    *  restored file as a new output. */
@@ -260,7 +235,7 @@ export class SessionWorkspace {
      * real file from the output scan. */
     this.primed.clear();
     this.surfaced.clear();
-    this.delivered.clear();
+    this.dirty = undefined;
     for (const [relPath, entry] of snapshot.primed) this.primed.set(relPath, entry);
     for (const [relPath, hash] of snapshot.surfaced) this.surfaced.set(relPath, hash);
   }
@@ -275,7 +250,7 @@ export class SessionWorkspace {
     const wiped = await resetSessionWorkspace();
     this.surfaced.clear();
     this.primed.clear();
-    this.delivered.clear();
+    this.dirty = undefined;
     this.lease = undefined;
     if (!wiped) {
       logger.error(

@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import RedisMock from 'ioredis-mock';
 import * as zlib from 'zlib';
+import * as fsp from 'fs/promises';
 import axios from 'axios';
 import { env } from '../config';
 import { FakeLambdaMicrovmClient } from '../runtime-session/lambda-client-fake';
@@ -12,12 +13,18 @@ import {
 import {
   acquireRuntimeSessionLock,
   readRuntimeSessionRecord,
+  releaseRuntimeSessionLock,
   resetRedisForTests as resetRegistryRedis,
   setRedisForTests as setRegistryRedis,
   writeRuntimeSessionRecord,
 } from '../runtime-session/registry';
 import { MemoryCheckpointStore, checkpointObjectKey, checkpointPrefixFor } from '../runtime-session/checkpoint-store';
-import { LambdaMicrovmSandboxBackend, normalizeMicrovmEndpoint, type LambdaMicrovmBackendConfig } from './lambda-microvm';
+import {
+  LambdaMicrovmSandboxBackend,
+  normalizeMicrovmEndpoint,
+  runtimeSessionLaunchFingerprint,
+  type LambdaMicrovmBackendConfig,
+} from './lambda-microvm';
 import { SandboxBackendError } from './types';
 import type { SandboxExecuteContext, SandboxTransportRequest } from './types';
 import type * as t from '../types';
@@ -29,12 +36,18 @@ let captured: CapturedRequest[] = [];
 let healthStatus = 200;
 let executeDelayMs = 0;
 let executeStatus = 200;
+let executeResponseBody: unknown;
 let sessionFilesStatus = 200;
 let lastSessionFilesBody: Buffer | null = null;
 let stealSessionLockOnExecute = false;
 let fileReadOnly = false;
+let fileObjectStatus = 200;
+let probeMissingOverride: Array<{ cache_key: string }> | undefined;
+let evictAfterPush = false;
+let recordDuringRestore: Awaited<ReturnType<typeof readRuntimeSessionRecord>> | undefined;
+let onExecute: (() => void | Promise<void>) | undefined;
 /** Models the runner's input cache so probe/push behave like the real VM. */
-let lastProbedRefs: Array<{ storage_session_id: string; id: string }> = [];
+let lastProbedRefs: Array<{ cache_key: string }> = [];
 const vmInputCache = new Set<string>();
 const fileObjectBytes = 'csv,bytes\n1,2\n';
 let mock: InstanceType<typeof RedisMock>;
@@ -66,16 +79,17 @@ beforeAll(() => {
        * fetches input refs from when building a session files delivery. */
       if (path.startsWith('/sessions/')) {
         return new Response(fileObjectBytes, {
-          status: 200,
+          status: fileObjectStatus,
           headers: fileReadOnly ? { 'X-Read-Only': 'true' } : {},
         });
       }
       if (path === '/api/v2/session/inputs/probe') {
         const refs = (JSON.parse(raw.toString()) as {
-          refs: Array<{ storage_session_id: string; id: string }>;
+          refs: Array<{ cache_key: string }>;
         }).refs;
         lastProbedRefs = refs;
-        const missing = refs.filter((r) => !vmInputCache.has(`${r.storage_session_id}/${r.id}`));
+        const missing = probeMissingOverride
+          ?? refs.filter((r) => !vmInputCache.has(r.cache_key));
         return new Response(JSON.stringify({ missing }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -85,7 +99,8 @@ beforeAll(() => {
         lastSessionFilesBody = raw;
         if (sessionFilesStatus === 200) {
           /* Model the runner cache: everything just pushed is now held. */
-          for (const ref of lastProbedRefs) vmInputCache.add(`${ref.storage_session_id}/${ref.id}`);
+          for (const ref of lastProbedRefs) vmInputCache.add(ref.cache_key);
+          if (evictAfterPush) vmInputCache.clear();
         }
         return new Response(JSON.stringify({ stored: lastProbedRefs.length }), {
           status: sessionFilesStatus,
@@ -99,13 +114,14 @@ beforeAll(() => {
         });
       }
       if (path === '/api/v2/execute') {
+        await onExecute?.();
         if (executeDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, executeDelayMs));
         }
         if (stealSessionLockOnExecute) {
           await mock.set('rtsx:lock:rt_session_1', 'stolen');
         }
-        return new Response(JSON.stringify(EXECUTE_RESPONSE), {
+        return new Response(JSON.stringify(executeResponseBody), {
           status: executeStatus,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -114,6 +130,7 @@ beforeAll(() => {
         return new Response(checkpointBlob, { status: 200, headers: { 'Content-Type': 'application/x-gtar' } });
       }
       if (path === '/api/v2/session/restore') {
+        recordDuringRestore = await readRuntimeSessionRecord('rt_ckpt_1');
         return new Response(JSON.stringify({ status: 'restored' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -139,10 +156,16 @@ beforeEach(async () => {
   healthStatus = 200;
   executeDelayMs = 0;
   executeStatus = 200;
+  executeResponseBody = EXECUTE_RESPONSE;
   sessionFilesStatus = 200;
   lastSessionFilesBody = null;
   stealSessionLockOnExecute = false;
   fileReadOnly = false;
+  fileObjectStatus = 200;
+  probeMissingOverride = undefined;
+  evictAfterPush = false;
+  recordDuringRestore = undefined;
+  onExecute = undefined;
   lastProbedRefs = [];
   vmInputCache.clear();
 });
@@ -262,6 +285,15 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     expect(paths.indexOf('/api/v2/health')).toBeLessThan(paths.indexOf('/api/v2/execute'));
   });
 
+  test('health check runs before stateless input delivery', async () => {
+    const fake = fakeClient();
+    await makeBackend(fake).execute(request(), context());
+    const paths = captured.map((c) => c.path);
+    expect(paths.indexOf('/api/v2/health')).toBeLessThan(
+      paths.indexOf('/api/v2/session/inputs/probe'),
+    );
+  });
+
   test('terminates the VM even when the execute is aborted mid-flight', async () => {
     const fake = fakeClient();
     executeDelayMs = 5_000;
@@ -321,6 +353,30 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
   });
 
+  test('refreshes an expiring proxy token while waiting for runner readiness', async () => {
+    const fake = fakeClient();
+    const mint = fake.createMicrovmAuthToken.bind(fake);
+    let readinessMints = 0;
+    healthStatus = 500;
+    fake.createMicrovmAuthToken = async (args) => {
+      readinessMints += 1;
+      const token = await mint(args);
+      if (readinessMints === 1) {
+        return { ...token, expiresAtMs: Date.now() + 1 };
+      }
+      /* A second readiness mint is what makes the simulated runner ready.
+       * Without rollover the first 500 repeats until launch timeout. */
+      if (readinessMints === 2) healthStatus = 200;
+      return token;
+    };
+
+    await expect(
+      makeBackend(fake, { launchTimeoutMs: 250, healthTimeoutMs: 20 })
+        .execute(request(), context()),
+    ).resolves.toEqual(EXECUTE_RESPONSE);
+    expect(readinessMints).toBeGreaterThanOrEqual(2);
+  });
+
   test('does not mutate the signed request body', async () => {
     const fake = fakeClient();
     const req = request();
@@ -356,6 +412,72 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
 });
 
 describe('LambdaMicrovmSandboxBackend session execution', () => {
+  test('retries transport failures while a suspended input endpoint resumes', async () => {
+    const reservation = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: () => new Response('reserved'),
+    });
+    const port = reservation.port;
+    reservation.stop(true);
+
+    let lateServer: ReturnType<typeof Bun.serve> | undefined;
+    const starter = setTimeout(() => {
+      lateServer = Bun.serve({
+        hostname: '127.0.0.1',
+        port,
+        fetch: () => new Response(JSON.stringify({ missing: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      });
+    }, 25);
+
+    const backend = makeBackend(fakeClient()) as unknown as {
+      probeInputsWithRetry(
+        args: {
+          mintToken: () => Promise<{
+            headerName: string;
+            token: string;
+            expiresAtMs: number;
+          }>;
+          endpointBase: string;
+          signal?: AbortSignal;
+        },
+        refs: Array<{ cache_key: string }>,
+        cfg: {
+          port: number;
+          authTokenTtlSeconds: number;
+          maxBytes: number;
+          timeoutMs: number;
+        },
+      ): Promise<Array<{ cache_key: string }>>;
+    };
+
+    try {
+      await expect(backend.probeInputsWithRetry(
+        {
+          mintToken: async () => ({
+            headerName: 'X-aws-proxy-auth',
+            token: 'test-token',
+            expiresAtMs: Date.now() + 60_000,
+          }),
+          endpointBase: `http://127.0.0.1:${port}`,
+        },
+        [{ cache_key: 'a'.repeat(64) }],
+        {
+          port: 8080,
+          authTokenTtlSeconds: 300,
+          maxBytes: 1024,
+          timeoutMs: 500,
+        },
+      )).resolves.toEqual([]);
+    } finally {
+      clearTimeout(starter);
+      lateServer?.stop(true);
+    }
+  });
+
   function sessionContext(overrides: Partial<SandboxExecuteContext> = {}): SandboxExecuteContext {
     return context({
       runtimeSessionId: 'rt_session_1',
@@ -393,6 +515,58 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
     expect(record?.microvm_id).toBe([...fake.vms.keys()][0]);
     expect(record?.generation).toBe(1);
+  });
+
+  test('replays a recorded launch intent after the RunMicrovm response is lost', async () => {
+    const fake = fakeClient();
+    const cfg = config();
+    const launchedAt = Date.now();
+    const token = 'sess-rt_session_1-7';
+    const accepted = await fake.runMicrovm({
+      imageIdentifier: cfg.imageArn,
+      imageVersion: cfg.imageVersion,
+      executionRoleArn: cfg.executionRoleArn,
+      logGroup: cfg.logGroup,
+      ingressConnectorArns: cfg.ingressConnectorArns,
+      egressConnectorArns: cfg.egressConnectorArns,
+      maximumDurationSeconds: cfg.maxDurationSeconds,
+      idlePolicy: {
+        maxIdleSeconds: cfg.idleSeconds,
+        suspendedSeconds: cfg.suspendedSeconds,
+        autoResume: true,
+      },
+      clientToken: token,
+    });
+    /* Model a worker that persisted its intent and whose RunMicrovm reached AWS,
+     * but died before it could record the returned MicroVM id. */
+    await mock.set('rtsx:gen:rt_session_1', '7');
+    const lock = await acquireRuntimeSessionLock('rt_session_1', 60_000);
+    expect(lock).not.toBeNull();
+    await writeRuntimeSessionRecord({
+      runtime_session_id: 'rt_session_1',
+      tenant_id: 'tenant-a',
+      canonical_user_id: 'user-1',
+      port: cfg.port,
+      image_arn: cfg.imageArn,
+      image_version: cfg.imageVersion,
+      launch_fingerprint: runtimeSessionLaunchFingerprint(cfg),
+      state: 'PENDING',
+      generation: 7,
+      launched_at: launchedAt,
+      last_seen_at: launchedAt,
+      hard_deadline_at: launchedAt + cfg.maxDurationSeconds * 1_000 - 60_000,
+    }, lock as string);
+    await releaseRuntimeSessionLock('rt_session_1', lock as string);
+
+    const result = await makeBackend(fake).execute(request(), sessionContext());
+    expect(result).toEqual(EXECUTE_RESPONSE);
+    const runCalls = fake.callsFor('runMicrovm');
+    expect(runCalls).toHaveLength(2);
+    expect(runCalls.map(call => (call.args as { clientToken?: string }).clientToken))
+      .toEqual([token, token]);
+    expect(fake.vms.size).toBe(1);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.microvm_id)
+      .toBe(accepted.microvmId);
   });
 
   test('reuses the warm VM on the second execution (no second RunMicrovm)', async () => {
@@ -435,6 +609,21 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
+  test('a partial-prime signal recycles the dirty session workspace', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    executeStatus = 409;
+    executeResponseBody = {
+      error: 'session_workspace_dirty',
+      message: 'Session workspace must be restored',
+    };
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow();
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
 
 
 
@@ -453,6 +642,11 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
       paths.indexOf('/api/v2/session/inputs/probe'),
     );
     expect(paths.indexOf('/api/v2/session/inputs')).toBeLessThan(paths.indexOf('/api/v2/execute'));
+    const push = captured.find((request) => request.path === '/api/v2/session/inputs');
+    expect(Number(push?.headers['x-codeapi-input-expanded-bytes'])).toBe(
+      Buffer.byteLength(fileObjectBytes)
+      + Buffer.byteLength(JSON.stringify({ readOnly: false })),
+    );
     /* Objects are pushed under runner-computed digests, and carry only
      * object-level metadata: no caller-supplied path appears anywhere in the
      * batch, so nothing in delivery can act on one. */
@@ -487,17 +681,119 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(paths.indexOf('/api/v2/session/inputs')).toBeLessThan(paths.indexOf('/api/v2/execute'));
   });
 
-  test('a failed input delivery recycles the session VM and never executes', async () => {
+  test('a live runner rejecting an input push keeps the warm session VM', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
     sessionFilesStatus = 500;
 
     await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
-      'Session input delivery failed',
+      'Session input push failed',
+    );
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
+
+  test('a proxy 502 during input push recycles the unreachable session VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    sessionFilesStatus = 502;
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
+      'Session input push failed',
     );
     expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
     expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
+  test('a probe token throttle preserves its code and keeps the warm session VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    vmInputCache.clear();
+    captured = [];
+    fake.failNext(
+      'createMicrovmAuthToken',
+      new LambdaMicrovmApiError('throttled', 'CreateMicrovmAuthToken', 'rate exceeded'),
+    );
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toMatchObject({
+      code: 'MICROVM_LAUNCH_THROTTLED',
+    });
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
+
+  test('a push token throttle preserves its code and keeps the warm session VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    vmInputCache.clear();
+    captured = [];
+
+    const mint = fake.createMicrovmAuthToken.bind(fake);
+    let deliveryMints = 0;
+    fake.createMicrovmAuthToken = async (args) => {
+      deliveryMints += 1;
+      if (deliveryMints === 2) {
+        throw new LambdaMicrovmApiError(
+          'throttled',
+          'CreateMicrovmAuthToken',
+          'rate exceeded',
+        );
+      }
+      return mint(args);
+    };
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toMatchObject({
+      code: 'MICROVM_LAUNCH_THROTTLED',
+    });
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
+
+  test('a source-object failure never recycles a healthy warm session VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    vmInputCache.clear();
+    fileObjectStatus = 404;
+    captured = [];
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
+      'Session input source fetch failed',
+    );
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
+
+  test('rejects a probe response containing an unrequested cache key', async () => {
+    const fake = fakeClient();
+    probeMissingOverride = [{ cache_key: 'f'.repeat(64) }];
+
+    await expect(makeBackend(fake).execute(request(), sessionContext())).rejects.toThrow(
+      'Session input delivery failed',
+    );
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+  });
+
+  test('re-probes the full working set after push and never executes after eviction', async () => {
+    const fake = fakeClient();
+    evictAfterPush = true;
+
+    await expect(makeBackend(fake).execute(request(), sessionContext())).rejects.toThrow(
+      'working set',
+    );
+    const paths = captured.map((c) => c.path);
+    const pushIndex = paths.indexOf('/api/v2/session/inputs');
+    expect(pushIndex).toBeGreaterThanOrEqual(0);
+    expect(paths.lastIndexOf('/api/v2/session/inputs/probe')).toBeGreaterThan(pushIndex);
+    expect(paths).not.toContain('/api/v2/execute');
   });
 
   test('a payload with no by-ref inputs skips probe and push entirely', async () => {
@@ -561,6 +857,7 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     await releaseRuntimeSessionLock('rt_session_1', token);
     await backend.execute(request(), sessionContext());
     expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
   });
 
   test('two concurrent executions on one session serialize on the registry lock', async () => {
@@ -589,6 +886,25 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
       expect(error).toBeInstanceOf(SandboxBackendError);
       expect((error as SandboxBackendError).code).toBe('MICROVM_FENCED');
     }
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+  });
+
+  test('a missing post-execute session record fences and terminates the known VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    onExecute = async () => {
+      await mock.del('rtsx:sess:rt_session_1');
+    };
+
+    try {
+      await backend.execute(request(), sessionContext());
+      throw new Error('expected rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SandboxBackendError);
+      expect((error as SandboxBackendError).code).toBe('MICROVM_FENCED');
+    }
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
   });
 
   test('strict mode raises RUNTIME_SESSION_BUSY when the lock is held', async () => {
@@ -615,6 +931,14 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(runArgs.runHookPayload).toBeUndefined();
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
     expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+  });
+
+  test('session mode refuses an unpinned image version before launch', async () => {
+    const fake = fakeClient();
+    await expect(
+      makeBackend(fake, { imageVersion: undefined }).execute(request(), sessionContext()),
+    ).rejects.toThrow('pinned LAMBDA_MICROVM_IMAGE_VERSION');
+    expect(fake.callsFor('runMicrovm')).toHaveLength(0);
   });
 
   test('sends X-aws-proxy-port only when the port is not the 8080 default', async () => {
@@ -656,6 +980,39 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(terminated).toContain(oldVmId);
   });
 
+  test('provider not-found while terminating a stale VM still permits relaunch', async () => {
+    const fake = fakeClient();
+    await makeBackend(fake).execute(request(), sessionContext());
+    fake.failNext(
+      'terminateMicrovm',
+      new LambdaMicrovmApiError('not_found', 'TerminateMicrovm', 'already gone'),
+    );
+
+    await makeBackend(fake, { imageVersion: '4' }).execute(request(), sessionContext());
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.image_version).toBe('4');
+  });
+
+  test('launch-record failure after RunMicrovm terminates the untracked VM', async () => {
+    const fake = fakeClient();
+    const redisWithScript = mock as unknown as {
+      writeRuntimeSessionRecordScript: (...args: string[]) => Promise<number>;
+    };
+    const originalWrite = redisWithScript.writeRuntimeSessionRecordScript.bind(mock);
+    let writes = 0;
+    redisWithScript.writeRuntimeSessionRecordScript = async (...args: string[]) => {
+      writes += 1;
+      if (writes === 2) throw new Error('Redis unavailable after launch');
+      return originalWrite(...args);
+    };
+
+    await expect(makeBackend(fake).execute(request(), sessionContext())).rejects.toThrow(
+      'Redis unavailable after launch',
+    );
+    expect(fake.callsFor('runMicrovm')).toHaveLength(1);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+  });
+
   test('a tightened egress connector config makes an existing session non-reusable', async () => {
     const fake = fakeClient();
     await makeBackend(fake).execute(request(), sessionContext());
@@ -695,9 +1052,15 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     /* The runner binds session mode from this header (hookless): without it the
      * checkpoint/restore handlers 409 and state is lost across expiry. */
     expect(checkpoints[0].headers['x-runtime-session-id']).toBe('rt_ckpt_1');
-    expect((await store.get('rt_ckpt_1', 1_000_000))?.toString()).toBe(checkpointBlob);
+    const stored = await store.get('rt_ckpt_1', 1_000_000);
+    expect(stored).not.toBeNull();
+    try {
+      expect(await fsp.readFile(stored!.path, 'utf8')).toBe(checkpointBlob);
+    } finally {
+      await stored?.cleanup();
+    }
     const record = await readRuntimeSessionRecord('rt_ckpt_1');
-    /* Key is timestamp-based now (Date.now at checkpoint), so match the shape. */
+    /* Key is an immutable, zero-padded per-session sequence. */
     expect(record?.workspace_checkpoint).toStartWith(checkpointPrefixFor('rt_ckpt_1'));
     expect(record?.workspace_checkpoint).toEndWith('.tar.gz');
     expect(record?.checkpointed_at).toBeGreaterThan(0);
@@ -706,6 +1069,7 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
   test('a relaunched VM restores the checkpoint before the first exec', async () => {
     const store = new MemoryCheckpointStore();
     await store.put('rt_ckpt_1', 1000, Buffer.from('PRIOR_WORKSPACE'));
+    await store.commit('rt_ckpt_1', 1000);
     /* Seed a terminated prior session so findOrLaunch relaunches. */
     const seedToken = await acquireRuntimeSessionLock('rt_ckpt_1', 60_000);
     await writeRuntimeSessionRecord({
@@ -726,6 +1090,10 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(paths.indexOf('/api/v2/session/restore')).toBeLessThan(paths.indexOf('/api/v2/execute'));
     const restoreReq = captured.find((c) => c.path === '/api/v2/session/restore');
     expect(restoreReq?.headers['x-runtime-session-id']).toBe('rt_ckpt_1');
+    expect(recordDuringRestore?.state).toBe('PENDING');
+    expect(recordDuringRestore?.workspace_checkpoint).toBe(
+      checkpointObjectKey('rt_ckpt_1', 1000),
+    );
     expect(fake.callsFor('runMicrovm')).toHaveLength(1);
   });
 
@@ -755,6 +1123,90 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(store.objects.size).toBe(0);
   });
 
+  test('skips a checkpoint unless the budget covers all four bounded I/O legs', async () => {
+    const originalNow = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+    onExecute = () => {
+      /* Leaves 45ms: more than the old 10 + 3*10 guard, but less than the
+       * actual token wait + GET + list + put + commit worst case (50ms). */
+      now += 55;
+    };
+    try {
+      const fake = fakeClient();
+      const store = new MemoryCheckpointStore();
+      const backend = makeBackend(fake, {
+        checkpointsEnabled: true,
+        jobTimeoutMs: 100,
+        launchTimeoutMs: 10,
+        checkpoint: {
+          port: 8080,
+          authTokenTtlSeconds: 300,
+          maxBytes: 512 * 1024 * 1024,
+          timeoutMs: 10,
+        },
+      }, store);
+
+      expect(await backend.execute(request(), sessionContext())).toEqual(EXECUTE_RESPONSE);
+      expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(0);
+      expect(store.objects.size).toBe(0);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  test('production defaults leave enough budget for a fresh session checkpoint', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, {
+      checkpointsEnabled: true,
+      jobTimeoutMs: 300_000,
+      launchTimeoutMs: 60_000,
+      checkpoint: {
+        port: 8080,
+        authTokenTtlSeconds: 300,
+        maxBytes: 512 * 1024 * 1024,
+        timeoutMs: 60_000,
+      },
+    }, store);
+
+    expect(await backend.execute(request(), sessionContext())).toEqual(EXECUTE_RESPONSE);
+    expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(1);
+    expect(store.objects.size).toBe(1);
+  });
+
+  test('uses the worker deadline so pre-backend setup consumes checkpoint budget', async () => {
+    const originalNow = Date.now;
+    const now = 1_000_000;
+    Date.now = () => now;
+    try {
+      const fake = fakeClient();
+      const store = new MemoryCheckpointStore();
+      const backend = makeBackend(fake, {
+        checkpointsEnabled: true,
+        /* A backend-local 100ms clock would allow the 50ms pipeline. The
+         * worker deadline has only 49ms left after earlier egress/setup work. */
+        jobTimeoutMs: 100,
+        launchTimeoutMs: 10,
+        checkpoint: {
+          port: 8080,
+          authTokenTtlSeconds: 300,
+          maxBytes: 512 * 1024 * 1024,
+          timeoutMs: 10,
+        },
+      }, store);
+
+      expect(await backend.execute(
+        request(),
+        sessionContext({ deadlineAtMs: now + 49 }),
+      )).toEqual(EXECUTE_RESPONSE);
+      expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(0);
+      expect(store.objects.size).toBe(0);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   test('a checkpoint FETCH failure fails closed instead of running on an empty workspace', async () => {
     const fake = fakeClient();
     const store = new MemoryCheckpointStore();
@@ -781,5 +1233,59 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     const record = await readRuntimeSessionRecord('rt_ckpt_1');
     expect(record?.state).toBe('RUNNING');
     expect(record?.workspace_checkpoint).toBeUndefined();
+  });
+
+  test('a failed first reseed lookup cannot strand the Redis sequence below retained objects', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    await store.put('rt_ckpt_1', 100, Buffer.from('PRIOR_WORKSPACE'));
+    await store.commit('rt_ckpt_1', 100);
+    const latestSequence = store.latestSequence.bind(store);
+    let lookups = 0;
+    store.latestSequence = async (runtimeSessionId) => {
+      lookups += 1;
+      if (lookups === 1) throw new Error('transient list failure');
+      return latestSequence(runtimeSessionId);
+    };
+    const backend = makeBackend(fake, cfgOn, store);
+
+    expect(await backend.execute(request(), sessionContext())).toEqual(EXECUTE_RESPONSE);
+    expect(await backend.execute(request(), sessionContext())).toEqual(EXECUTE_RESPONSE);
+
+    const record = await readRuntimeSessionRecord('rt_ckpt_1');
+    expect(record?.workspace_checkpoint).toBe(checkpointObjectKey('rt_ckpt_1', 101));
+    expect(store.objects.has(checkpointObjectKey('rt_ckpt_1', 101))).toBe(true);
+  });
+
+  test('a commit-marker failure keeps the previous durable recovery point', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    await store.put('rt_ckpt_1', 10, Buffer.from('PRIOR_WORKSPACE'));
+    await store.commit('rt_ckpt_1', 10);
+    const commit = store.commit.bind(store);
+    store.commit = async (runtimeSessionId, sequence) => {
+      if (sequence === 11) throw new Error('marker write failed');
+      await commit(runtimeSessionId, sequence);
+    };
+    let pruneCalls = 0;
+    const prune = store.pruneOlderThan.bind(store);
+    store.pruneOlderThan = async (runtimeSessionId, sequence) => {
+      pruneCalls += 1;
+      await prune(runtimeSessionId, sequence);
+    };
+    const backend = makeBackend(fake, cfgOn, store);
+
+    expect(await backend.execute(request(), sessionContext())).toEqual(EXECUTE_RESPONSE);
+    expect((await readRuntimeSessionRecord('rt_ckpt_1'))?.workspace_checkpoint).toBe(
+      checkpointObjectKey('rt_ckpt_1', 11),
+    );
+    expect(pruneCalls).toBe(0);
+
+    const durable = await store.get('rt_ckpt_1', 1_000_000);
+    try {
+      expect(await fsp.readFile(durable!.path, 'utf8')).toBe('PRIOR_WORKSPACE');
+    } finally {
+      await durable?.cleanup();
+    }
   });
 });

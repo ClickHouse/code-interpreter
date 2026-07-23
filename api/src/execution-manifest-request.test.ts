@@ -249,6 +249,23 @@ describe('execute request manifest validation', () => {
     })).toEqual(legacyClaims);
   });
 
+  test('never admits input cache selectors through the legacy no-body-hash grace', () => {
+    const cachedBody = {
+      ...body,
+      files: [
+        body.files[0],
+        { ...body.files[1], input_cache_key: 'a'.repeat(64) },
+      ],
+    };
+    expectManifestError(() => verifyExecuteRequestManifest({
+      headerValue: signExecutionManifest(claims(), SECRET),
+      secret: SECRET,
+      body: cachedBody,
+      nowSeconds: 150,
+      bodyHashRequiredAfterSeconds: 200,
+    }), 'scope_mismatch');
+  });
+
   test('rejects scoped legacy manifests after the body-hash rollout grace window', () => {
     expectManifestError(() => verifyExecuteRequestManifest({
       headerValue: signExecutionManifest(claims(), SECRET),

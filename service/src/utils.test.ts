@@ -133,7 +133,7 @@ describe('sandbox error formatting', () => {
     const err = new Error('RUNTIME_SESSION_BUSY: Runtime session rt_abc is busy');
     expect(publicExecutionFailure(err)).toEqual({
       status: 409,
-      body: { error: 'runtime_session_busy', message: 'Runtime session rt_abc is busy' },
+      body: { error: 'runtime_session_busy', message: 'Runtime session is busy' },
     });
   });
 
@@ -141,8 +141,21 @@ describe('sandbox error formatting', () => {
     const err = new Error('MICROVM_LAUNCH_FAILED: MicroVM did not reach RUNNING within 60000ms');
     expect(publicExecutionFailure(err)).toEqual({
       status: 503,
-      body: { error: 'microvm_launch_failed', message: 'MicroVM did not reach RUNNING within 60000ms' },
+      body: { error: 'microvm_launch_failed', message: 'Sandbox launch failed' },
     });
+  });
+
+  test('does not expose AWS identifiers embedded in backend failures', () => {
+    const arn = 'arn:aws:iam::123456789012:role/private-microvm-exec';
+    const failure = publicExecutionFailure(
+      new Error(`MICROVM_LAUNCH_FAILED: Access denied while passing ${arn} to mvm-secret-123`),
+    );
+    expect(failure).toEqual({
+      status: 503,
+      body: { error: 'microvm_launch_failed', message: 'Sandbox launch failed' },
+    });
+    expect(JSON.stringify(failure)).not.toContain('123456789012');
+    expect(JSON.stringify(failure)).not.toContain('mvm-secret-123');
   });
 
   test('maps sandbox request guard failures to public bad requests', () => {

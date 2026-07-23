@@ -27,6 +27,7 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/client-lambda-microvms": "3.1079.0",
+    "@aws-sdk/client-s3": "3.1079.0",
     "@opentelemetry/api": "1.9.1",
     "@opentelemetry/core": "2.7.1",
     "@opentelemetry/exporter-trace-otlp-proto": "0.218.0",

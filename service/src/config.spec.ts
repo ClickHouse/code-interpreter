@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'bun:test';
-import { languageConfig, resolveEgressGrantTtlSeconds, resolveLanguage } from './config';
+import {
+  jobDeadlineAtMs,
+  languageConfig,
+  lambdaMicrovmNumericConfigError,
+  resolveEgressGrantTtlSeconds,
+  resolveLanguage,
+  resolveLambdaMicrovmNumericConfig,
+} from './config';
 import { Languages } from './enum';
 import { createPayload } from './payload';
 import type { AuthenticatedRequest } from './types';
@@ -87,5 +94,72 @@ describe('egress grant TTL configuration', () => {
     expect(resolveEgressGrantTtlSeconds('0', 300000)).toBe(900);
     expect(resolveEgressGrantTtlSeconds('-1', 300000)).toBe(900);
     expect(resolveEgressGrantTtlSeconds('not-a-number', 300000)).toBe(900);
+  });
+});
+
+describe('job deadline accounting', () => {
+  it('counts time spent waiting in BullMQ against JOB_TIMEOUT', () => {
+    expect(jobDeadlineAtMs(1_000, 300_000, 50_000)).toBe(301_000);
+  });
+
+  it('falls back to worker start only when enqueue time is unavailable', () => {
+    expect(jobDeadlineAtMs(undefined, 300_000, 50_000)).toBe(350_000);
+    expect(jobDeadlineAtMs(Number.NaN, 300_000, 50_000)).toBe(350_000);
+  });
+});
+
+describe('Lambda MicroVM numeric configuration', () => {
+  it('uses defaults only for absent or blank values and preserves suspend=0', () => {
+    expect(resolveLambdaMicrovmNumericConfig({})).toMatchObject({
+      LAMBDA_MICROVM_PORT: 8080,
+      LAMBDA_MICROVM_MAX_DURATION_SECONDS: 28_800,
+      LAMBDA_MICROVM_IDLE_SECONDS: 1_800,
+      LAMBDA_MICROVM_SUSPEND_SECONDS: 1_800,
+      LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: 300,
+      LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: 60_000,
+      LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: 5_000,
+      LAMBDA_MICROVM_LAUNCH_TPS: 4,
+      LAMBDA_MICROVM_TOKEN_TPS: 8,
+    });
+    expect(resolveLambdaMicrovmNumericConfig({
+      LAMBDA_MICROVM_SUSPEND_SECONDS: '0',
+      LAMBDA_MICROVM_PORT: ' ',
+    }).LAMBDA_MICROVM_SUSPEND_SECONDS).toBe(0);
+  });
+
+  it('accepts the supported boundary values', () => {
+    const numeric = resolveLambdaMicrovmNumericConfig({
+      LAMBDA_MICROVM_PORT: '1',
+      LAMBDA_MICROVM_MAX_DURATION_SECONDS: '28800',
+      LAMBDA_MICROVM_IDLE_SECONDS: '60',
+      LAMBDA_MICROVM_SUSPEND_SECONDS: '0',
+      LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: '1',
+      LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: '1',
+      LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: '1',
+      LAMBDA_MICROVM_LAUNCH_TPS: '1',
+      LAMBDA_MICROVM_TOKEN_TPS: '1',
+    });
+    expect(lambdaMicrovmNumericConfigError(numeric)).toBeUndefined();
+  });
+
+  it('rejects non-integers and values outside the supported ranges', () => {
+    const cases: Array<[string, string, string]> = [
+      ['LAMBDA_MICROVM_PORT', '0', 'between 1 and 65535'],
+      ['LAMBDA_MICROVM_PORT', '65536', 'between 1 and 65535'],
+      ['LAMBDA_MICROVM_MAX_DURATION_SECONDS', '28801', 'between 1 and 28800'],
+      ['LAMBDA_MICROVM_IDLE_SECONDS', '59', 'between 60 and 28800'],
+      ['LAMBDA_MICROVM_SUSPEND_SECONDS', '-1', 'between 0 and 28800'],
+      ['LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS', '901', 'between 1 and 900'],
+      ['LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS', '0', 'at least 1'],
+      ['LAMBDA_MICROVM_HEALTH_TIMEOUT_MS', 'NaN', 'at least 1'],
+      ['LAMBDA_MICROVM_LAUNCH_TPS', '1.5', 'at least 1'],
+      ['LAMBDA_MICROVM_TOKEN_TPS', '-1', 'at least 1'],
+    ];
+
+    for (const [name, value, expected] of cases) {
+      const numeric = resolveLambdaMicrovmNumericConfig({ [name]: value });
+      expect(lambdaMicrovmNumericConfigError(numeric)).toContain(name);
+      expect(lambdaMicrovmNumericConfigError(numeric)).toContain(expected);
+    }
   });
 });

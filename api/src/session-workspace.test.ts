@@ -56,10 +56,10 @@ describe('parseSessionBindingFromHeader (per-request opt-in)', () => {
   test('rejects missing, empty, repeated, or malformed headers', () => {
     config.session_workspace_enabled = true;
     expect(parseSessionBindingFromHeader(undefined)).toBeUndefined();
-    expect(parseSessionBindingFromHeader('')).toBeUndefined();
-    expect(parseSessionBindingFromHeader(['rt_a', 'rt_b'])).toBeUndefined();
-    expect(parseSessionBindingFromHeader('rt bad space')).toBeUndefined();
-    expect(parseSessionBindingFromHeader('a'.repeat(129))).toBeUndefined();
+    expect(() => parseSessionBindingFromHeader('')).toThrow('malformed');
+    expect(() => parseSessionBindingFromHeader(['rt_a', 'rt_b'])).toThrow('exactly once');
+    expect(() => parseSessionBindingFromHeader('rt bad space')).toThrow('malformed');
+    expect(() => parseSessionBindingFromHeader('a'.repeat(129))).toThrow('malformed');
   });
 
   test('tolerates absent and non-JSON payloads', () => {
@@ -156,5 +156,14 @@ describe('SessionWorkspace state', () => {
     expect(relaunched.primedHash('in.csv')).toBe('ORIGHASH');
     /* read-only flag survives the round-trip, so it still re-downloads */
     expect(relaunched.primedInputId('skill.py')).toBeUndefined();
+  });
+
+  test('a partial prime stays fail-closed until a successful restore loads metadata', () => {
+    const workspace = new SessionWorkspace({ runtimeSessionId: 'rt_dirty' });
+    workspace.markDirty('partial input prime');
+    expect(workspace.dirtyReason).toBe('partial input prime');
+
+    workspace.loadMeta({ primed: [], surfaced: [] });
+    expect(workspace.dirtyReason).toBeUndefined();
   });
 });

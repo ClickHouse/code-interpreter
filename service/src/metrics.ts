@@ -224,16 +224,6 @@ export const runtimeSessionLockContention = new Counter({
   labelNames: ['mode'] as const,
 });
 
-export const runtimeSessionFallback = new Counter({
-  name: 'codeapi_runtime_session_fallback_total',
-  help: 'Affinity-mode executions that fell back to a stateless one-shot VM',
-});
-
-export const microvmActiveSessions = new Gauge({
-  name: 'codeapi_microvm_active_sessions',
-  help: 'Live runtime sessions tracked in the registry active set',
-});
-
 export const microvmCheckpoints = new Counter({
   name: 'codeapi_microvm_checkpoints_total',
   help: 'Session workspace checkpoint attempts by outcome',

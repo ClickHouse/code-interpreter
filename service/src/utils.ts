@@ -116,7 +116,24 @@ export function publicExecutionFailure(error: unknown): { status: number; body: 
   if (backendMatch) {
     const code = backendMatch[1];
     const status = code === 'RUNTIME_SESSION_BUSY' ? 409 : 503;
-    return { status, body: { error: code.toLowerCase(), message: backendMatch[2] } };
+    const publicMessages: Record<string, string> = {
+      RUNTIME_SESSION_BUSY: 'Runtime session is busy',
+      MICROVM_LAUNCH_FAILED: 'Sandbox launch failed',
+      MICROVM_LAUNCH_THROTTLED: 'Sandbox capacity is temporarily unavailable',
+      MICROVM_UNHEALTHY: 'Sandbox runtime is unavailable',
+      MICROVM_FENCED: 'Runtime session changed during execution',
+      MICROVM_DEADLINE_EXCEEDED: 'Sandbox execution deadline exceeded',
+    };
+    /* The backend message is retained in worker/router logs, but it can contain
+     * AWS validation text, account IDs, ARNs, connector names, or MicroVM IDs.
+     * Only the stable code and a fixed public message cross the API boundary. */
+    return {
+      status,
+      body: {
+        error: code.toLowerCase(),
+        message: publicMessages[code] ?? 'Sandbox runtime is unavailable',
+      },
+    };
   }
 
   const match = message.match(/^Error from sandbox(?:\s+\[([a-z_]+)\])?:\s*(?:\[([a-z_]+)\]\s*)?(.+)$/);

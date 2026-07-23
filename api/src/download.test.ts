@@ -282,7 +282,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     expect(contents).toBe('hi');
   });
 
-  it('returns null when the server keeps 404-ing past the retry cap (no phantom write)', async () => {
+  it('fails when the server keeps 404-ing past the retry cap (no phantom write)', async () => {
     const file: TFile = {
       id: 'missing-id',
       storage_session_id: 'prev-session',
@@ -293,9 +293,7 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     const job = makeJob([file]);
     asInternals(job).submissionDir = tmpDir;
 
-    const writtenName = await job.downloadAndWriteFile(file, 2, 1);
-
-    expect(writtenName).toBeNull();
+    await expect(job.downloadAndWriteFile(file, 2, 1)).rejects.toThrow('HTTP error: 404');
     /* Defensive: confirm we did not leave a partial / phantom file on
      * disk after exhausting retries. */
     await expect(fsp.access(path.join(tmpDir, 'should-not-exist.txt'))).rejects.toThrow();

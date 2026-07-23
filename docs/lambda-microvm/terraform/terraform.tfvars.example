@@ -11,9 +11,30 @@ image_name = "codeapi-session"
 # in this account (the default runner Dockerfile does). false for public bases.
 private_ecr = true
 
-# Checkpoints are a resumable cache; keep the window short.
-checkpoint_retention_days = 14
-log_retention_days        = 30
+# The module creates this repo by default. Set create_ecr_repository=false only
+# when the repository already exists.
+create_ecr_repository = true
+ecr_repository_name   = "codeapi-microvm-runner"
+ecr_max_image_count   = 30
+
+# AIML-dev is a disposable integration stack, so this example explicitly opts
+# into destructive teardown. Terraform defaults all three values to false.
+# Keep them false for retained environments: `terraform destroy` will then fail
+# instead of silently deleting non-empty buckets or a non-empty image repo.
+artifact_force_destroy   = true
+checkpoint_force_destroy = true
+ecr_force_delete          = true
+
+# Optional: attach both emitted runtime policies directly to an existing
+# CodeAPI worker/task role. Leave empty to attach the output ARNs elsewhere.
+codeapi_worker_role_name = ""
+
+# Checkpoints are a resumable cache; keep current versions for 14 days and an
+# S3 noncurrent version for one additional day after replacement/expiration.
+artifact_retention_days              = 30
+checkpoint_retention_days            = 14
+checkpoint_noncurrent_retention_days = 1
+log_retention_days                   = 30
 
 # Prefer attaching checkpoint_access_policy_arn to your CodeAPI task role.
 # Only set true if you must hand static keys to a non-role deployment.

@@ -1,12 +1,66 @@
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 
 locals {
   account_id      = data.aws_caller_identity.current.account_id
   artifact_bucket = var.create_artifact_bucket ? aws_s3_bucket.artifact[0].id : var.artifact_bucket_name
+  runner_repository_arn = (
+    var.private_ecr && var.create_ecr_repository
+    ? aws_ecr_repository.runner[0].arn
+    : "arn:${data.aws_partition.current.partition}:ecr:${var.region}:${local.account_id}:repository/${var.ecr_repository_name}"
+  )
+  runner_repository_url = (
+    var.private_ecr
+    ? (
+      var.create_ecr_repository
+      ? aws_ecr_repository.runner[0].repository_url
+      : "${local.account_id}.dkr.ecr.${var.region}.${data.aws_partition.current.dns_suffix}/${var.ecr_repository_name}"
+    )
+    : null
+  )
+  microvm_image_arn = "arn:${data.aws_partition.current.partition}:lambda:${var.region}:${local.account_id}:microvm-image:${var.image_name}"
 
   base_tags = merge(var.tags, {
     "app"       = "codeapi"
     "component" = "lambda-microvm"
+  })
+}
+
+# --------------------------------------------------------------------------
+# ECR: arm64 runner image consumed by the Lambda MicroVM image builder
+# --------------------------------------------------------------------------
+resource "aws_ecr_repository" "runner" {
+  count                = var.private_ecr && var.create_ecr_repository ? 1 : 0
+  name                 = var.ecr_repository_name
+  image_tag_mutability = "IMMUTABLE"
+  force_delete         = var.ecr_force_delete
+  tags                 = local.base_tags
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "runner" {
+  count      = var.private_ecr && var.create_ecr_repository ? 1 : 0
+  repository = aws_ecr_repository.runner[0].name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Retain the newest ${var.ecr_max_image_count} runner images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = var.ecr_max_image_count
+      }
+      action = {
+        type = "expire"
+      }
+    }]
   })
 }
 
@@ -18,7 +72,7 @@ resource "aws_s3_bucket" "artifact" {
   # Region in the name: S3 bucket names are globally unique, so applying this
   # module in a second region with the same name_prefix would otherwise collide.
   bucket        = "${var.name_prefix}-artifacts-${var.region}-${local.account_id}"
-  force_destroy = true
+  force_destroy = var.artifact_force_destroy
   tags          = local.base_tags
 }
 
@@ -46,6 +100,22 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifact" {
   }
 }
 
+resource "aws_s3_bucket_lifecycle_configuration" "artifact" {
+  count  = var.create_artifact_bucket ? 1 : 0
+  bucket = aws_s3_bucket.artifact[0].id
+  rule {
+    id     = "expire-build-artifacts"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = var.artifact_retention_days
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
 # --------------------------------------------------------------------------
 # S3: session-workspace checkpoint bucket
 # The CodeAPI control plane (not the MicroVM) reads/writes these. Encrypted,
@@ -54,7 +124,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifact" {
 # --------------------------------------------------------------------------
 resource "aws_s3_bucket" "checkpoint" {
   bucket        = "${var.name_prefix}-checkpoints-${var.region}-${local.account_id}"
-  force_destroy = true
+  force_destroy = var.checkpoint_force_destroy
   tags          = local.base_tags
 }
 
@@ -88,6 +158,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "checkpoint" {
 
 resource "aws_s3_bucket_lifecycle_configuration" "checkpoint" {
   bucket = aws_s3_bucket.checkpoint.id
+  depends_on = [
+    aws_s3_bucket_versioning.checkpoint,
+  ]
   rule {
     id     = "expire-checkpoints"
     status = "Enabled"
@@ -96,7 +169,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "checkpoint" {
       days = var.checkpoint_retention_days
     }
     noncurrent_version_expiration {
-      noncurrent_days = var.checkpoint_retention_days
+      noncurrent_days = var.checkpoint_noncurrent_retention_days
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
     }
   }
 }
@@ -127,8 +203,9 @@ resource "aws_cloudwatch_log_group" "runtime" {
 
 # --------------------------------------------------------------------------
 # IAM: build role (assumed by Lambda during create/update-microvm-image)
-# Trust MUST include sts:TagSession, and perms MUST include logs:* + s3:GetObject
-# or the build FAILS with an empty stateReason (undebuggable).
+# Trust MUST include sts:TagSession, and perms MUST include writes to the exact
+# pre-created build log group plus s3:GetObject or the build FAILS with an empty
+# stateReason (undebuggable).
 # --------------------------------------------------------------------------
 data "aws_iam_policy_document" "build_trust" {
   statement {
@@ -152,34 +229,39 @@ data "aws_iam_policy_document" "build_perms" {
     sid       = "ArtifactRead"
     effect    = "Allow"
     actions   = ["s3:GetObject"]
-    resources = ["arn:aws:s3:::${local.artifact_bucket}/*"]
+    resources = ["arn:${data.aws_partition.current.partition}:s3:::${local.artifact_bucket}/*"]
   }
 
   statement {
     sid     = "BuildLogs"
     effect  = "Allow"
-    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    # Two ARN forms: the log-group itself (CreateLogGroup) and its streams
-    # (`:*` suffix — CreateLogStream/PutLogEvents act at stream level, which the
-    # `/*` form does NOT match). Missing `:*` = build fails with empty stateReason.
-    resources = [
-      "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/lambda-microvms/*",
-      "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/lambda-microvms/*:*",
-    ]
+    actions = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    # The group is pre-created above. Stream actions need the `:*` suffix; `/*`
+    # does not match log-stream ARNs.
+    resources = ["${aws_cloudwatch_log_group.build.arn}:*"]
   }
 
   dynamic "statement" {
     for_each = var.private_ecr ? [1] : []
     content {
-      sid    = "PrivateEcrPull"
+      sid       = "PrivateEcrAuth"
+      effect    = "Allow"
+      actions   = ["ecr:GetAuthorizationToken"]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.private_ecr ? [1] : []
+    content {
+      sid    = "PrivateEcrRepositoryPull"
       effect = "Allow"
       actions = [
-        "ecr:GetAuthorizationToken",
         "ecr:BatchCheckLayerAvailability",
         "ecr:GetDownloadUrlForLayer",
         "ecr:BatchGetImage",
       ]
-      resources = ["*"]
+      resources = [local.runner_repository_arn]
     }
   }
 }
@@ -216,14 +298,9 @@ data "aws_iam_policy_document" "exec_perms" {
   statement {
     sid     = "RuntimeLogs"
     effect  = "Allow"
-    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    # Group ARN for CreateLogGroup + the `:*` stream form for the stream-level
-    # actions (the group is pre-created here, but grant both so the runtime
-    # logging agent works regardless).
-    resources = [
-      aws_cloudwatch_log_group.runtime.arn,
-      "${aws_cloudwatch_log_group.runtime.arn}:*",
-    ]
+    actions = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    # The group is Terraform-managed; the runtime may write only its streams.
+    resources = ["${aws_cloudwatch_log_group.runtime.arn}:*"]
   }
 }
 
@@ -231,6 +308,58 @@ resource "aws_iam_role_policy" "execution" {
   name   = "runtime-logs"
   role   = aws_iam_role.execution.id
   policy = data.aws_iam_policy_document.exec_perms.json
+}
+
+# --------------------------------------------------------------------------
+# IAM: CodeAPI worker caller policy
+# RunMicrovm has two dependent permissions that are easy to miss:
+# iam:PassRole for the runtime execution role and lambda:PassNetworkConnector
+# for every ingress/egress connector supplied on the request.
+# --------------------------------------------------------------------------
+data "aws_iam_policy_document" "worker_microvm_control" {
+  statement {
+    sid    = "OperateCodeapiMicrovms"
+    effect = "Allow"
+    actions = [
+      "lambda:RunMicrovm",
+      "lambda:GetMicrovm",
+      "lambda:CreateMicrovmAuthToken",
+      "lambda:TerminateMicrovm",
+    ]
+    resources = [local.microvm_image_arn]
+  }
+
+  statement {
+    sid       = "PassMicrovmExecutionRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.execution.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["lambda.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid     = "PassMicrovmNetworkConnectors"
+    effect  = "Allow"
+    actions = ["lambda:PassNetworkConnector"]
+    # This permission-only action currently exposes no resource type.
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "worker_microvm_control" {
+  name   = "${var.name_prefix}-worker-microvm-control"
+  policy = data.aws_iam_policy_document.worker_microvm_control.json
+  tags   = local.base_tags
+}
+
+resource "aws_iam_role_policy_attachment" "worker_microvm_control" {
+  count      = var.codeapi_worker_role_name == "" ? 0 : 1
+  role       = var.codeapi_worker_role_name
+  policy_arn = aws_iam_policy.worker_microvm_control.arn
 }
 
 # --------------------------------------------------------------------------
@@ -256,6 +385,12 @@ resource "aws_iam_policy" "checkpoint_access" {
   name   = "${var.name_prefix}-checkpoint-access"
   policy = data.aws_iam_policy_document.checkpoint_access.json
   tags   = local.base_tags
+}
+
+resource "aws_iam_role_policy_attachment" "worker_checkpoint_access" {
+  count      = var.codeapi_worker_role_name == "" ? 0 : 1
+  role       = var.codeapi_worker_role_name
+  policy_arn = aws_iam_policy.checkpoint_access.arn
 }
 
 resource "aws_iam_user" "checkpoint" {

@@ -45,6 +45,16 @@ export function applyRunHook(body: unknown): MicrovmRunContext {
   const microvmId = typeof parsed.microvmId === 'string' ? parsed.microvmId : undefined;
   const runHookPayload = typeof parsed.runHookPayload === 'string' ? parsed.runHookPayload : undefined;
 
+  /* A malformed first delivery must not permanently win the idempotency slot.
+   * Lambda can retry lifecycle hooks, so only a payload carrying the platform
+   * identity becomes the immutable run context. Keep returning an ephemeral
+   * context for malformed calls because the hook must still acknowledge them
+   * with 200 rather than failing the lifecycle operation. */
+  if (microvmId == null) {
+    logger.warn('Ignoring /run hook without a valid microvmId');
+    return runContext ?? { microvmId, runHookPayload, receivedAt: Date.now() };
+  }
+
   if (runContext == null) {
     runContext = { microvmId, runHookPayload, receivedAt: Date.now() };
     const binding = parseSessionBinding(runHookPayload);

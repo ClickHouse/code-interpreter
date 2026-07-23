@@ -1,27 +1,51 @@
 import axios from 'axios';
+import * as fs from 'fs';
+import { Readable } from 'stream';
 import type { MicrovmAuthToken } from './lambda-client';
 import { microvmPortHeaders } from './lambda-client';
-import type { CheckpointStore } from './checkpoint-store';
+import {
+  CheckpointTooLargeError,
+  checkpointArtifactFromStream,
+  type CheckpointArtifact,
+  type CheckpointStore,
+} from './checkpoint-store';
 import {
   acquireRuntimeSessionLock,
   allocateCheckpointSequence,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
-  reseedCheckpointSequence,
   writeRuntimeSessionRecord,
 } from './registry';
 import { checkpointObjectKey } from './checkpoint-store';
 import { microvmCheckpoints, microvmRestores, microvmCheckpointBytes } from '../metrics';
+import { CHECKPOINT_METADATA_TIMEOUT_CAP_MS } from '../config';
 import logger from '../logger';
 
-/** Reject if `promise` doesn't settle within `ms`. The underlying op is not
- *  cancelled (the object-store client has no abort hook), but the caller stops
- *  waiting so a stalled write can't hold the session lock indefinitely. */
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+/** Reject if `promise` doesn't settle within `ms`, so a stalled metadata leg
+ * cannot hold the session lock. The production S3-compatible store separately
+ * attaches an AbortSignal deadline to every request and streamed transfer,
+ * which destroys the underlying transport when its hard bound expires. */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+  onLateValue?: (value: T) => void | Promise<void>,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
     promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
+      (value) => {
+        clearTimeout(timer);
+        if (timedOut) {
+          if (onLateValue) void Promise.resolve(onLateValue(value)).catch(() => {});
+          return;
+        }
+        resolve(value);
+      },
       (err) => { clearTimeout(timer); reject(err); },
     );
   });
@@ -33,10 +57,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * checkpoint after each exec yields complete, tear-free coverage: if a newer
  * exec already holds the lock we skip, and that exec's own post-checkpoint
  * covers our changes. Restore runs in-path on relaunch, before the first
- * execute on the fresh VM. Failures are never fatal: a missed checkpoint
- * degrades to file-ref recovery, a failed restore degrades to a fresh
- * workspace ("a resumed VM can be faster, but a relaunched VM must be
- * correct").
+ * execute on the fresh VM. A missed post-exec checkpoint is non-fatal and
+ * leaves the prior durable pointer intact. Restore failures fail closed and
+ * recycle the fresh VM rather than silently running against an empty or
+ * partially restored workspace.
  */
 
 export interface CheckpointConfig {
@@ -53,38 +77,57 @@ export interface CheckpointConfig {
 const RUNTIME_SESSION_ID_HEADER = 'X-Runtime-Session-Id';
 
 export async function pullCheckpoint(
-  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; runtimeSessionId: string },
+  args: {
+    mintToken: () => Promise<MicrovmAuthToken>;
+    endpointBase: string;
+    runtimeSessionId: string;
+    signal?: AbortSignal;
+  },
   config: CheckpointConfig,
-): Promise<Buffer> {
+): Promise<CheckpointArtifact> {
   const token = await args.mintToken();
-  const response = await axios.get<ArrayBuffer>(`${args.endpointBase}/api/v2/session/checkpoint`, {
+  const response = await axios.get<Readable>(`${args.endpointBase}/api/v2/session/checkpoint`, {
     headers: {
       [token.headerName]: token.token,
       ...microvmPortHeaders(config.port),
       [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
     },
-    responseType: 'arraybuffer',
-    maxContentLength: config.maxBytes,
+    responseType: 'stream',
     timeout: config.timeoutMs,
+    signal: args.signal,
   });
-  return Buffer.from(response.data);
+  const announced = Number(response.headers['content-length']);
+  if (Number.isFinite(announced) && announced > config.maxBytes) {
+    response.data.destroy();
+    throw new CheckpointTooLargeError(
+      `checkpoint ${announced}B exceeds maxBytes ${config.maxBytes}B`,
+    );
+  }
+  return checkpointArtifactFromStream(response.data, config.maxBytes);
 }
 
 export async function pushRestore(
-  args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; runtimeSessionId: string },
-  data: Buffer,
+  args: {
+    mintToken: () => Promise<MicrovmAuthToken>;
+    endpointBase: string;
+    runtimeSessionId: string;
+    signal?: AbortSignal;
+  },
+  data: CheckpointArtifact,
   config: CheckpointConfig,
 ): Promise<void> {
   const token = await args.mintToken();
-  await axios.post(`${args.endpointBase}/api/v2/session/restore`, data, {
+  await axios.post(`${args.endpointBase}/api/v2/session/restore`, fs.createReadStream(data.path), {
     headers: {
       [token.headerName]: token.token,
       ...microvmPortHeaders(config.port),
       [RUNTIME_SESSION_ID_HEADER]: args.runtimeSessionId,
       'Content-Type': 'application/x-gtar',
+      'Content-Length': String(data.size),
     },
     maxBodyLength: config.maxBytes,
     timeout: config.timeoutMs,
+    signal: args.signal,
   });
 }
 
@@ -95,11 +138,11 @@ export async function pushRestore(
  */
 export async function probeInputs(
   args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; signal?: AbortSignal },
-  refs: Array<{ storage_session_id: string; id: string }>,
+  refs: Array<{ cache_key: string }>,
   config: CheckpointConfig,
-): Promise<Array<{ storage_session_id: string; id: string }>> {
+): Promise<Array<{ cache_key: string }>> {
   const token = await args.mintToken();
-  const response = await axios.post<{ missing?: Array<{ storage_session_id: string; id: string }> }>(
+  const response = await axios.post<{ missing?: Array<{ cache_key: string }> }>(
     `${args.endpointBase}/api/v2/session/inputs/probe`,
     { refs },
     {
@@ -112,24 +155,51 @@ export async function probeInputs(
       signal: args.signal,
     },
   );
-  return response.data?.missing ?? [];
+  const missing = response.data?.missing;
+  if (!Array.isArray(missing)) {
+    throw new Error('Runner returned an invalid input probe response');
+  }
+  const requested = new Set(refs.map(ref => ref.cache_key));
+  const seen = new Set<string>();
+  for (const ref of missing) {
+    if (
+      typeof ref?.cache_key !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(ref.cache_key) ||
+      !requested.has(ref.cache_key) ||
+      seen.has(ref.cache_key)
+    ) {
+      throw new Error('Runner returned an invalid input probe response');
+    }
+    seen.add(ref.cache_key);
+  }
+  return missing;
 }
 
 /** Pushes a digest-named input batch into the VM's runner-local cache. Never
  *  touches the sandbox workspace — priming does that, from the cache. */
 export async function pushInputs(
   args: { mintToken: () => Promise<MicrovmAuthToken>; endpointBase: string; signal?: AbortSignal },
-  data: Buffer,
+  data: NodeJS.ReadableStream | Buffer | (() => NodeJS.ReadableStream),
   config: CheckpointConfig,
+  contentLength?: number,
+  expandedBytes?: number,
 ): Promise<void> {
   const token = await args.mintToken();
-  await axios.post(`${args.endpointBase}/api/v2/session/inputs`, data, {
+  /* Build file streams only after token minting succeeds. An eagerly-created
+   * fs.ReadStream opens on a later tick; if minting rejects, caller cleanup can
+   * unlink the archive first and the stream then emits an unhandled ENOENT. */
+  const requestData = typeof data === 'function' ? data() : data;
+  await axios.post(`${args.endpointBase}/api/v2/session/inputs`, requestData, {
     headers: {
       [token.headerName]: token.token,
       ...microvmPortHeaders(config.port),
       'Content-Type': 'application/x-gtar',
+      ...(contentLength === undefined ? {} : { 'Content-Length': String(contentLength) }),
+      ...(expandedBytes === undefined
+        ? {}
+        : { 'X-CodeAPI-Input-Expanded-Bytes': String(expandedBytes) }),
     },
-    maxBodyLength: config.maxBytes,
+    maxBodyLength: Math.max(config.maxBytes, contentLength ?? 0),
     timeout: config.timeoutMs,
     signal: args.signal,
   });
@@ -150,9 +220,11 @@ export async function checkpointSession(args: {
   config: CheckpointConfig;
   normalizeEndpoint: (endpoint: string) => string;
   lockToken?: string;
+  signal?: AbortSignal;
 }): Promise<'stored' | 'skipped_busy' | 'skipped_state' | 'failed'> {
   const heldToken = args.lockToken;
   const lockToken = heldToken ?? await acquireRuntimeSessionLock(args.runtimeSessionId);
+  let data: CheckpointArtifact | undefined;
   if (!lockToken) {
     microvmCheckpoints.inc({ outcome: 'skipped_busy' });
     return 'skipped_busy';
@@ -164,30 +236,32 @@ export async function checkpointSession(args: {
       return 'skipped_state';
     }
     const microvmId = record.microvm_id;
-    const data = await pullCheckpoint({
+    data = await pullCheckpoint({
       mintToken: () => args.mintToken(microvmId),
       endpointBase: args.normalizeEndpoint(record.endpoint),
       runtimeSessionId: args.runtimeSessionId,
+      signal: args.signal,
     }, args.config);
-    /* Allocate the checkpoint's sequence. INCR==1 means a fresh OR TTL-reset
-     * counter, so seed it above any objects still retained in the store (else a
-     * post-idle checkpoint would write seq 1 and restore would keep picking a
-     * stale higher-sequence object). Checkpoints for one session serialize on
-     * the lock, so this read-then-seed has no concurrent writer. */
-    let sequence = await allocateCheckpointSequence(args.runtimeSessionId);
-    if (sequence === 1) {
-      const retainedMax = await withTimeout(
-        args.store.latestSequence(args.runtimeSessionId),
-        args.config.timeoutMs,
-        'checkpoint store.latestSequence',
-      );
-      if (retainedMax >= sequence) {
-        sequence = retainedMax + 1;
-        await reseedCheckpointSequence(args.runtimeSessionId, sequence);
-      }
-    }
-    /* Fence the pointer write first: if it reports we were fenced, skip the
-     * store entirely. */
+    /* Read the durable high-water mark before reserving a sequence. The Redis
+     * reservation atomically advances above max(counter, retainedMax), so even
+     * a stale holder that resumes after lock expiry receives a distinct object
+     * key and cannot overwrite the newer holder's committed checkpoint. */
+    const retainedMax = await withTimeout(
+      args.store.latestSequence(args.runtimeSessionId),
+      Math.min(args.config.timeoutMs, CHECKPOINT_METADATA_TIMEOUT_CAP_MS),
+      'checkpoint store.latestSequence',
+    );
+    const sequence = await allocateCheckpointSequence(args.runtimeSessionId, retainedMax);
+    /* Upload immutable data first. If this times out or we lose the lock before
+     * the pointer CAS, it is only an uncommitted orphan: restore ignores it. */
+    await withTimeout(
+      args.store.put(args.runtimeSessionId, sequence, data),
+      args.config.timeoutMs,
+      'checkpoint store.put',
+    );
+
+    /* Commit the exact pointer under the session fence only after the object
+     * exists. This prevents a crash/timeout from publishing a missing object. */
     const persisted = await writeRuntimeSessionRecord({
       ...record,
       workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, sequence),
@@ -197,14 +271,36 @@ export async function checkpointSession(args: {
       microvmCheckpoints.inc({ outcome: 'skipped_busy' });
       return 'skipped_busy';
     }
-    /* Bound the object-store write by the checkpoint timeout too — otherwise a
-     * stalled S3/MinIO put holds the session lock past JOB_TIMEOUT. */
+
+    /* The Redis pointer is authoritative while present. A durable commit
+     * marker lets a later restore recover after Redis TTL/loss without ever
+     * selecting an uncommitted late upload. Marker/GC failures must not undo
+     * the already-committed pointer. */
+    let markerCommitted = false;
     await withTimeout(
-      args.store.put(args.runtimeSessionId, sequence, data),
-      args.config.timeoutMs,
-      'checkpoint store.put',
-    );
-    microvmCheckpointBytes.observe(data.length);
+      args.store.commit(args.runtimeSessionId, sequence),
+      Math.min(args.config.timeoutMs, CHECKPOINT_METADATA_TIMEOUT_CAP_MS),
+      'checkpoint store.commit',
+    ).then(() => {
+      markerCommitted = true;
+    }).catch(error => {
+      logger.warn('Checkpoint commit marker failed; Redis pointer remains authoritative', {
+        runtimeSessionId: args.runtimeSessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+    /* Never prune the previous durable recovery point unless the new marker
+     * exists. The Redis pointer can outlive a marker failure, but Redis loss
+     * must still fall back to the prior committed pair. */
+    if (markerCommitted) {
+      void args.store.pruneOlderThan(args.runtimeSessionId, sequence).catch(error => {
+        logger.warn('Checkpoint garbage collection failed', {
+          runtimeSessionId: args.runtimeSessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    microvmCheckpointBytes.observe(data.size);
     microvmCheckpoints.inc({ outcome: 'stored' });
     return 'stored';
   } catch (error) {
@@ -215,6 +311,7 @@ export async function checkpointSession(args: {
     });
     return 'failed';
   } finally {
+    await data?.cleanup().catch(() => {});
     /* Only release a lock we acquired here. */
     if (!heldToken) await releaseRuntimeSessionLock(args.runtimeSessionId, lockToken);
   }
@@ -228,24 +325,28 @@ export async function restoreSession(args: {
   microvmId: string;
   endpointBase: string;
   config: CheckpointConfig;
+  signal?: AbortSignal;
+  checkpointKey?: string;
 }): Promise<'restored' | 'absent' | 'fetch_failed' | 'push_failed'> {
-  /* The store enforces `maxBytes` before buffering (stats S3 object size first),
-   * so an oversized/stray checkpoint throws here instead of OOM'ing the worker.
+  /* The store enforces `maxBytes` before and during its streamed download, so an
+   * oversized/stray checkpoint cannot consume unbounded worker memory or disk.
    * Bound the fetch too — a stalled S3/MinIO get would otherwise hold the
    * session lock through the whole relaunch and time the request out. */
-  let data: Buffer | null;
+  let data: CheckpointArtifact | null;
   try {
     data = await withTimeout(
-      args.store.get(args.runtimeSessionId, args.config.maxBytes),
+      args.store.get(args.runtimeSessionId, args.config.maxBytes, args.checkpointKey),
       args.config.timeoutMs,
       'checkpoint store.get',
+      late => late?.cleanup(),
     );
   } catch (error) {
     /* Fetch failed before the runner was touched — the workspace is still the
-     * clean fresh-VM one, so the caller can safely execute (degraded, no
-     * restore). */
+     * clean fresh-VM one, but a prior checkpoint pointer means running there
+     * would silently lose session state. The caller fails closed and recycles
+     * this VM. */
     microvmRestores.inc({ outcome: 'failed' });
-    logger.warn('Checkpoint fetch failed; continuing with a fresh workspace', {
+    logger.warn('Checkpoint fetch failed; refusing to run with an empty workspace', {
       runtimeSessionId: args.runtimeSessionId,
       error: error instanceof Error ? error.message : String(error),
     });
@@ -260,11 +361,12 @@ export async function restoreSession(args: {
       mintToken: () => args.mintToken(args.microvmId),
       endpointBase: args.endpointBase,
       runtimeSessionId: args.runtimeSessionId,
+      signal: args.signal,
     }, data, args.config);
     microvmRestores.inc({ outcome: 'restored' });
     logger.info('Session workspace restored from checkpoint', {
       runtimeSessionId: args.runtimeSessionId,
-      bytes: data.length,
+      bytes: data.size,
     });
     return 'restored';
   } catch (error) {
@@ -278,5 +380,7 @@ export async function restoreSession(args: {
       error: error instanceof Error ? error.message : String(error),
     });
     return 'push_failed';
+  } finally {
+    await data.cleanup().catch(() => {});
   }
 }

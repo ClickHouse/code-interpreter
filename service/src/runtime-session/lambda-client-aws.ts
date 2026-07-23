@@ -67,23 +67,40 @@ function toDescription(response: {
 
 /** Minimal send-shaped surface so tests can stub the SDK client. */
 export interface MicrovmCommandSender {
-  send(command: unknown): Promise<unknown>;
+  send(command: unknown, options?: { abortSignal?: AbortSignal }): Promise<unknown>;
 }
 
 export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
   private readonly client: MicrovmCommandSender;
+  private readonly requestTimeoutMs: number;
 
-  constructor(options: { region?: string; client?: MicrovmCommandSender } = {}) {
+  constructor(options: {
+    region?: string;
+    client?: MicrovmCommandSender;
+    requestTimeoutMs?: number;
+  } = {}) {
     this.client = options.client ?? new LambdaMicrovmsClient({
       region: options.region,
       retryMode: 'adaptive',
       maxAttempts: 3,
     });
+    this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? 60_000);
   }
 
-  private async send<T>(operation: string, command: unknown): Promise<T> {
+  private async send<T>(
+    operation: string,
+    command: unknown,
+    callerSignal?: AbortSignal,
+  ): Promise<T> {
+    /* Every SDK request has its own hard deadline even when the caller does not
+     * supply one (notably best-effort termination). When a job signal exists,
+     * either deadline cancels the adaptive-retry loop and underlying handler. */
+    const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+    const abortSignal = callerSignal
+      ? AbortSignal.any([callerSignal, timeoutSignal])
+      : timeoutSignal;
     try {
-      return await this.client.send(command) as T;
+      return await this.client.send(command, { abortSignal }) as T;
     } catch (error) {
       throw new LambdaMicrovmApiError(
         classifyError(error),
@@ -94,8 +111,8 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
     }
   }
 
-  async runMicrovm(args: RunMicrovmArgs): Promise<MicrovmDescription> {
-    const response = await this.send<Parameters<typeof toDescription>[0]>('RunMicrovm', new RunMicrovmCommand({
+  async runMicrovm(args: RunMicrovmArgs, signal?: AbortSignal): Promise<MicrovmDescription> {
+    const input = {
       imageIdentifier: args.imageIdentifier,
       imageVersion: args.imageVersion,
       executionRoleArn: args.executionRoleArn,
@@ -112,39 +129,83 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
       logging: args.logGroup ? { cloudWatch: { logGroup: args.logGroup } } : undefined,
       runHookPayload: args.runHookPayload,
       clientToken: args.clientToken,
-    }));
-    return toDescription(response);
+    };
+    try {
+      const response = await this.send<Parameters<typeof toDescription>[0]>(
+        'RunMicrovm',
+        new RunMicrovmCommand(input),
+        signal,
+      );
+      return toDescription(response);
+    } catch (firstError) {
+      /* A timeout/abort or broken response is ambiguous: AWS may have accepted
+       * RunMicrovm before the client lost the response. Replay the SAME
+       * idempotency token once on an independent bounded request. If AWS
+       * accepted it, this recovers the MicroVM id so the backend can either
+       * continue or (when the job signal is already aborted) terminate it.
+       * Never reconcile deterministic validation/quota/throttle failures, and
+       * never replay a launch that lacks an idempotency token. */
+      const ambiguous =
+        !(firstError instanceof LambdaMicrovmApiError)
+        || firstError.kind === 'other';
+      if (!args.clientToken || !ambiguous) throw firstError;
+      try {
+        const recovered = await this.send<Parameters<typeof toDescription>[0]>(
+          'RunMicrovmReconcile',
+          new RunMicrovmCommand(input),
+        );
+        return toDescription(recovered);
+      } catch {
+        /* Preserve the original classification/message. The persisted session
+         * launch intent (stateful path) can make the same-token recovery on a
+         * successor; stateless VMs retain their short maximum duration. */
+        throw firstError;
+      }
+    }
   }
 
-  async getMicrovm(microvmId: string): Promise<MicrovmDescription> {
+  async getMicrovm(microvmId: string, signal?: AbortSignal): Promise<MicrovmDescription> {
     const response = await this.send<Parameters<typeof toDescription>[0]>(
       'GetMicrovm',
       new GetMicrovmCommand({ microvmIdentifier: microvmId }),
+      signal,
     );
     return toDescription(response);
   }
 
-  async suspendMicrovm(microvmId: string): Promise<void> {
-    await this.send('SuspendMicrovm', new SuspendMicrovmCommand({ microvmIdentifier: microvmId }));
+  async suspendMicrovm(microvmId: string, signal?: AbortSignal): Promise<void> {
+    await this.send(
+      'SuspendMicrovm',
+      new SuspendMicrovmCommand({ microvmIdentifier: microvmId }),
+      signal,
+    );
   }
 
-  async resumeMicrovm(microvmId: string): Promise<MicrovmDescription> {
-    const response = await this.send<Parameters<typeof toDescription>[0]>(
+  async resumeMicrovm(microvmId: string, signal?: AbortSignal): Promise<MicrovmDescription> {
+    /* ResumeMicrovm's real response is empty. Read the resource afterward
+     * instead of passing that empty object through toDescription(), which
+     * would turn every successful resume into "response omitted microvmId". */
+    await this.send(
       'ResumeMicrovm',
       new ResumeMicrovmCommand({ microvmIdentifier: microvmId }),
+      signal,
     );
-    return toDescription(response);
+    return this.getMicrovm(microvmId, signal);
   }
 
-  async terminateMicrovm(microvmId: string): Promise<void> {
-    await this.send('TerminateMicrovm', new TerminateMicrovmCommand({ microvmIdentifier: microvmId }));
+  async terminateMicrovm(microvmId: string, signal?: AbortSignal): Promise<void> {
+    await this.send(
+      'TerminateMicrovm',
+      new TerminateMicrovmCommand({ microvmIdentifier: microvmId }),
+      signal,
+    );
   }
 
   async createMicrovmAuthToken(args: {
     microvmId: string;
     port: number;
     ttlSeconds: number;
-  }): Promise<MicrovmAuthToken> {
+  }, signal?: AbortSignal): Promise<MicrovmAuthToken> {
     const expirationInMinutes = Math.min(Math.max(Math.ceil(args.ttlSeconds / 60), 1), 60);
     const response = await this.send<{ authToken?: Record<string, string> }>(
       'CreateMicrovmAuthToken',
@@ -153,6 +214,7 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
         expirationInMinutes,
         allowedPorts: [{ port: args.port }],
       }),
+      signal,
     );
     const token = response.authToken?.[MICROVM_AUTH_HEADER];
     if (token == null || token.length === 0) {

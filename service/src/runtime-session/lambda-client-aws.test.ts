@@ -83,6 +83,7 @@ describe('AwsLambdaMicrovmClient command mapping', () => {
     const { sender, sent } = stubSender([
       { microvmId: 'mvm-1', state: 'RUNNING' },
       {},
+      {},
       { microvmId: 'mvm-1', state: 'RUNNING' },
       {},
     ]);
@@ -97,6 +98,7 @@ describe('AwsLambdaMicrovmClient command mapping', () => {
       'GetMicrovmCommand',
       'SuspendMicrovmCommand',
       'ResumeMicrovmCommand',
+      'GetMicrovmCommand',
       'TerminateMicrovmCommand',
     ]);
     for (const command of sent) {
@@ -142,6 +144,101 @@ describe('AwsLambdaMicrovmClient command mapping', () => {
     const client = new AwsLambdaMicrovmClient({ client: sender });
     expect(client.createMicrovmAuthToken({ microvmId: 'mvm-1', port: 8080, ttlSeconds: 300 }))
       .rejects.toThrow(`missing ${MICROVM_AUTH_HEADER}`);
+  });
+
+  test('a hanging SDK request is aborted by the client request deadline', async () => {
+    const sender: MicrovmCommandSender = {
+      send(_command, options): Promise<unknown> {
+        return new Promise((_resolve, reject) => {
+          options?.abortSignal?.addEventListener(
+            'abort',
+            () => reject(options.abortSignal?.reason ?? new Error('aborted')),
+            { once: true },
+          );
+        });
+      },
+    };
+    const client = new AwsLambdaMicrovmClient({ client: sender, requestTimeoutMs: 10 });
+
+    await expect(client.getMicrovm('mvm-hung')).rejects.toMatchObject({
+      operation: 'GetMicrovm',
+      kind: 'other',
+    });
+  });
+
+  test('passes a caller abort signal through to the SDK request', async () => {
+    let observedSignal: AbortSignal | undefined;
+    const sender: MicrovmCommandSender = {
+      send(_command, options): Promise<unknown> {
+        observedSignal = options?.abortSignal;
+        return new Promise((_resolve, reject) => {
+          observedSignal?.addEventListener(
+            'abort',
+            () => reject(observedSignal?.reason ?? new Error('aborted')),
+            { once: true },
+          );
+        });
+      },
+    };
+    const client = new AwsLambdaMicrovmClient({ client: sender, requestTimeoutMs: 5_000 });
+    const controller = new AbortController();
+    const pending = client.createMicrovmAuthToken({
+      microvmId: 'mvm-hung',
+      port: 8080,
+      ttlSeconds: 300,
+    }, controller.signal);
+    controller.abort(new Error('job timed out'));
+
+    await expect(pending).rejects.toMatchObject({ operation: 'CreateMicrovmAuthToken' });
+    expect(observedSignal?.aborted).toBe(true);
+  });
+
+  test('replays the same client token after an ambiguous abort to recover the VM id', async () => {
+    const sent: Array<{ command: SentCommand; signal?: AbortSignal }> = [];
+    const sender: MicrovmCommandSender = {
+      send(command, options): Promise<unknown> {
+        sent.push({ command: command as SentCommand, signal: options?.abortSignal });
+        if (sent.length === 1) {
+          return new Promise((_resolve, reject) => {
+            options?.abortSignal?.addEventListener(
+              'abort',
+              () => reject(options.abortSignal?.reason ?? new Error('aborted')),
+              { once: true },
+            );
+          });
+        }
+        return Promise.resolve({
+          microvmId: 'mvm-recovered',
+          state: 'RUNNING',
+          endpoint: 'https://mvm-recovered.example',
+        });
+      },
+    };
+    const client = new AwsLambdaMicrovmClient({ client: sender, requestTimeoutMs: 5_000 });
+    const controller = new AbortController();
+    const pending = client.runMicrovm({
+      imageIdentifier: 'arn:image',
+      maximumDurationSeconds: 120,
+      clientToken: 'exec-idempotent-1',
+    }, controller.signal);
+    controller.abort(new Error('job deadline'));
+
+    await expect(pending).resolves.toMatchObject({ microvmId: 'mvm-recovered' });
+    expect(sent).toHaveLength(2);
+    expect(sent.map(item => item.command.input.clientToken))
+      .toEqual(['exec-idempotent-1', 'exec-idempotent-1']);
+    expect(sent[1].signal?.aborted).toBe(false);
+  });
+
+  test('does not reconcile a deterministic RunMicrovm rejection', async () => {
+    const { sender, sent } = stubSender([namedError('ValidationException')]);
+    const client = new AwsLambdaMicrovmClient({ client: sender });
+    await expect(client.runMicrovm({
+      imageIdentifier: 'arn:image',
+      maximumDurationSeconds: 120,
+      clientToken: 'exec-invalid',
+    })).rejects.toMatchObject({ kind: 'validation', operation: 'RunMicrovm' });
+    expect(sent).toHaveLength(1);
   });
 });
 

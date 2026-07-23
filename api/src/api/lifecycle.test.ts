@@ -40,6 +40,19 @@ describe('MicroVM /run hook context', () => {
     expect(applyRunHook({ microvmId: 42, runHookPayload: {} }).microvmId).toBeUndefined();
   });
 
+  test('a malformed first delivery does not block a valid retry', () => {
+    const malformed = applyRunHook({ runHookPayload: '{"runtime_session_id":"rt_bad"}' });
+    expect(malformed.microvmId).toBeUndefined();
+    expect(getMicrovmRunContext()).toBeUndefined();
+
+    const retried = applyRunHook({
+      microvmId: 'mvm-retried',
+      runHookPayload: '{"runtime_session_id":"rt_good"}',
+    });
+    expect(retried.microvmId).toBe('mvm-retried');
+    expect(getMicrovmRunContext()).toBe(retried);
+  });
+
   test('hook base path matches the AWS well-known prefix', () => {
     expect(LIFECYCLE_HOOK_BASE_PATH).toBe('/aws/lambda-microvms/runtime/v1');
   });

@@ -44,6 +44,23 @@ variable "artifact_bucket_name" {
   }
 }
 
+variable "artifact_retention_days" {
+  description = "Days to retain uploaded MicroVM build artifacts in the managed artifact bucket."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.artifact_retention_days > 0 && floor(var.artifact_retention_days) == var.artifact_retention_days
+    error_message = "artifact_retention_days must be a positive whole number."
+  }
+}
+
+variable "artifact_force_destroy" {
+  description = "Allow terraform destroy to remove a non-empty managed artifact bucket. Opt in only for disposable dev stacks."
+  type        = bool
+  default     = false
+}
+
 variable "checkpoint_retention_days" {
   description = <<-EOT
     Days to keep session-workspace checkpoints in the checkpoint bucket before
@@ -52,6 +69,33 @@ variable "checkpoint_retention_days" {
   EOT
   type        = number
   default     = 14
+
+  validation {
+    condition     = var.checkpoint_retention_days > 0 && floor(var.checkpoint_retention_days) == var.checkpoint_retention_days
+    error_message = "checkpoint_retention_days must be a positive whole number."
+  }
+}
+
+variable "checkpoint_noncurrent_retention_days" {
+  description = <<-EOT
+    Days to keep a noncurrent checkpoint object version after S3 replaces or
+    expires its current version. This is separate from
+    checkpoint_retention_days so bucket versioning does not silently double the
+    intended resumable-cache retention window.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.checkpoint_noncurrent_retention_days > 0 && floor(var.checkpoint_noncurrent_retention_days) == var.checkpoint_noncurrent_retention_days
+    error_message = "checkpoint_noncurrent_retention_days must be a positive whole number."
+  }
+}
+
+variable "checkpoint_force_destroy" {
+  description = "Allow terraform destroy to remove a non-empty checkpoint bucket. Opt in only for disposable dev stacks."
+  type        = bool
+  default     = false
 }
 
 variable "log_retention_days" {
@@ -70,14 +114,51 @@ variable "private_ecr" {
   default     = true
 }
 
+variable "create_ecr_repository" {
+  description = "Create the private ECR repository used by the runner image build."
+  type        = bool
+  default     = true
+}
+
+variable "ecr_repository_name" {
+  description = "Private ECR repository containing the arm64 CodeAPI runner image."
+  type        = string
+  default     = "codeapi-microvm-runner"
+}
+
+variable "ecr_force_delete" {
+  description = "Allow terraform destroy to remove a non-empty runner ECR repository. Opt in only for disposable dev stacks."
+  type        = bool
+  default     = false
+}
+
+variable "ecr_max_image_count" {
+  description = "Maximum number of runner images retained by the managed ECR repository."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.ecr_max_image_count > 0 && floor(var.ecr_max_image_count) == var.ecr_max_image_count
+    error_message = "ecr_max_image_count must be a positive whole number."
+  }
+}
+
+variable "codeapi_worker_role_name" {
+  description = <<-EOT
+    Existing CodeAPI worker/task IAM role name. When set, Terraform attaches
+    both the MicroVM control-plane policy and checkpoint S3 policy. Leave empty
+    to consume the two policy ARN outputs in your deployment stack.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "create_checkpoint_access_user" {
   description = <<-EOT
     Create an IAM user + access key with read/write on the checkpoint bucket, for
     the CodeAPI service's MinIO-compatible checkpoint client (MINIO_ACCESS_KEY /
-    MINIO_SECRET_KEY). This is currently the ONLY working path: the checkpoint
-    client reads static keys and does not load task-role/IRSA credentials, so
-    attaching `checkpoint_access_policy_arn` to a task role alone does not work
-    yet. Set true unless you supply MINIO_ACCESS_KEY/SECRET some other way.
+    MINIO_SECRET_KEY). Prefer an ECS task role, EC2 instance profile, or IRSA;
+    create static credentials only for a deployment that cannot use a role.
   EOT
   type        = bool
   default     = false

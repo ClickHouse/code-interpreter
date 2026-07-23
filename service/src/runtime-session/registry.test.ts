@@ -2,16 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import RedisMock from 'ioredis-mock';
 import {
   acquireRuntimeSessionLock,
+  allocateCheckpointSequence,
   allocateRuntimeSessionGeneration,
-  countActiveRuntimeSessions,
-  forgetRuntimeSessionActive,
-  listIdleRuntimeSessions,
   readRuntimeSessionRecord,
   releaseRuntimeSessionLock,
   removeRuntimeSession,
   resetRedisForTests,
   setRedisForTests,
-  touchRuntimeSessionActive,
   waitForRuntimeSessionLock,
   writeRuntimeSessionRecord,
   type RuntimeSessionRecord,
@@ -74,9 +71,47 @@ describe('runtime session lock', () => {
     expect(token).toBeNull();
     expect(Date.now() - started).toBeLessThan(1_000);
   });
+
+  test('waitForRuntimeSessionLock stops promptly when the job is canceled', async () => {
+    const holder = await acquireRuntimeSessionLock('rt_abc123');
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(new Error('job deadline')), 10);
+
+    await expect(waitForRuntimeSessionLock('rt_abc123', {
+      waitMs: 5_000,
+      pollMs: 1_000,
+      signal: controller.signal,
+    })).rejects.toThrow('job deadline');
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(await acquireRuntimeSessionLock('rt_abc123')).toBeNull();
+    await releaseRuntimeSessionLock('rt_abc123', holder as string);
+  });
 });
 
 describe('fenced record writes', () => {
+  test('retries a transient lock-release failure so the session is immediately reusable', async () => {
+    const token = (await acquireRuntimeSessionLock('rt_release_retry')) as string;
+    const scripted = mock as unknown as {
+      releaseRuntimeSessionLockScript(
+        lockKey: string,
+        lockToken: string,
+      ): Promise<number>;
+    };
+    const release = scripted.releaseRuntimeSessionLockScript.bind(scripted);
+    let calls = 0;
+    scripted.releaseRuntimeSessionLockScript = async (lockKey, lockToken) => {
+      calls += 1;
+      if (calls === 1) throw new Error('temporary Redis failover');
+      return release(lockKey, lockToken);
+    };
+
+    await releaseRuntimeSessionLock('rt_release_retry', token);
+
+    expect(calls).toBe(2);
+    expect(await acquireRuntimeSessionLock('rt_release_retry')).not.toBeNull();
+  });
+
   test('write succeeds while holding the lock and round-trips the record', async () => {
     const token = (await acquireRuntimeSessionLock('rt_abc123')) as string;
     const rec = record({ state: 'RUNNING', microvm_id: 'mvm-1', endpoint: 'https://vm.example', generation: 3 });
@@ -102,17 +137,15 @@ describe('fenced record writes', () => {
     expect(await writeRuntimeSessionRecord(record(), 'never-held')).toBe(false);
   });
 
-  test('removal is fenced and clears record + active member', async () => {
+  test('removal is fenced and clears the record', async () => {
     const token = (await acquireRuntimeSessionLock('rt_abc123')) as string;
     await writeRuntimeSessionRecord(record(), token);
-    await touchRuntimeSessionActive('rt_abc123', 1_778_250_000_000);
 
     expect(await removeRuntimeSession('rt_abc123', 'stale-token')).toBe(false);
     expect(await readRuntimeSessionRecord('rt_abc123')).not.toBeNull();
 
     expect(await removeRuntimeSession('rt_abc123', token)).toBe(true);
     expect(await readRuntimeSessionRecord('rt_abc123')).toBeNull();
-    expect(await countActiveRuntimeSessions()).toBe(0);
   });
 });
 
@@ -125,31 +158,17 @@ describe('generation counter', () => {
   });
 });
 
-describe('active session bookkeeping', () => {
-  test('idle listing returns only sessions last seen before the cutoff', async () => {
-    await touchRuntimeSessionActive('rt_old', 1_000);
-    await touchRuntimeSessionActive('rt_mid', 5_000);
-    await touchRuntimeSessionActive('rt_new', 9_000);
-
-    expect(await listIdleRuntimeSessions(4_999)).toEqual(['rt_old']);
-    expect(await listIdleRuntimeSessions(5_000)).toEqual(['rt_old', 'rt_mid']);
-    expect(await countActiveRuntimeSessions()).toBe(3);
-  });
-
-  test('touch updates the score in place; forget repairs orphans', async () => {
-    await touchRuntimeSessionActive('rt_abc123', 1_000);
-    await touchRuntimeSessionActive('rt_abc123', 9_000);
-    expect(await listIdleRuntimeSessions(5_000)).toEqual([]);
-    expect(await countActiveRuntimeSessions()).toBe(1);
-
-    await forgetRuntimeSessionActive('rt_abc123');
-    expect(await countActiveRuntimeSessions()).toBe(0);
-  });
-
-  test('idle listing respects the limit bound', async () => {
-    for (let i = 0; i < 5; i++) {
-      await touchRuntimeSessionActive(`rt_${i}`, i);
-    }
-    expect(await listIdleRuntimeSessions(10, 2)).toHaveLength(2);
+describe('checkpoint sequence counter', () => {
+  test('concurrent stale holders reserve distinct keys above the durable high-water mark', async () => {
+    /* Models two holders that both listed durable sequence 100 around a lease
+     * handoff. A split INCR + reseed SET can return 101 to both and let the
+     * stale upload overwrite the new holder's committed object. The atomic
+     * reservation must serialize them as 101 and 102 instead. */
+    const reservations = await Promise.all([
+      allocateCheckpointSequence('rt_abc123', 100),
+      allocateCheckpointSequence('rt_abc123', 100),
+    ]);
+    expect(reservations.sort((a, b) => a - b)).toEqual([101, 102]);
+    expect(await allocateCheckpointSequence('rt_abc123', 50)).toBe(103);
   });
 });

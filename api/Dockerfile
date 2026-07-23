@@ -121,8 +121,8 @@ COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /sandbox_api
 
-COPY api/package.json ./
-RUN bun install
+COPY api/package.json api/bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY api/tsconfig.json ./
 COPY api/src ./src

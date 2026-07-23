@@ -8,6 +8,7 @@ import { Job, type TFile } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
 import { DIRKEEP } from './validation';
+import { SessionWorkspace } from './session-workspace';
 
 /**
  * Integration tests for Job.walkDir and its extracted helpers. These tests
@@ -25,6 +26,7 @@ interface WalkerInternals {
   generatedFiles: Array<{ id: string; name: string; path: string }>;
   sessionFiles: Array<{ id: string; name: string; storage_session_id: string; modified_from?: { id: string; storage_session_id: string }; inherited?: true; entity_id?: string }>;
   inheritedRefs: Array<{ id: string; name: string; storage_session_id: string; inherited?: true; entity_id?: string }>;
+  pendingSurfaced: Map<string, { name: string; signature: string }>;
   inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string; readOnly?: boolean }>;
   files: TFile[];
   walkDir: (dir: string, depth: number, inputByName: Map<string, TFile>) => Promise<'collected' | 'empty' | 'skipped'>;
@@ -61,6 +63,7 @@ function makeJob(opts: {
    * `storage_session_id` carried on each file ref. */
   session_id?: string;
   maxFileSize?: number;
+  session?: SessionWorkspace;
 } = {}): Job {
   return new Job({
     session_id: opts.session_id ?? 'test-session',
@@ -71,6 +74,7 @@ function makeJob(opts: {
     timeouts: { compile: 5000, run: 5000 },
     cpu_times: { compile: 5000, run: 5000 },
     memory_limits: { compile: 100_000_000, run: 100_000_000 },
+    session: opts.session,
   });
 }
 
@@ -372,13 +376,12 @@ describe('walkDir / regular file handling', () => {
     expect(internals.inheritedRefs[0]).not.toHaveProperty('entity_id');
   });
 
-  it('treats a downloaded input as generated when no hash baseline exists (e.g. download failed)', async () => {
+  it('treats a by-ref-shaped file without a hash baseline as generated', async () => {
     const name = 'inherited.py';
     const full = path.join(tmpDir, name);
-    /* Simulate the failure scenario: downloadAndWriteFile returned null
-     * (never populated inputFileHashes), but the sandboxed run still
-     * produced bytes at this path. Echoing the stale inherited ref would
-     * lie to the client about content, so this must upload as generated. */
+    /* Defense in depth for callers that construct a Job directly without
+     * priming it. Normal execution now fails before running when a required
+     * download cannot be completed. */
     await fsp.writeFile(full, 'print("new bytes produced by the run")');
 
     const downloaded: TFile = {
@@ -808,6 +811,32 @@ describe('walkDir / dirent classification', () => {
 });
 
 describe('createDirkeepMarker / symlink safety', () => {
+  it('tracks a successfully uploaded synthetic marker across session turns', async () => {
+    await fsp.mkdir(path.join(tmpDir, 'empty'));
+    const keepRel = path.join('empty', DIRKEEP);
+    const session = new SessionWorkspace({ runtimeSessionId: 'rt_dirkeep' });
+
+    const first = asInternals(makeJob({ session }));
+    first.submissionDir = tmpDir;
+    await first.walkDir(tmpDir, 0, new Map());
+
+    const marker = first.generatedFiles.find(file => file.name === keepRel);
+    expect(marker).toBeDefined();
+    const pending = first.pendingSurfaced.get(marker!.id);
+    expect(pending).toEqual({ name: keepRel, signature: sha256('') });
+
+    /* uploadGeneratedFiles commits this exact pending entry only after the
+     * object PUT succeeds. Model that successful commit, then scan the same
+     * persistent workspace on the next turn. */
+    session.markSurfaced(pending!.name, pending!.signature);
+    const second = asInternals(makeJob({ session }));
+    second.submissionDir = tmpDir;
+    await second.walkDir(tmpDir, 0, new Map());
+
+    expect(second.generatedFiles.some(file => file.name === keepRel)).toBe(false);
+    expect(second.sessionFiles.some(file => file.name === keepRel)).toBe(false);
+  });
+
   it('refuses to write a .dirkeep marker through an existing symlink', async () => {
     /* Simulate a malicious sandbox that plants a .dirkeep symlink pointing
      * to a sensitive file outside the empty directory. The marker write

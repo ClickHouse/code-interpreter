@@ -48,11 +48,130 @@ const defaultJobTimeoutMs = Number(process.env.JOB_TIMEOUT) || 300000;
 const defaultMaxFileSize = Number(process.env.MAX_FILE_SIZE) || 25 * 1024 * 1024;
 const defaultExecutionManifestTtlSeconds = Math.min(Math.ceil((defaultJobTimeoutMs + 60000) / 1000), 600);
 const EGRESS_GRANT_GRACE_MS = 10 * 60 * 1000;
+/** Object-store listing and marker writes are metadata operations, not
+ * checkpoint transfers. Bound each tightly so the post-exec checkpoint
+ * reserve does not consume a full transfer timeout for a tiny request. */
+export const CHECKPOINT_METADATA_TIMEOUT_CAP_MS = 5_000;
+
+/** Worst-case time reserved after a successful session execute for the
+ * checkpoint pipeline:
+ *   token throttle + guest pull + object listing + object upload + marker.
+ * The two large transfers receive the configured transfer timeout; the two
+ * metadata operations receive the smaller metadata cap. */
+export function checkpointPipelineBudgetMs(
+  launchTimeoutMs: number,
+  checkpointTimeoutMs: number,
+): number {
+  const metadataTimeoutMs = Math.min(
+    checkpointTimeoutMs,
+    CHECKPOINT_METADATA_TIMEOUT_CAP_MS,
+  );
+  return launchTimeoutMs + 2 * checkpointTimeoutMs + 2 * metadataTimeoutMs;
+}
+
+/** BullMQ's `timestamp` is the enqueue time. Anchor the worker deadline to it
+ * so queueing consumes the same caller-visible JOB_TIMEOUT budget instead of
+ * granting a second full timeout after a delayed job finally starts. */
+export function jobDeadlineAtMs(
+  enqueuedAtMs: number | undefined,
+  timeoutMs: number,
+  nowMs: number = Date.now(),
+): number {
+  return Number.isFinite(enqueuedAtMs) && (enqueuedAtMs as number) > 0
+    ? (enqueuedAtMs as number) + timeoutMs
+    : nowMs + timeoutMs;
+}
 
 export function parseArnList(raw: string | undefined): string[] | undefined {
   if (raw == null) return undefined;
   const entries = raw.split(',').map((entry) => entry.trim()).filter((entry) => entry.length > 0);
   return entries.length > 0 ? entries : undefined;
+}
+
+export interface LambdaMicrovmNumericConfig {
+  LAMBDA_MICROVM_PORT: number;
+  LAMBDA_MICROVM_MAX_DURATION_SECONDS: number;
+  LAMBDA_MICROVM_IDLE_SECONDS: number;
+  LAMBDA_MICROVM_SUSPEND_SECONDS: number;
+  LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: number;
+  LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: number;
+  LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: number;
+  LAMBDA_MICROVM_LAUNCH_TPS: number;
+  LAMBDA_MICROVM_TOKEN_TPS: number;
+}
+
+type LambdaMicrovmNumericEnv = Record<string, string | undefined>;
+
+interface IntegerRange {
+  min: number;
+  max?: number;
+}
+
+const lambdaMicrovmNumericRanges: Record<keyof LambdaMicrovmNumericConfig, IntegerRange> = {
+  LAMBDA_MICROVM_PORT: { min: 1, max: 65_535 },
+  LAMBDA_MICROVM_MAX_DURATION_SECONDS: { min: 1, max: 28_800 },
+  LAMBDA_MICROVM_IDLE_SECONDS: { min: 60, max: 28_800 },
+  LAMBDA_MICROVM_SUSPEND_SECONDS: { min: 0, max: 28_800 },
+  /* Keep proxy credentials shorter than the AWS 60-minute maximum. */
+  LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: { min: 1, max: 900 },
+  LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: { min: 1 },
+  LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: { min: 1 },
+  LAMBDA_MICROVM_LAUNCH_TPS: { min: 1 },
+  LAMBDA_MICROVM_TOKEN_TPS: { min: 1 },
+};
+
+const lambdaMicrovmNumericDefaults: LambdaMicrovmNumericConfig = {
+  LAMBDA_MICROVM_PORT: 8080,
+  LAMBDA_MICROVM_MAX_DURATION_SECONDS: 28_800,
+  /* 30min keeps a session's VM fully RUNNING (RAM + page cache live, ~0.3s
+   * follow-ups) across a realistic conversation gap before it suspends;
+   * 5min proved too aggressive — heavy libraries (chdb ~400MB) pay a
+   * 30-120s lazy rootfs re-read whenever the cache is lost. */
+  LAMBDA_MICROVM_IDLE_SECONDS: 1_800,
+  LAMBDA_MICROVM_SUSPEND_SECONDS: 1_800,
+  LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: 300,
+  LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: 60_000,
+  LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: 5_000,
+  LAMBDA_MICROVM_LAUNCH_TPS: 4,
+  LAMBDA_MICROVM_TOKEN_TPS: 8,
+};
+
+/** Parse configured values without `||` so an intentional zero survives long
+ * enough for the range validator to accept it where AWS does (suspend duration)
+ * and reject it everywhere else. */
+export function resolveLambdaMicrovmNumericConfig(
+  source: LambdaMicrovmNumericEnv,
+): LambdaMicrovmNumericConfig {
+  const read = (name: keyof LambdaMicrovmNumericConfig): number => {
+    const raw = source[name];
+    return raw == null || raw.trim() === '' ? lambdaMicrovmNumericDefaults[name] : Number(raw);
+  };
+  return {
+    LAMBDA_MICROVM_PORT: read('LAMBDA_MICROVM_PORT'),
+    LAMBDA_MICROVM_MAX_DURATION_SECONDS: read('LAMBDA_MICROVM_MAX_DURATION_SECONDS'),
+    LAMBDA_MICROVM_IDLE_SECONDS: read('LAMBDA_MICROVM_IDLE_SECONDS'),
+    LAMBDA_MICROVM_SUSPEND_SECONDS: read('LAMBDA_MICROVM_SUSPEND_SECONDS'),
+    LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: read('LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS'),
+    LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: read('LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS'),
+    LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: read('LAMBDA_MICROVM_HEALTH_TIMEOUT_MS'),
+    LAMBDA_MICROVM_LAUNCH_TPS: read('LAMBDA_MICROVM_LAUNCH_TPS'),
+    LAMBDA_MICROVM_TOKEN_TPS: read('LAMBDA_MICROVM_TOKEN_TPS'),
+  };
+}
+
+/** Returns the first invalid Lambda numeric setting for fail-fast startup. */
+export function lambdaMicrovmNumericConfigError(
+  config: LambdaMicrovmNumericConfig,
+): string | undefined {
+  for (const name of Object.keys(lambdaMicrovmNumericRanges) as Array<keyof LambdaMicrovmNumericConfig>) {
+    const value = config[name];
+    const { min, max } = lambdaMicrovmNumericRanges[name];
+    if (!Number.isSafeInteger(value) || value < min || (max != null && value > max)) {
+      const range = max == null ? `at least ${min}` : `between ${min} and ${max}`;
+      return `${name} must be a whole number ${range}`;
+    }
+  }
+  return undefined;
 }
 
 export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, jobTimeoutMs: number): number {
@@ -67,6 +186,12 @@ export function resolveEgressGrantTtlSeconds(rawTtlSeconds: string | undefined, 
   }
 
   return Math.max(1, Math.ceil(configuredTtlSeconds));
+}
+
+const lambdaMicrovmNumericConfig = resolveLambdaMicrovmNumericConfig(process.env);
+
+function configuredNumber(raw: string | undefined, fallback: number): number {
+  return raw == null || raw.trim() === '' ? fallback : Number(raw);
 }
 
 export const env = {
@@ -152,8 +277,7 @@ export const env = {
    * Sandbox execution backend.
    * - `http` (default): POST signed execute requests to SANDBOX_ENDPOINT
    *   (current Kubernetes/libkrun sandbox-runner).
-   * - `lambda-microvm`: AWS Lambda MicroVM backend. Startup policy rejects
-   *   this value until the backend implementation lands.
+   * - `lambda-microvm`: AWS Lambda MicroVM backend.
    */
   SANDBOX_BACKEND: (process.env.CODEAPI_SANDBOX_BACKEND === 'lambda-microvm'
     ? 'lambda-microvm'
@@ -161,16 +285,19 @@ export const env = {
   /**
    * Runtime session affinity for stateful sandbox backends.
    * - `stateless` (default): no runtime sessions; `runtime_session_hint` ignored.
-   * - `affinity`: best-effort session reuse; contention falls back to a
-   *   stateless one-shot execution (correct because payloads always carry
-   *   file refs — warmth is only an optimization).
-   * - `strict`: sessions required; contention surfaces as HTTP 409.
+   * - `affinity`: stateful session reuse; contention surfaces as HTTP 409
+   *   rather than silently losing workspace state in a stateless execution.
+   * - `strict`: same serialized session semantics, and a session hint is
+   *   required instead of degrading requests without one to stateless.
    */
   RUNTIME_SESSION_MODE: (process.env.CODEAPI_RUNTIME_SESSION_MODE === 'affinity'
     || process.env.CODEAPI_RUNTIME_SESSION_MODE === 'strict'
     ? process.env.CODEAPI_RUNTIME_SESSION_MODE
     : 'stateless') as 'stateless' | 'affinity' | 'strict',
-  RUNTIME_SESSION_LOCK_WAIT_MS: Number(process.env.CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS) || 15_000,
+  RUNTIME_SESSION_LOCK_WAIT_MS: configuredNumber(
+    process.env.CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS,
+    15_000,
+  ),
   // Lambda MicroVM backend. Connector lists are comma-separated ARNs.
   LAMBDA_MICROVM_IMAGE_ARN: process.env.LAMBDA_MICROVM_IMAGE_ARN ?? '',
   LAMBDA_MICROVM_IMAGE_VERSION: process.env.LAMBDA_MICROVM_IMAGE_VERSION || undefined,
@@ -181,34 +308,20 @@ export const env = {
   LAMBDA_MICROVM_REGION: process.env.LAMBDA_MICROVM_REGION || undefined,
   LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_INGRESS_CONNECTOR_ARNS),
   LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS: parseArnList(process.env.LAMBDA_MICROVM_EGRESS_CONNECTOR_ARNS),
-  LAMBDA_MICROVM_PORT: Number(process.env.LAMBDA_MICROVM_PORT) || 8080,
-  LAMBDA_MICROVM_MAX_DURATION_SECONDS: Math.min(
-    Number(process.env.LAMBDA_MICROVM_MAX_DURATION_SECONDS) || 28_800,
-    28_800,
-  ),
-  /* 30min keeps a session's VM fully RUNNING (RAM + page cache live, ~0.3s
-   * follow-ups) across a realistic conversation gap before it suspends;
-   * 5min proved too aggressive — heavy libraries (chdb ~400MB) pay a
-   * 30-120s lazy rootfs re-read whenever the cache is lost. */
-  LAMBDA_MICROVM_IDLE_SECONDS: Number(process.env.LAMBDA_MICROVM_IDLE_SECONDS) || 1800,
-  LAMBDA_MICROVM_SUSPEND_SECONDS: Number(process.env.LAMBDA_MICROVM_SUSPEND_SECONDS) || 1_800,
-  LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS: Number(process.env.LAMBDA_MICROVM_AUTH_TOKEN_TTL_SECONDS) || 300,
-  LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS: Number(process.env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS) || 60_000,
-  LAMBDA_MICROVM_HEALTH_TIMEOUT_MS: Number(process.env.LAMBDA_MICROVM_HEALTH_TIMEOUT_MS) || 5_000,
-  LAMBDA_MICROVM_LAUNCH_TPS: Number(process.env.LAMBDA_MICROVM_LAUNCH_TPS) || 4,
-  LAMBDA_MICROVM_RESUME_TPS: Number(process.env.LAMBDA_MICROVM_RESUME_TPS) || 4,
-  LAMBDA_MICROVM_SUSPEND_TPS: Number(process.env.LAMBDA_MICROVM_SUSPEND_TPS) || 1,
+  ...lambdaMicrovmNumericConfig,
   /* CreateMicrovmAuthToken is minted per execute + per checkpoint; share a
    * fleet-wide budget so concurrent warm-session executes queue instead of
    * bursting past the AWS TPS limit. */
-  LAMBDA_MICROVM_TOKEN_TPS: Number(process.env.LAMBDA_MICROVM_TOKEN_TPS) || 8,
   LAMBDA_MICROVM_ALLOW_SHELL: process.env.LAMBDA_MICROVM_ALLOW_SHELL === 'true',
   /* Session workspace checkpoints (effective only in affinity/strict modes).
    * On by default so VM expiry/eviction recovery is automatic; the byte cap
    * bounds tar size pulled from the VM and stored to S3. */
   SESSION_CHECKPOINTS: process.env.CODEAPI_SESSION_CHECKPOINTS !== 'false',
-  CHECKPOINT_MAX_BYTES: Number(process.env.CODEAPI_CHECKPOINT_MAX_BYTES) || 512 * 1024 * 1024,
-  CHECKPOINT_TIMEOUT_MS: Number(process.env.CODEAPI_CHECKPOINT_TIMEOUT_MS) || 60_000,
+  CHECKPOINT_MAX_BYTES: configuredNumber(
+    process.env.CODEAPI_CHECKPOINT_MAX_BYTES,
+    512 * 1024 * 1024,
+  ),
+  CHECKPOINT_TIMEOUT_MS: configuredNumber(process.env.CODEAPI_CHECKPOINT_TIMEOUT_MS, 60_000),
   CHECKPOINT_PREFIX: process.env.CODEAPI_CHECKPOINT_PREFIX ?? 'rtsx-checkpoints/',
 };
 
