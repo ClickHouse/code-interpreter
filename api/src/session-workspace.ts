@@ -117,6 +117,10 @@ export class SessionWorkspace {
    *  baseline on reuse so a writable input mutated by a prior turn is reported
    *  as modified-from-original rather than re-hashed as if it were pristine. */
   private readonly primed = new Map<string, { id: string; readOnly: boolean; hash?: string; sessionId?: string }>();
+  /** relPaths the control plane pushed into the workspace for the NEXT execute
+   *  (see {@link consumeFreshDelivery}). Never checkpointed: it describes a
+   *  single turn's delivery, not durable workspace state. */
+  private readonly delivered = new Set<string>();
 
   constructor(binding: SessionBinding) {
     this.runtimeSessionId = binding.runtimeSessionId;
@@ -161,6 +165,27 @@ export class SessionWorkspace {
     const entry = this.primed.get(relPath);
     if (!entry || entry.readOnly) return undefined;
     return entry.id;
+  }
+
+  /**
+   * Consumes the "the control plane just pushed this exact ref" marker for
+   * `relPath`. Push-model backends (MicroVM) deliver inputs over the authed
+   * proxy immediately before the execute, so the on-disk copy is pristine and
+   * trusted for THIS run — including read-only refs, which `primedInputId`
+   * deliberately reports as unprimed. Without this the runner would fall
+   * through to the pull path, which has nothing reachable to pull from.
+   * One-shot by design: a later exec that does not re-push gets the normal
+   * (id, storage session) reuse rules back.
+   */
+  consumeFreshDelivery(relPath: string, id: string, storageSessionId?: string): boolean {
+    if (!this.delivered.delete(relPath)) return false;
+    const entry = this.primed.get(relPath);
+    return entry?.id === id && entry?.sessionId === storageSessionId;
+  }
+
+  /** Records that the control plane delivered `relPath` for the next execute. */
+  markDelivered(relPath: string): void {
+    this.delivered.add(relPath);
   }
 
   /** Whether `relPath` was primed as an input on any earlier turn (regardless
@@ -210,6 +235,13 @@ export class SessionWorkspace {
    *  restored in-place-modified input with its original, and re-upload every
    *  restored file as a new output. */
   loadMeta(snapshot: SessionMetaSnapshot): void {
+    /* REPLACE, never merge: the restored workspace is the authoritative
+     * content, so entries from a prior (failed or superseded) restore that the
+     * snapshot omits must not linger — a stale primed entry would suppress a
+     * real file from the output scan. */
+    this.primed.clear();
+    this.surfaced.clear();
+    this.delivered.clear();
     for (const [relPath, entry] of snapshot.primed) this.primed.set(relPath, entry);
     for (const [relPath, hash] of snapshot.surfaced) this.surfaced.set(relPath, hash);
   }
@@ -224,6 +256,7 @@ export class SessionWorkspace {
     const wiped = await resetSessionWorkspace();
     this.surfaced.clear();
     this.primed.clear();
+    this.delivered.clear();
     this.lease = undefined;
     if (!wiped) {
       logger.error(

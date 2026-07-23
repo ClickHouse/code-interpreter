@@ -748,11 +748,19 @@ export class Job {
 
   async computeFileHash(filePath: string, noFollow = false): Promise<string> {
     const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(filePath, noFollow
-      ? { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW }
-      : undefined);
-    for await (const chunk of stream) hash.update(chunk as Buffer);
-    return hash.digest('hex');
+    /* Numeric open flags are only typed on fsp.open; `createReadStream`'s
+     * options want a string mode with no O_NOFOLLOW spelling, so open the
+     * handle first and stream from it. */
+    const handle = noFollow
+      ? await fsp.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+      : undefined;
+    try {
+      const stream = handle ? handle.createReadStream() : fs.createReadStream(filePath);
+      for await (const chunk of stream) hash.update(chunk as Buffer);
+      return hash.digest('hex');
+    } finally {
+      await handle?.close().catch(() => {});
+    }
   }
 
   /**
@@ -908,11 +916,22 @@ export class Job {
   private async reusePrimedInput(file: TFile): Promise<boolean> {
     const session = this.session;
     if (!session || !file.id) return false;
-    if (session.primedInputId(file.name) !== file.id) return false;
-    /* Match the storage session too: refs are addressed by (storage_session_id,
-     * id), so a later turn reusing the same path + id from a DIFFERENT storage
-     * session must re-download rather than run against the prior session's bytes. */
-    if (session.primedSessionId(file.name) !== file.storage_session_id) return false;
+    /* A ref the control plane pushed for THIS execute is pristine by
+     * construction (trusted channel, written moments ago under the session
+     * lock), so it is reusable even when read-only — on push-model backends
+     * the pull fallback has nothing reachable to download from. */
+    const freshlyDelivered = session.consumeFreshDelivery(
+      file.name,
+      file.id,
+      file.storage_session_id,
+    );
+    if (!freshlyDelivered) {
+      if (session.primedInputId(file.name) !== file.id) return false;
+      /* Match the storage session too: refs are addressed by (storage_session_id,
+       * id), so a later turn reusing the same path + id from a DIFFERENT storage
+       * session must re-download rather than run against the prior session's bytes. */
+      if (session.primedSessionId(file.name) !== file.storage_session_id) return false;
+    }
     const filePath = path.join(this.submissionDir, file.name);
     try {
       const st = await fsp.lstat(filePath);
@@ -928,6 +947,11 @@ export class Job {
         originalSessionId: file.storage_session_id,
         hash,
         path: filePath,
+        /* Carry the read-only bit into this run's input info: without it the
+         * output scan would treat a modified read-only input as a normal
+         * changed file and surface it, instead of dropping the modification
+         * per the read-only contract. */
+        readOnly: session.isPrimedReadOnly(file.name) || undefined,
       });
       return true;
     } catch {
@@ -1954,7 +1978,9 @@ export class Job {
       return null;
     }
 
-    const stream = fs.createReadStream(file.path, { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW });
+    /* See computeFileHash: numeric O_NOFOLLOW is only typed via fsp.open. */
+    const uploadHandle = await fsp.open(file.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const stream = uploadHandle.createReadStream();
     stream.on('error', (error) => {
       this.log.warn({ file: file.name, err: error }, 'Upload file stream error');
     });

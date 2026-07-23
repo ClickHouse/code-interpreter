@@ -12,6 +12,7 @@ import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
+import type { SessionWorkspace } from '../session-workspace';
 import {
   RUNTIME_SESSION_ID_HEADER,
   bindSessionWorkspace,
@@ -184,7 +185,17 @@ function getJob(
    * would reuse that session's files/UID (defense-in-depth — the backend always
    * sends the header for a session VM, so this only guards stray requests). */
   const binding = parseSessionBindingFromHeader(runtimeSessionHeader);
-  const session = binding ? bindSessionWorkspace(binding) ?? null : null;
+  let session: SessionWorkspace | null = null;
+  if (binding) {
+    session = bindSessionWorkspace(binding) ?? null;
+    /* The runner is already pinned to a DIFFERENT session. Falling through
+     * with `session = null` would silently run the request as a stateless
+     * one-shot under another session's workspace/UID; conflict loudly instead
+     * so the control plane recycles this VM. */
+    if (!session) {
+      throw { status: 409, message: 'Runner is bound to a different runtime session' };
+    }
+  }
 
   return new Job({
     session_id: session_id ?? null,
@@ -358,7 +369,13 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       const message = error instanceof Error
         ? error.message
         : (error as { message?: unknown })?.message;
-      return res.status(400).json({ message: message || 'Bad request' });
+      /* Most validation paths are 400; a session-binding conflict carries its
+       * own status so the control plane can tell "bad request" from "this VM
+       * belongs to another session, recycle me". */
+      const status = (error as { status?: unknown })?.status;
+      return res
+        .status(typeof status === 'number' ? status : 400)
+        .json({ message: message || 'Bad request' });
     }
 
     try {
@@ -474,8 +491,11 @@ router.get('/runtimes', (_req: Request, res: Response) => {
 function bindSessionFromHeader(req: Request): boolean {
   const binding = parseSessionBindingFromHeader(req.headers[RUNTIME_SESSION_ID_HEADER]);
   if (!binding) return false;
-  bindSessionWorkspace(binding);
-  return true;
+  /* A REJECTED bind (this runner is already pinned to a different session)
+   * must fail the request too — proceeding would run checkpoint/restore/file
+   * delivery for the requested session against the previously bound session's
+   * workspace. */
+  return bindSessionWorkspace(binding) != null;
 }
 
 /* Express 4 (pinned) does NOT auto-forward rejected route-handler promises, so

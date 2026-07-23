@@ -6,7 +6,11 @@ import * as path from 'path';
 import type { Request, Response } from 'express';
 import { pipeline } from 'stream/promises';
 import { logger } from './logger';
-import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID } from './workspace-isolation';
+import {
+  SANDBOX_WORKSPACE_ROOT,
+  SESSION_WORKSPACE_ID,
+  applyReadOnlyInputPermissions,
+} from './workspace-isolation';
 import type { SessionMetaSnapshot, SessionWorkspace } from './session-workspace';
 import { SESSION_META_FILE, SESSION_META_MARKER, getBoundSessionWorkspace } from './session-workspace';
 
@@ -101,6 +105,11 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
       tar.on('close', resolve);
       tar.on('error', reject);
     });
+    /* Observe the rejection immediately: when `tar` fails to spawn, `pipeline`
+     * below rejects first and we never reach `await closed` — an unobserved
+     * rejection would then take the whole runner down after we already
+     * answered 500. The later `await closed` still sees the same rejection. */
+    closed.catch(() => {});
     await pipeline(tar.stdout, res);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`checkpoint tar exited ${code}`);
@@ -148,6 +157,11 @@ export async function restoreSessionCheckpoint(req: Request, res: Response): Pro
       tar.on('close', resolve);
       tar.on('error', reject);
     });
+    /* Observe the rejection immediately: when `tar` fails to spawn, `pipeline`
+     * below rejects first and we never reach `await closed` — an unobserved
+     * rejection would then take the whole runner down after we already
+     * answered 500. The later `await closed` still sees the same rejection. */
+    closed.catch(() => {});
     await pipeline(req, tar.stdin);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
@@ -205,6 +219,11 @@ export async function receiveSessionFiles(req: Request, res: Response): Promise<
       tar.on('close', resolve);
       tar.on('error', reject);
     });
+    /* Observe the rejection immediately: when `tar` fails to spawn, `pipeline`
+     * below rejects first and we never reach `await closed` — an unobserved
+     * rejection would then take the whole runner down after we already
+     * answered 500. The later `await closed` still sees the same rejection. */
+    closed.catch(() => {});
     await pipeline(req, tar.stdin);
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`session files tar exited ${code}`);
@@ -232,35 +251,59 @@ export async function receiveSessionFiles(req: Request, res: Response): Promise<
  */
 async function applyDeliveredFilesManifest(session: SessionWorkspace, dir: string): Promise<void> {
   const manifestPath = path.join(dir, SESSION_FILES_MANIFEST_FILE);
+  const stat = await fsp.lstat(manifestPath).catch(() => null);
+  /* No manifest at all: a legacy/manifest-less delivery. Nothing to register,
+   * and nothing is broken — the pull path still applies where reachable. */
+  if (!stat?.isFile()) return;
+
+  let parsed: { marker?: string; files?: DeliveredFileEntry[] };
   try {
-    const stat = await fsp.lstat(manifestPath).catch(() => null);
-    if (!stat?.isFile()) return;
-    const parsed = JSON.parse(await fsp.readFile(manifestPath, 'utf8')) as {
-      marker?: string;
-      files?: DeliveredFileEntry[];
-    };
-    if (parsed?.marker !== SESSION_FILES_MANIFEST_MARKER || !Array.isArray(parsed.files)) return;
-    await fsp.rm(manifestPath, { force: true }).catch(() => {});
-    for (const entry of parsed.files) {
-      if (typeof entry?.name !== 'string' || typeof entry?.id !== 'string'
-        || typeof entry?.storage_session_id !== 'string') continue;
-      /* The manifest names workspace-relative paths; resolve and re-check
-       * containment so a malformed entry can never prime (or hash) a path
-       * outside the session workspace. */
-      const target = path.resolve(dir, entry.name);
-      if (target !== dir && !target.startsWith(dir + path.sep)) continue;
-      const st = await fsp.lstat(target).catch(() => null);
-      if (!st?.isFile()) continue;
-      session.markPrimed(
-        entry.name,
-        entry.id,
-        entry.read_only === true,
-        await sha256File(target),
-        entry.storage_session_id,
-      );
-    }
+    parsed = JSON.parse(await fsp.readFile(manifestPath, 'utf8')) as typeof parsed;
   } catch (error) {
-    logger.debug({ err: error }, 'No session files manifest to apply');
+    /* Unparseable content under the reserved name is user data, not our
+     * manifest (we never write invalid JSON): leave it in the workspace
+     * untouched, exactly like the marker-mismatch case below. */
+    logger.warn({ err: error }, 'Ignoring unparseable file at the reserved session-files manifest path');
+    return;
+  }
+  if (parsed?.marker !== SESSION_FILES_MANIFEST_MARKER || !Array.isArray(parsed.files)) return;
+
+  /* From here the manifest is provably ours, so every failure is a REAL
+   * delivery failure: priming is what makes the pushed files usable, and a
+   * push-model runner cannot fall back to pulling them. Throw so
+   * receiveSessionFiles answers 500 and the control plane recycles, instead
+   * of acknowledging a delivery the next execute cannot use. */
+  await fsp.rm(manifestPath, { force: true });
+  for (const entry of parsed.files) {
+    if (typeof entry?.name !== 'string' || typeof entry?.id !== 'string'
+      || typeof entry?.storage_session_id !== 'string') {
+      throw new SessionCheckpointError('Malformed session files manifest entry');
+    }
+    /* The manifest names workspace-relative paths; resolve and re-check
+     * containment so a malformed entry can never prime (or hash) a path
+     * outside the session workspace. */
+    const target = path.resolve(dir, entry.name);
+    if (target !== dir && !target.startsWith(dir + path.sep)) {
+      throw new SessionCheckpointError(`Session files manifest escapes the workspace: ${entry.name}`);
+    }
+    const st = await fsp.lstat(target).catch(() => null);
+    if (!st?.isFile()) {
+      throw new SessionCheckpointError(`Session files manifest names a missing file: ${entry.name}`);
+    }
+    const readOnly = entry.read_only === true;
+    if (readOnly) {
+      /* Same defense-in-depth as the pull path: root-owned 0444 so the sandbox
+       * UID can read an infrastructure file but cannot chmod it writable. Runs
+       * AFTER the delivery-wide chown, which would otherwise hand it back.
+       * Best-effort exactly like the pull path (an unprivileged runner outside
+       * hardened mode cannot chown), so a failure warns rather than voiding a
+       * delivery whose bytes are already correct. */
+      await applyReadOnlyInputPermissions(target).catch((err) => {
+        logger.warn({ file: entry.name, err }, 'Failed to protect read-only delivered input');
+      });
+    }
+    session.markPrimed(entry.name, entry.id, readOnly, await sha256File(target), entry.storage_session_id);
+    session.markDelivered(entry.name);
   }
 }
 

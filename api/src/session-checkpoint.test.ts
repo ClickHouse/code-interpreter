@@ -147,8 +147,6 @@ describe('receiveSessionFiles (additive delivery)', () => {
         files: [
           { name: 'upload.csv', id: 'file_up1', storage_session_id: 'store_1' },
           { name: 'skill.md', id: 'file_ro1', storage_session_id: 'store_1', read_only: true },
-          { name: '../escape.txt', id: 'file_bad', storage_session_id: 'store_1' },
-          { name: 'never-delivered.txt', id: 'file_missing', storage_session_id: 'store_1' },
         ],
       }),
     });
@@ -167,11 +165,36 @@ describe('receiveSessionFiles (additive delivery)', () => {
     expect(session!.isPrimedInput('skill.md')).toBe(true);
     expect(session!.isPrimedReadOnly('skill.md')).toBe(true);
     expect(session!.primedInputId('skill.md')).toBeUndefined();
-    /* Traversal names and entries with no on-disk file are ignored. */
-    expect(session!.primedInputId('../escape.txt')).toBeUndefined();
-    expect(session!.primedInputId('never-delivered.txt')).toBeUndefined();
+    /* Both are reusable for THIS exec, read-only included: on a push-model
+     * backend the pull fallback has nothing reachable to download from. */
+    expect(session!.consumeFreshDelivery('upload.csv', 'file_up1', 'store_1')).toBe(true);
+    expect(session!.consumeFreshDelivery('skill.md', 'file_ro1', 'store_1')).toBe(true);
+    /* One-shot: a later exec that does not re-push falls back to the normal
+     * (id, storage session) reuse rules. */
+    expect(session!.consumeFreshDelivery('skill.md', 'file_ro1', 'store_1')).toBe(false);
     /* The reserved member is consumed, never left for user code to see. */
     expect(await fsp.lstat(path.join(dir, SESSION_FILES_MANIFEST_FILE)).catch(() => null)).toBeNull();
+  });
+
+  test('a manifest naming a path outside the workspace fails the delivery', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_files_bad' });
+    seedNonRootIdentity(session!);
+    await session!.ownership();
+
+    const archive = await makeArchive({
+      'upload.csv': 'a,b\n1,2\n',
+      [SESSION_FILES_MANIFEST_FILE]: JSON.stringify({
+        marker: SESSION_FILES_MANIFEST_MARKER,
+        files: [{ name: '../escape.txt', id: 'file_bad', storage_session_id: 'store_1' }],
+      }),
+    });
+    const res = fakeStreamRes();
+    await receiveSessionFiles(Readable.from(archive) as never, res as never);
+
+    /* Priming is what makes a pushed file usable; acknowledging a delivery the
+     * next execute cannot use would strand it on the unreachable pull path. */
+    expect(res.statusCode).toBe(500);
   });
 
   test('a corrupt archive fails WITHOUT wiping existing workspace content', async () => {

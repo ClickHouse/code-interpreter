@@ -446,7 +446,7 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
      * any in-place modification the first exec made to the file. */
     expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(1);
     const record = await readRuntimeSessionRecord('rt_session_1');
-    expect(record?.delivered_files).toEqual(['sess_store_1/file_1']);
+    expect(record?.delivered_files).toEqual(['sess_store_1/file_1@inputs/data.csv']);
     expect(record?.delivered_at).toBeGreaterThan(0);
   });
 
@@ -463,6 +463,41 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     /* The manifest carries the read-only bit so the runner primes accordingly. */
     const untarred = zlib.gunzipSync(lastSessionFilesBody!).toString('latin1');
     expect(untarred).toContain('"read_only":true');
+  });
+
+  test('the same object under a NEW filename is still delivered', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+
+    const renamed = request();
+    renamed.body.files = [
+      { id: 'file_1', storage_session_id: 'sess_store_1', name: 'inputs/copy.csv' },
+    ];
+    await backend.execute(renamed, sessionContext());
+
+    /* Same (storage session, id) but a path the workspace does not have yet:
+     * skipping it would leave the exec without the file it asked for. */
+    expect(captured.filter((c) => c.path === '/api/v2/session/files')).toHaveLength(2);
+    const record = await readRuntimeSessionRecord('rt_session_1');
+    expect(record?.delivered_files).toContain('sess_store_1/file_1@inputs/data.csv');
+    expect(record?.delivered_files).toContain('sess_store_1/file_1@inputs/copy.csv');
+  });
+
+  test('lock contention with by-ref inputs fails retryably instead of losing them', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, { lockWaitMs: 10 });
+    /* Hold the session lock so the execute cannot acquire it. */
+    const held = await acquireRuntimeSessionLock('rt_session_1');
+    expect(held).toBeTruthy();
+
+    /* The stateless fallback has no session workspace, so push delivery never
+     * runs and the runner would have to pull the refs — impossible on this
+     * backend. BUSY is retryable; running without inputs is silently wrong. */
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
+      'carries input files',
+    );
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
   });
 
   test('a failed file delivery recycles the VM instead of executing partial inputs', async () => {
@@ -573,7 +608,12 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     const backend = makeBackend(fake, { lockWaitMs: 100 });
     await acquireRuntimeSessionLock('rt_session_1', 60_000);
 
-    const result = await backend.execute(request(), sessionContext({ runtimeSessionMode: 'affinity' }));
+    /* No by-reference inputs: the fallback costs only warm workspace state (an
+     * optimization). A request WITH refs must fail retryably instead — see
+     * 'lock contention with by-ref inputs'. */
+    const inline = request();
+    inline.body.files = [{ name: 'main.py', content: 'print(1)' }];
+    const result = await backend.execute(inline, sessionContext({ runtimeSessionMode: 'affinity' }));
     expect(result).toEqual(EXECUTE_RESPONSE);
     /* Stateless fallback: launched a one-shot VM and terminated it. */
     const runArgs = fake.callsFor('runMicrovm')[0].args as { runHookPayload?: string; clientToken: string };

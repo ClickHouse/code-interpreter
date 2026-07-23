@@ -177,8 +177,18 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       if (ctx.runtimeSessionMode === 'strict') {
         throw new SandboxBackendError('RUNTIME_SESSION_BUSY', `Runtime session ${runtimeSessionId} is busy`);
       }
-      /* Affinity: warmth is only an optimization — fall back to a correct
-       * stateless one-shot (the payload still carries all file refs). */
+      /* A stateless one-shot has no session workspace, so the push-delivery leg
+       * never runs and the runner would have to PULL the refs — which is
+       * exactly what it cannot do on this backend (internet-only egress). Fail
+       * retryably instead of running the code without its inputs. Requests
+       * with no by-reference inputs still take the fallback: they lose warm
+       * workspace state (an optimization) but nothing they asked for. */
+      if (sessionFileRefs(req.body.files).length > 0) {
+        throw new SandboxBackendError(
+          'RUNTIME_SESSION_BUSY',
+          `Runtime session ${runtimeSessionId} is busy and the request carries input files`,
+        );
+      }
       runtimeSessionFallback.inc();
       return this.executeStateless(client, req, ctx);
     }
@@ -195,9 +205,18 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * instead. A transient renew ERROR does not abort: the TTL is three
      * intervals, so the next tick retries long before expiry. */
     const fence = new AbortController();
+    /* Persistent renew ERRORS are as dangerous as an explicit fence: once the
+     * lease can no longer be proven held past its TTL, another worker may have
+     * taken it. Track the last confirmed renewal and fence on lease expiry. */
+    let lastHeldAt = Date.now();
     const heartbeat = setInterval(() => {
       void renewRuntimeSessionLock(runtimeSessionId, lockToken).then((renewal) => {
-        if (renewal === 'lost') {
+        if (renewal === 'held') {
+          lastHeldAt = Date.now();
+          return;
+        }
+        const leaseExpired = Date.now() - lastHeldAt >= RUNTIME_SESSION_LOCK_TTL_MS;
+        if (renewal === 'lost' || leaseExpired) {
           clearInterval(heartbeat);
           fence.abort();
         }
@@ -306,10 +325,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * is dead, not that the runner rejected the request; recycle it, else
        * every later call keeps reusing the dead VM until idle expiry. */
       const status = axios.isAxiosError(error) ? error.response?.status ?? 0 : 0;
-      /* A fence abort means another worker holds the lock and may already be
-       * using this VM — never terminate it out from under them. Our stale
-       * lockToken makes the registry writes no-ops anyway; just stop. */
+      /* Fenced: another worker owns the lock and will reuse this VM. Aborting
+       * our HTTP request does NOT stop the runner's NsJail child (it runs to
+       * completion after the socket closes), so leaving the VM alive would let
+       * two executions mutate one persistent workspace concurrently. Terminate
+       * it: the new holder's call fails fast on the dead endpoint and
+       * relaunches + restores from the last checkpoint. A surfaced error and a
+       * relaunch beat silent workspace corruption. The registry write is a
+       * no-op under our stale token, which is fine — the reuse path already
+       * recycles records pointing at dead VMs. */
       if (fenceSignal?.aborted === true) {
+        await this.terminate(client, vm.microvmId, 'error').catch(() => {});
         throw new SandboxBackendError(
           'MICROVM_FENCED',
           `Lost session lock for ${runtimeSessionId} during execute`,
@@ -626,7 +652,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     const deliveredSet = new Set(deliveredBefore);
     const refs = sessionFileRefs(req.body.files)
       .filter((ref) => !deliveredSet.has(sessionFileRefKey(ref)));
-    if (refs.length === 0) return;
+    if (refs.length === 0) {
+      await this.recordDeliveredFiles(runtimeSessionId, lockToken, deliveredBefore, []);
+      return;
+    }
     const archive = await buildSessionFilesArchive(refs, {
       timeoutMs: this.config.checkpoint.timeoutMs,
       maxBytes: this.config.checkpoint.maxBytes,
@@ -655,12 +684,32 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         error,
       );
     }
-    if (archive.deliveredKeys.length === 0) return;
+    await this.recordDeliveredFiles(runtimeSessionId, lockToken, deliveredBefore, archive.deliveredKeys);
+  }
+
+  /**
+   * Reconciles the session record with the set of refs the LIVE workspace now
+   * holds. Must run even when every ref was skipped: a relaunch writes a fresh
+   * RUNNING record that carries no delivery metadata, so the carried-forward
+   * `deliveredBefore` (validated against the restore) would otherwise be lost
+   * and the next warm call would re-push originals over restored edits.
+   */
+  private async recordDeliveredFiles(
+    runtimeSessionId: string,
+    lockToken: string,
+    deliveredBefore: string[],
+    newlyDelivered: string[],
+  ): Promise<void> {
+    const effective = Array.from(new Set([...deliveredBefore, ...newlyDelivered]));
+    if (effective.length === 0) return;
     const current = await readRuntimeSessionRecord(runtimeSessionId);
     if (!current) return;
-    const merged = Array.from(new Set([...(current.delivered_files ?? []), ...archive.deliveredKeys]));
+    const existing = current.delivered_files ?? [];
+    const unchanged = existing.length === effective.length
+      && effective.every((key) => existing.includes(key));
+    if (unchanged) return;
     const persisted = await writeRuntimeSessionRecord(
-      { ...current, delivered_files: merged, delivered_at: Date.now() },
+      { ...current, delivered_files: effective, delivered_at: Date.now() },
       lockToken,
     );
     if (!persisted) {

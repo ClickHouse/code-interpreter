@@ -50,9 +50,12 @@ export interface SessionFileRef {
   name: string;
 }
 
-/** `<storage_session_id>/<id>` — the registry key for a delivered ref. */
+/** `<storage_session_id>/<id>@<name>` — the registry key for a delivered ref.
+ *  The destination path is part of the identity: the SAME object presented
+ *  under a new filename is a file the workspace does not have yet and must
+ *  still be delivered. */
 export function sessionFileRefKey(ref: SessionFileRef): string {
-  return `${ref.storage_session_id}/${ref.id}`;
+  return `${ref.storage_session_id}/${ref.id}@${ref.name}`;
 }
 
 /** The by-reference subset of the payload's files (inline `content` entries
@@ -124,6 +127,12 @@ export async function buildSessionFilesArchive(
       }
       const name = safeRelativeName(stage, ref.name);
       if (!name) throw new SessionFilesError(`Unsafe input file name: ${ref.name}`);
+      /* The manifest rides in the archive under a reserved name. A user input
+       * claiming that name would be silently replaced by protocol metadata (and
+       * then deleted by the runner), so refuse the delivery instead. */
+      if (name === SESSION_FILES_MANIFEST_FILE) {
+        throw new SessionFilesError(`Input file name is reserved: ${SESSION_FILES_MANIFEST_FILE}`);
+      }
       if (seen.has(name)) continue;
       seen.add(name);
       const fetched = await fetchFileObject(baseUrl, ref, opts);

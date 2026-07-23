@@ -1,4 +1,5 @@
 import type * as t from '../types';
+import { getAxiosErrorDetails } from '../utils';
 
 /**
  * Fully built sandbox execute request: `body` already carries the egress
@@ -49,6 +50,15 @@ export type SandboxBackendErrorCode =
  *  from the sandbox POST itself are rethrown raw by every backend. */
 export class SandboxBackendError extends Error {
   /**
+   * The originating failure, ALWAYS stored sanitized. Backend causes are
+   * routinely axios errors whose `config` carries the minted MicroVM auth
+   * header, the internal service token, and (on a push) the request body —
+   * i.e. the archive bytes. Callers log wrapper errors wholesale, so
+   * sanitizing at construction is the only place that covers every path.
+   */
+  public readonly cause?: unknown;
+
+  /**
    * @param transient - Marks a failure the backend may safely retry once with
    * fresh identifiers (e.g. a MicroVM that reached a terminal state during
    * boot). Throttles, aborts, and deadline timeouts stay non-transient: a
@@ -57,10 +67,11 @@ export class SandboxBackendError extends Error {
   constructor(
     public readonly code: SandboxBackendErrorCode,
     message: string,
-    public readonly cause?: unknown,
+    cause?: unknown,
     public readonly transient: boolean = false,
   ) {
     super(message);
     this.name = 'SandboxBackendError';
+    this.cause = cause === undefined ? undefined : getAxiosErrorDetails(cause);
   }
 }
