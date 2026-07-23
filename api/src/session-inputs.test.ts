@@ -40,7 +40,24 @@ async function makeBatch(
   return tar.stdout;
 }
 
+/**
+ * Cross-component contract. The control plane names batch members with ITS
+ * implementation of this digest and the runner looks entries up with THIS one;
+ * nothing else ties them together, so both suites assert the same vector.
+ *
+ * They silently diverged once — one side used a literal NUL separator, the
+ * other a space — and every push landed in the cache under names no lookup
+ * would ever produce. Both unit suites passed (each self-consistent) and only
+ * a live execution showed it, as "file not found" for files that had been
+ * delivered successfully.
+ */
+const GOLDEN_KEY_SID_1_FILE_1 = 'a995f1e7977466c5636419d21582e0b44420c44d2d7e2660b13aa4d4b4667d90';
+
 describe('pushed input cache', () => {
+  test('digests match the wire contract the control plane names members with', () => {
+    expect(inputCacheKey('sid-1', 'file-1')).toBe(GOLDEN_KEY_SID_1_FILE_1);
+  });
+
   test('lives outside the workspace root so the reaper cannot eat it', async () => {
     /* Regression: the cache was originally a dot-directory INSIDE
      * SANDBOX_WORKSPACE_ROOT, where the stale-workspace reaper treats every

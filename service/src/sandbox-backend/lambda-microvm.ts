@@ -638,6 +638,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         refs.map((ref) => ({ storage_session_id: ref.storage_session_id, id: ref.id })),
         this.config.checkpoint,
       );
+      logger.info('Session input delivery', {
+        microvmId: vm.microvmId,
+        refs: refs.length,
+        missing: missing.length,
+      });
       if (missing.length === 0) return;
       const wanted = new Set(missing.map((ref) => `${ref.storage_session_id}/${ref.id}`));
       const batch = await buildInputBatch(

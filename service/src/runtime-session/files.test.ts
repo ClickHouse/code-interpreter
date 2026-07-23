@@ -56,6 +56,21 @@ async function membersOf(data: Buffer): Promise<string[]> {
   }
 }
 
+/**
+ * Cross-component contract — see the twin assertion in the runner's
+ * session-inputs.test.ts. Members are named here and looked up there, so a
+ * silent divergence makes every delivery land under names the runner can never
+ * find. That happened (NUL vs space separator) and only live execution caught
+ * it; this vector is what makes it a test failure instead.
+ */
+const GOLDEN_KEY_SID_1_FILE_1 = 'a995f1e7977466c5636419d21582e0b44420c44d2d7e2660b13aa4d4b4667d90';
+
+describe('inputCacheKey', () => {
+  test('matches the digest the runner resolves cache entries with', () => {
+    expect(inputCacheKey('sid-1', 'file-1')).toBe(GOLDEN_KEY_SID_1_FILE_1);
+  });
+});
+
 describe('sessionFileRefs', () => {
   test('collapses the same object requested under multiple names', () => {
     /* Identity is (storage session, id): one delivery, and priming writes it

@@ -44,7 +44,7 @@ export interface SessionFileRef {
 /** Mirrors the runner's `inputCacheKey` (api/src/session-inputs.ts): both ends
  *  ship in the same image, so the digest is a hard-coded contract. */
 export function inputCacheKey(storageSessionId: string, id: string): string {
-  return crypto.createHash('sha256').update(`${storageSessionId} ${id}`, 'utf8').digest('hex');
+  return crypto.createHash('sha256').update(`${storageSessionId}\u0000${id}`, 'utf8').digest('hex');
 }
 
 /** The by-reference subset of the payload's files (inline `content` entries
