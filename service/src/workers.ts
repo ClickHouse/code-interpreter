@@ -13,7 +13,7 @@ import { buildSandboxExecuteRequest } from './sandbox-dispatch';
 import { prepareInputDelivery } from './runtime-session/input-delivery';
 import { SessionFilesError } from './runtime-session/files';
 import { resolveRuntimeSessionIdForJob } from './runtime-session/job-policy';
-import { getSandboxBackend, SandboxBackendError } from './sandbox-backend';
+import { getSandboxBackend, SandboxBackendError, type SandboxRawResponse } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
 import { withSpan, withTraceContext } from './telemetry';
 import logger from './logger';
@@ -95,6 +95,30 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
       isSynthetic: isSyntheticJob,
     });
 
+    /* Stateful Lambda runs this inside its session commit barrier. The worker
+     * still invokes it unconditionally as the HTTP/stateless fallback; marking
+     * the transformed object makes that second call an idempotent no-op. */
+    const resultRestoreToken = egressGrantTokenForRestore;
+    const finalizedSandboxResults = new WeakSet<SandboxRawResponse>();
+    const finalizeSandboxResult = async (result: SandboxRawResponse): Promise<SandboxRawResponse> => {
+      if (
+        resultRestoreToken === undefined ||
+        resultRestoreToken.length === 0 ||
+        finalizedSandboxResults.has(result)
+      ) {
+        return result;
+      }
+      const restored = await restoreGatewaySandboxResult({
+        grantId: egressGrantId,
+        egressGrantToken: resultRestoreToken,
+        result,
+        isSynthetic: isSyntheticJob,
+        signal: controller.signal,
+      });
+      finalizedSandboxResults.add(restored);
+      return restored;
+    };
+
     const responseRaw = await getSandboxBackend().execute(
       {
         body: sandboxRequest.body,
@@ -111,18 +135,16 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         canonicalUserId: job.data.canonicalUserId,
         runtimeSessionId,
         runtimeSessionMode: env.RUNTIME_SESSION_MODE,
+        /* Stateful backends run this as a commit barrier after user code but
+         * before checkpointing/reusing the mutated workspace. Stateless/HTTP
+         * paths retain the worker-owned fallback immediately below. */
+        sessionResultFinalizer: resultRestoreToken !== undefined && resultRestoreToken.length > 0
+          ? finalizeSandboxResult
+          : undefined,
       },
     );
 
-    const responseData = egressGrantTokenForRestore
-      ? await restoreGatewaySandboxResult({
-        grantId: egressGrantId,
-        egressGrantToken: egressGrantTokenForRestore,
-        result: responseRaw,
-        isSynthetic: isSyntheticJob,
-        signal: controller.signal,
-      })
-      : responseRaw;
+    const responseData = await finalizeSandboxResult(responseRaw);
 
     if (!isSyntheticJob) {
       logger.info('Sandbox response', summarizeSandboxResponse(responseData));

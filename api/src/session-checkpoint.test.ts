@@ -393,6 +393,23 @@ describe('restoreSessionCheckpoint', () => {
     expect(session!.dirtyReason).toBe('checkpoint restore failed');
   });
 
+  test('rejects a checkpoint whose expanded tar stream exceeds the runner-local cap', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_expansion_bomb' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    const archive = await makeArchive({ 'highly-compressible.txt': 'x'.repeat(32 * 1024) });
+    config.checkpoint_max_bytes = archive.length + 1024;
+    expect(archive.length).toBeLessThan(config.checkpoint_max_bytes);
+
+    const res = fakeStreamRes();
+    await restoreSessionCheckpoint(Readable.from(archive) as never, res as never);
+
+    expect(res.statusCode).toBe(500);
+    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
+    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+  });
+
   test('rejects malformed metadata in a present new-format control member', async () => {
     config.session_workspace_enabled = true;
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_bad_control' });

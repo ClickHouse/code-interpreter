@@ -881,11 +881,41 @@ export class Job {
     }
   }
 
+  /**
+   * Atomically replaces this ref's provisional/previous aliases with its
+   * authoritative destination. There is no await in this transition: two
+   * concurrent downloads resolving to the same path cannot both pass the
+   * conflict check and start writing.
+   */
+  private reserveInputDestination(file: TFile, destination: string): void {
+    const conflict = [...this.inputDestinations.entries()].find(
+      ([reserved, owner]) =>
+        owner !== file
+        && (
+          reserved === destination
+          || reserved.startsWith(`${destination}/`)
+          || destination.startsWith(`${reserved}/`)
+        ),
+    );
+    if (conflict) {
+      throw new ValidationError(
+        `Conflicting input destinations: ${conflict[0]} and ${destination}`,
+      );
+    }
+    for (const [reserved, owner] of this.inputDestinations) {
+      if (owner === file && reserved !== destination) {
+        this.inputDestinations.delete(reserved);
+      }
+    }
+    this.inputDestinations.set(destination, file);
+  }
+
   async prime(): Promise<void> {
     this.inputDestinations.clear();
+    const requestedDestinations = new Map<string, TFile>();
     for (const file of this.files) {
       validateFilePath(file.name, '/tmp/codeapi-request-validation');
-      const conflict = [...this.inputDestinations.entries()].find(
+      const conflict = [...requestedDestinations.entries()].find(
         ([destination, owner]) =>
           owner !== file &&
           (
@@ -899,7 +929,13 @@ export class Job {
           `Conflicting input destinations: ${conflict[0]} and ${file.name}`,
         );
       }
-      this.inputDestinations.set(file.name, file);
+      requestedDestinations.set(file.name, file);
+      /* Inline destinations are final, so keep them reserved while reference
+       * downloads resolve their authoritative Content-Disposition names.
+       * A ref's requested name is only a fallback, not a real destination yet:
+       * reserving every ref here makes concurrent swaps/order-dependent
+       * renames falsely conflict before the owning response has resolved. */
+      if (!file.id) this.inputDestinations.set(file.name, file);
     }
 
     if (this.session) {
@@ -999,7 +1035,14 @@ export class Job {
     context: PrimeOperationContext,
   ): Promise<void> {
     throwIfAborted(context.signal);
-    if (this.session && file.id && (await this.reusePrimedInput(file, context))) return;
+    if (this.session && file.id && (await this.reusePrimedInput(file, context))) {
+      /* Reuse has no response header to pass through downloadAndWriteFile, so
+       * its requested name becomes authoritative only after the on-disk copy
+       * has been verified. Reserve it before another concurrent ref can claim
+       * and overwrite that path. */
+      this.reserveInputDestination(file, file.name);
+      return;
+    }
     const name = await this.downloadAndWriteFile(file, 5, 500, context);
     if (this.session && file.id) {
       /* Record read-only so the next turn re-downloads it (primedInputId reports
@@ -1217,21 +1260,7 @@ export class Job {
 
         const originalName = resolveOriginalName(response, file);
         validateFilePath(originalName, operation.submissionDir);
-        const destinationConflict = [...this.inputDestinations.entries()].find(
-          ([destination, owner]) =>
-            owner !== file &&
-            (
-              destination === originalName ||
-              destination.startsWith(`${originalName}/`) ||
-              originalName.startsWith(`${destination}/`)
-            ),
-        );
-        if (destinationConflict) {
-          throw new ValidationError(
-            `Conflicting input destinations: ${destinationConflict[0]} and ${originalName}`,
-          );
-        }
-        this.inputDestinations.set(originalName, file);
+        this.reserveInputDestination(file, originalName);
         const finalPath = path.join(operation.submissionDir, originalName);
         const finalParent = path.dirname(finalPath);
         /* Persistent-session workspaces can hold a prior turn's symlink, so build

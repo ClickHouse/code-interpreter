@@ -145,6 +145,20 @@ describe('sandbox error formatting', () => {
     });
   });
 
+  test('maps a recycled dirty session to a retryable public failure', () => {
+    const failure = publicExecutionFailure(
+      new Error('MICROVM_UNHEALTHY: Runtime session rt_private workspace was dirty and has been recycled'),
+    );
+    expect(failure).toEqual({
+      status: 503,
+      body: {
+        error: 'microvm_unhealthy',
+        message: 'Sandbox runtime is unavailable',
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain('rt_private');
+  });
+
   test('maps oversized input delivery to 413', () => {
     const err = new Error('SESSION_INPUT_TOO_LARGE: Session inputs exceed the 536870912-byte budget');
     expect(publicExecutionFailure(err)).toEqual({

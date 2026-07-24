@@ -5,6 +5,7 @@ import * as path from 'path';
 import type { Request, Response } from 'express';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
+import { createGunzip } from 'zlib';
 import { config } from './config';
 import { logger } from './logger';
 import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID } from './workspace-isolation';
@@ -173,14 +174,14 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function checkpointUploadLimit(maxBytes: number): Transform {
+function checkpointStreamLimit(maxBytes: number, kind: 'upload' | 'expanded'): Transform {
   let received = 0;
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       received += chunk.length;
       callback(
         received > maxBytes
-          ? new SessionCheckpointError(`checkpoint upload exceeds ${maxBytes} bytes`)
+          ? new SessionCheckpointError(`checkpoint ${kind} stream exceeds ${maxBytes} bytes`)
           : null,
         chunk,
       );
@@ -208,7 +209,12 @@ export async function restoreSessionCheckpoint(
   );
   const restoredWorkspace = path.join(restoreStage, SESSION_WORKSPACE_ID);
   const restoredControl = path.join(restoreStage, CHECKPOINT_CONTROL_FILE);
-  const tar = spawn('tar', ['-xzf', '-', '-C', restoreStage], {
+  /* Decompress in-process so the runner can independently cap BOTH the
+   * compressed request and the expanded tar stream. Passing gzip directly to
+   * `tar -xzf` would let a tiny, highly-compressible checkpoint fill the
+   * workspace disk before any post-extraction validation could run. */
+  const gunzip = createGunzip();
+  const tar = spawn('tar', ['-xf', '-', '-C', restoreStage], {
     stdio: ['pipe', 'ignore', 'pipe'],
     env: { ...process.env, COPYFILE_DISABLE: '1' },
   });
@@ -226,7 +232,13 @@ export async function restoreSessionCheckpoint(
      * 200 — the control plane would then hit the restore timeout and recycle a
      * freshly-launched VM even though the archive was valid. 'error' guards the
      * spawn-failure case (see the create side). */
-    await pipeline(req, checkpointUploadLimit(config.checkpoint_max_bytes), tar.stdin);
+    await pipeline(
+      req,
+      checkpointStreamLimit(config.checkpoint_max_bytes, 'upload'),
+      gunzip,
+      checkpointStreamLimit(config.checkpoint_max_bytes, 'expanded'),
+      tar.stdin,
+    );
     const code = await closed;
     if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
 

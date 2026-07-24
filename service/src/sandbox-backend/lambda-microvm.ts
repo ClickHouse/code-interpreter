@@ -280,6 +280,25 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         lockToken,
         fence.signal,
       );
+      let finalizedResult: SandboxRawResponse;
+      try {
+        /* Gateway result restoration is part of the session transaction: do
+         * not checkpoint or advertise the mutated workspace until it succeeds.
+         * If it fails, quarantine/recycle this VM so an at-least-once retry
+         * relaunches from the preceding durable checkpoint. */
+        finalizedResult = sessionCtx.sessionResultFinalizer
+          ? await sessionCtx.sessionResultFinalizer(result)
+          : result;
+      } catch (error) {
+        await this.recycleUncommittedSessionVm(
+          client,
+          vm,
+          runtimeSessionId,
+          lockToken,
+          'result_finalization_failed',
+        );
+        throw error;
+      }
       /* Re-read the record findOrLaunch settled on (freshly written on
        * launch, or the reused one) and only bump its liveness — preserves
        * generation, deadline, and image fields. */
@@ -322,7 +341,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       if (!persisted) {
         throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after execute`);
       }
-      return result;
+      return finalizedResult;
     } catch (error) {
       /* Fencing can happen after proxyExecute returns — during checkpoint,
        * the final registry read, or the final liveness write. At that point a
@@ -346,8 +365,9 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
 
   /**
    * Proxies the execute to a session VM and, on a failure that means the VM
-   * must not be reused, terminates it and drops the registry record so the next
-   * call relaunches + restores rather than reusing a dead-or-dirty VM:
+   * must not be reused, terminates it and makes the registry record
+   * non-reusable so the next call relaunches + restores rather than reusing a
+   * dead-or-dirty VM:
    *  - abort (JOB_TIMEOUT): the runner keeps NsJail running until the child
    *    exits even after the socket closes, so a later request reusing this VM
    *    could mutate the workspace concurrently with the timed-out run.
@@ -413,12 +433,25 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         axios.isAxiosError(error) &&
         error.response?.status === 409 &&
         (error.response.data as { error?: unknown } | undefined)?.error === 'session_workspace_dirty';
+      if (sessionWorkspaceDirty) {
+        await this.recycleUncommittedSessionVm(
+          client,
+          vm,
+          runtimeSessionId,
+          lockToken,
+          'workspace_dirty',
+        );
+        throw new SandboxBackendError(
+          'MICROVM_UNHEALTHY',
+          `Runtime session ${runtimeSessionId} workspace was dirty and has been recycled`,
+          error,
+        );
+      }
       if (
         ctx.signal.aborted ||
         transportFailure ||
         unhealthy ||
-        gatewayUnreachable ||
-        sessionWorkspaceDirty
+        gatewayUnreachable
       ) {
         const terminated = await this.terminate(
           client,
@@ -430,6 +463,56 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * Makes a session VM non-reusable before attempting provider cleanup. The
+   * prior checkpoint pointer remains on the terminal record, so a retry can
+   * relaunch directly from the last committed workspace even if the durable
+   * marker write for that older checkpoint had failed.
+   */
+  private async recycleUncommittedSessionVm(
+    client: LambdaMicrovmClient,
+    vm: MicrovmDescription,
+    runtimeSessionId: string,
+    lockToken: string,
+    reason: 'result_finalization_failed' | 'workspace_dirty',
+  ): Promise<void> {
+    const record = await readRuntimeSessionRecord(runtimeSessionId);
+    const ownsRecordedVm = record?.microvm_id === vm.microvmId;
+    if (record && ownsRecordedVm) {
+      const quarantined = await writeRuntimeSessionRecord(
+        { ...record, state: 'TERMINATING', last_error: reason },
+        lockToken,
+      );
+      if (!quarantined) {
+        throw new SandboxBackendError(
+          'MICROVM_FENCED',
+          `Lost session lock for ${runtimeSessionId} while quarantining the workspace`,
+        );
+      }
+    }
+
+    const terminated = await this.terminate(client, vm.microvmId, reason);
+    if (!terminated || !record || !ownsRecordedVm) return;
+
+    const terminal = await writeRuntimeSessionRecord(
+      {
+        ...record,
+        microvm_id: undefined,
+        endpoint: undefined,
+        state: 'TERMINATED',
+        last_seen_at: Date.now(),
+        last_error: reason,
+      },
+      lockToken,
+    );
+    if (!terminal) {
+      throw new SandboxBackendError(
+        'MICROVM_FENCED',
+        `Lost session lock for ${runtimeSessionId} after recycling the workspace`,
+      );
     }
   }
 

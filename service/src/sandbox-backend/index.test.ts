@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import * as path from 'path';
 import { env } from '../config';
 import { HttpSandboxBackend } from './http';
 import { getSandboxBackend, setSandboxBackendForTests } from './index';
@@ -19,12 +20,42 @@ describe('getSandboxBackend', () => {
     expect(getSandboxBackend()).toBe(backend);
   });
 
-  test('selects the lambda-microvm backend when configured', async () => {
+  test('selects the lazy lambda-microvm backend when configured', () => {
     env.SANDBOX_BACKEND = 'lambda-microvm';
     const backend = getSandboxBackend();
-    const { LambdaMicrovmSandboxBackend } = await import('./lambda-microvm');
-    expect(backend).toBeInstanceOf(LambdaMicrovmSandboxBackend);
     expect(backend.name).toBe('lambda-microvm');
+  });
+
+  test('does not load Lambda-only modules for the HTTP backend', async () => {
+    const serviceRoot = path.resolve(import.meta.dir, '../..');
+    const probe = Bun.spawn([
+      process.execPath,
+      '-e',
+      `
+        process.env.CODEAPI_SANDBOX_BACKEND = 'http';
+        const { getSandboxBackend } = await import('./src/sandbox-backend/index.ts');
+        if (getSandboxBackend().name !== 'http') process.exit(2);
+        const loaded = Object.keys(require.cache).filter((id) =>
+          id.includes('/sandbox-backend/lambda-microvm.')
+          || id.includes('/runtime-session/checkpoint-store.')
+          || id.includes('/@aws-sdk/client-s3/')
+          || id.includes('/@aws-sdk/client-lambda-microvms/')
+        );
+        console.log(JSON.stringify(loaded));
+      `,
+    ], {
+      cwd: serviceRoot,
+      env: { ...process.env, CODEAPI_SANDBOX_BACKEND: 'http' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      probe.exited,
+      new Response(probe.stdout).text(),
+      new Response(probe.stderr).text(),
+    ]);
+    expect(exitCode, stderr).toBe(0);
+    expect(JSON.parse(stdout.trim().split('\n').at(-1) ?? 'null')).toEqual([]);
   });
 
   test('test seam replaces the active backend', () => {

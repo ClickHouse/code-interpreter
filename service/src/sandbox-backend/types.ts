@@ -40,6 +40,12 @@ export interface SandboxExecuteContext {
   /** Absent ⇒ stateless execution (no runtime session affinity). */
   runtimeSessionId?: string;
   runtimeSessionMode: 'stateless' | 'affinity' | 'strict';
+  /**
+   * Worker-owned result transformation that must succeed before a stateful
+   * backend makes workspace mutations reusable or durable. Stateless backends
+   * intentionally leave this to the worker's normal post-execute path.
+   */
+  sessionResultFinalizer?: (result: SandboxRawResponse) => Promise<SandboxRawResponse>;
 }
 
 /** Raw sandbox response, pre-gateway-restore. */

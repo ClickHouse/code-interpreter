@@ -3,11 +3,16 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import * as semver from 'semver';
-import { Job, type TFile } from './job';
+import { Job, SessionWorkspaceDirtyError, type TFile } from './job';
 import type { Runtime } from './runtime';
 import { config } from './config';
 import { SANDBOX_DIR_MODE, SANDBOX_FILE_MODE } from './validation';
-import { SANDBOX_READONLY_FILE_MODE, compatibilityModeForSkippedChown } from './workspace-isolation';
+import type { SessionWorkspace } from './session-workspace';
+import {
+  SANDBOX_READONLY_FILE_MODE,
+  compatibilityModeForSkippedChown,
+  fallbackSandboxIdentity,
+} from './workspace-isolation';
 
 /**
  * Integration tests for `Job.downloadAndWriteFile` against a real HTTP
@@ -47,7 +52,7 @@ function makeRuntime(): Runtime {
   };
 }
 
-function makeJob(files: TFile[] = []): Job {
+function makeJob(files: TFile[] = [], session?: SessionWorkspace): Job {
   return new Job({
     session_id: 'test-session',
     runtime: makeRuntime(),
@@ -57,7 +62,27 @@ function makeJob(files: TFile[] = []): Job {
     timeouts: { compile: 5000, run: 5000 },
     cpu_times: { compile: 5000, run: 5000 },
     memory_limits: { compile: 100_000_000, run: 100_000_000 },
+    session,
   });
+}
+
+function sessionWorkspaceAt(
+  dir: string,
+  runtimeSessionId: string,
+  markDirty: () => void = () => {},
+): SessionWorkspace {
+  const identity = fallbackSandboxIdentity();
+  return {
+    runtimeSessionId,
+    acquire: async () => ({
+      workspaceId: runtimeSessionId,
+      dir,
+      identity,
+    }),
+    primedInputId: () => undefined,
+    markPrimed: () => {},
+    markDirty,
+  } as unknown as SessionWorkspace;
 }
 
 function currentUid(): number | undefined {
@@ -76,6 +101,7 @@ type Route = {
   contentDisposition?: string;
   headers?: Record<string, string>;
   body?: string;
+  delayMs?: number;
   onRequest?: (req: Request) => void;
 };
 
@@ -92,11 +118,14 @@ beforeAll(() => {
   originalPerJobUids = config.per_job_uids;
   server = Bun.serve({
     port: 0,
-    fetch(req) {
+    async fetch(req) {
       const url = new URL(req.url);
       const route = routes.get(url.pathname);
       if (!route) return new Response('not found', { status: 404 });
       route.onRequest?.(req);
+      if (route.delayMs) {
+        await new Promise(resolve => setTimeout(resolve, route.delayMs));
+      }
       const headers = new Headers();
       if (route.contentDisposition) {
         headers.set('content-disposition', route.contentDisposition);
@@ -258,6 +287,103 @@ describe('downloadAndWriteFile / RFC 5987 round-trip', () => {
     expect(writtenName).toBe('legacy.txt');
     const contents = await fsp.readFile(path.join(tmpDir, 'legacy.txt'), 'utf8');
     expect(contents).toBe('legacy bytes');
+  });
+
+  it('resolves concurrent header destinations without provisional-name false conflicts', async () => {
+    const renamed: TFile = {
+      id: 'renamed-id',
+      storage_session_id: 'prev-session',
+      name: 'vacated.txt',
+    };
+    const replacement: TFile = {
+      id: 'replacement-id',
+      storage_session_id: 'prev-session',
+      name: 'actual.txt',
+    };
+    routes.set(`/sessions/${encodeURIComponent(renamed.storage_session_id!)}/objects/${encodeURIComponent(renamed.id!)}`, {
+      status: 200,
+      contentDisposition: 'attachment; filename="actual.txt"',
+      body: 'renamed bytes',
+      /* Make the other ref resolve `vacated.txt` while this ref's requested
+       * name would still be provisional under the old reservation scheme. */
+      delayMs: 75,
+    });
+    routes.set(`/sessions/${encodeURIComponent(replacement.storage_session_id!)}/objects/${encodeURIComponent(replacement.id!)}`, {
+      status: 200,
+      contentDisposition: 'attachment; filename="vacated.txt"',
+      body: 'replacement bytes',
+    });
+
+    const session = sessionWorkspaceAt(tmpDir, 'rt_concurrent_rename');
+    const job = makeJob([renamed, replacement], session);
+    const originalPrimeConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 2;
+    try {
+      await job.prime();
+      const submissionDir = asInternals(job).submissionDir;
+      expect(await fsp.readFile(path.join(submissionDir, 'actual.txt'), 'utf8'))
+        .toBe('renamed bytes');
+      expect(await fsp.readFile(path.join(submissionDir, 'vacated.txt'), 'utf8'))
+        .toBe('replacement bytes');
+    } finally {
+      config.prime_concurrency = originalPrimeConcurrency;
+      await job.cleanup();
+    }
+  });
+
+  it('rejects concurrent refs that resolve to the same destination before either can overwrite', async () => {
+    const slower: TFile = {
+      id: 'same-slower-id',
+      storage_session_id: 'prev-session',
+      name: 'slower-fallback.txt',
+    };
+    const faster: TFile = {
+      id: 'same-faster-id',
+      storage_session_id: 'prev-session',
+      name: 'faster-fallback.txt',
+    };
+    routes.set(`/sessions/${encodeURIComponent(slower.storage_session_id!)}/objects/${encodeURIComponent(slower.id!)}`, {
+      status: 200,
+      contentDisposition: 'attachment; filename="same.txt"',
+      body: 'slower bytes',
+      delayMs: 75,
+    });
+    routes.set(`/sessions/${encodeURIComponent(faster.storage_session_id!)}/objects/${encodeURIComponent(faster.id!)}`, {
+      status: 200,
+      contentDisposition: 'attachment; filename="same.txt"',
+      body: 'faster bytes',
+    });
+
+    let dirty = false;
+    const job = makeJob(
+      [slower, faster],
+      sessionWorkspaceAt(tmpDir, 'rt_concurrent_same_destination', () => { dirty = true; }),
+    );
+    const originalPrimeConcurrency = config.prime_concurrency;
+    config.prime_concurrency = 2;
+    let deadlockTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([
+        job.prime().then(
+          () => ({ status: 'fulfilled' as const }),
+          error => ({ status: 'rejected' as const, error }),
+        ),
+        new Promise<{ status: 'timeout' }>(resolve => {
+          deadlockTimer = setTimeout(() => resolve({ status: 'timeout' }), 2_000);
+        }),
+      ]);
+      if (deadlockTimer) clearTimeout(deadlockTimer);
+      expect(outcome.status).toBe('rejected');
+      if (outcome.status === 'rejected') {
+        expect(outcome.error).toBeInstanceOf(SessionWorkspaceDirtyError);
+      }
+      expect(dirty).toBe(true);
+      expect(await fsp.readFile(path.join(tmpDir, 'same.txt'), 'utf8')).toBe('faster bytes');
+    } finally {
+      if (deadlockTimer) clearTimeout(deadlockTimer);
+      config.prime_concurrency = originalPrimeConcurrency;
+      await job.cleanup();
+    }
   });
 
   it('decodes UTF-8 percent-encoded names with non-ASCII characters', async () => {

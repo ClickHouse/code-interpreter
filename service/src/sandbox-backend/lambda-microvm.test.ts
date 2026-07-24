@@ -26,7 +26,7 @@ import {
   type LambdaMicrovmBackendConfig,
 } from './lambda-microvm';
 import { SandboxBackendError } from './types';
-import type { SandboxExecuteContext, SandboxTransportRequest } from './types';
+import type { SandboxExecuteContext, SandboxRawResponse, SandboxTransportRequest } from './types';
 import type * as t from '../types';
 
 type CapturedRequest = { path: string; rawBody: string; headers: Record<string, string> };
@@ -619,9 +619,22 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
       message: 'Session workspace must be restored',
     };
 
-    await expect(backend.execute(request(), sessionContext())).rejects.toThrow();
+    try {
+      await backend.execute(request(), sessionContext());
+      throw new Error('expected rejection');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SandboxBackendError);
+      expect((error as SandboxBackendError).code).toBe('MICROVM_UNHEALTHY');
+    }
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
-    expect(await readRuntimeSessionRecord('rt_session_1')).toBeNull();
+    const recycled = await readRuntimeSessionRecord('rt_session_1');
+    expect(recycled?.state).toBe('TERMINATED');
+    expect(recycled?.microvm_id).toBeUndefined();
+
+    executeStatus = 200;
+    executeResponseBody = EXECUTE_RESPONSE;
+    await expect(backend.execute(request(), sessionContext())).resolves.toEqual(EXECUTE_RESPONSE);
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
   });
 
 
@@ -1082,6 +1095,65 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(record?.workspace_checkpoint).toStartWith(checkpointPrefixFor('rt_ckpt_1'));
     expect(record?.workspace_checkpoint).toEndWith('.tar.gz');
     expect(record?.checkpointed_at).toBeGreaterThan(0);
+  });
+
+  test('restores the prior checkpoint on retry when result finalization fails', async () => {
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    await store.put('rt_ckpt_1', 7, Buffer.from('PRIOR_WORKSPACE'));
+    await store.commit('rt_ckpt_1', 7);
+    const checkpointKey = checkpointObjectKey('rt_ckpt_1', 7);
+    const seedToken = await acquireRuntimeSessionLock('rt_ckpt_1', 60_000);
+    await writeRuntimeSessionRecord({
+      runtime_session_id: 'rt_ckpt_1',
+      tenant_id: 'tenant-a',
+      canonical_user_id: 'user-1',
+      state: 'TERMINATED',
+      generation: 1,
+      last_seen_at: 1,
+      workspace_checkpoint: checkpointKey,
+    }, seedToken as string);
+    await releaseRuntimeSessionLock('rt_ckpt_1', seedToken as string);
+    const backend = makeBackend(fake, cfgOn, store);
+    let finalizeAttempts = 0;
+    const sessionResultFinalizer = async (result: SandboxRawResponse): Promise<SandboxRawResponse> => {
+      finalizeAttempts += 1;
+      if (finalizeAttempts === 1) {
+        throw new Error('egress gateway restore unavailable');
+      }
+      return { ...result, session_id: 'restored_result' };
+    };
+
+    await expect(backend.execute(
+      request(),
+      sessionContext({ sessionResultFinalizer }),
+    )).rejects.toThrow('egress gateway restore unavailable');
+
+    const firstAttemptPaths = captured.map((c) => c.path);
+    expect(firstAttemptPaths.filter((path) => path === '/api/v2/session/checkpoint')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    const recycled = await readRuntimeSessionRecord('rt_ckpt_1');
+    expect(recycled?.state).toBe('TERMINATED');
+    expect(recycled?.workspace_checkpoint).toBe(checkpointKey);
+
+    const result = await backend.execute(
+      request(),
+      sessionContext({ sessionResultFinalizer }),
+    );
+    expect(result.session_id).toBe('restored_result');
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+
+    const paths = captured.map((c) => c.path);
+    const executeIndexes = paths
+      .map((path, index) => path === '/api/v2/execute' ? index : -1)
+      .filter((index) => index >= 0);
+    const restoreIndexes = paths
+      .map((path, index) => path === '/api/v2/session/restore' ? index : -1)
+      .filter((index) => index >= 0);
+    expect(executeIndexes).toHaveLength(2);
+    expect(restoreIndexes).toHaveLength(2);
+    expect(restoreIndexes[1]).toBeGreaterThan(executeIndexes[0]);
+    expect(restoreIndexes[1]).toBeLessThan(executeIndexes[1]);
   });
 
   test('a relaunched VM restores the checkpoint before the first exec', async () => {
