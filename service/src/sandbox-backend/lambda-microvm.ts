@@ -11,6 +11,7 @@ import { MicrovmOpThrottledError, acquireOpBudget, poisonOpBucket } from '../run
 import { checkpointSession, probeInputs, pushInputs, restoreSession } from '../runtime-session/checkpoint';
 import {
   SESSION_INPUTS_MAX_COUNT,
+  SessionFilesError,
   buildInputBatch,
   sessionFileRefs,
 } from '../runtime-session/files';
@@ -774,8 +775,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     const refs = req.inputDelivery ?? sessionFileRefs(req.body.files);
     if (refs.length === 0) return;
     if (refs.length > SESSION_INPUTS_MAX_COUNT) {
-      throw new SandboxBackendError(
-        'MICROVM_UNHEALTHY',
+      throw new SessionFilesError(
+        'SESSION_INPUT_TOO_LARGE',
         `Session delivery of ${refs.length} objects exceeds the ${SESSION_INPUTS_MAX_COUNT} limit`,
       );
     }
@@ -814,22 +815,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * Keep a warm session intact so a caller error cannot discard workspace
      * changes newer than the last checkpoint. */
     const wanted = new Set(missing.map((ref) => ref.cache_key));
-    let batch: Awaited<ReturnType<typeof buildInputBatch>>;
-    try {
-      batch = await buildInputBatch(
-        refs.filter((ref) => wanted.has(ref.cache_key)),
-        {
-          timeoutMs: this.config.checkpoint.timeoutMs,
-          maxBytes: this.config.checkpoint.maxBytes,
-          signal: ctx.signal,
-        },
-      );
-    } catch (error) {
-      throw new SandboxBackendError('MICROVM_UNHEALTHY', 'Session input source fetch failed', error);
-    }
+    const batch = await buildInputBatch(
+      refs.filter((ref) => wanted.has(ref.cache_key)),
+      {
+        timeoutMs: this.config.checkpoint.timeoutMs,
+        maxBytes: this.config.checkpoint.maxBytes,
+        signal: ctx.signal,
+      },
+    );
     if (!batch) {
-      throw new SandboxBackendError(
-        'MICROVM_UNHEALTHY',
+      throw new SessionFilesError(
+        'SESSION_INPUT_PREPARATION_FAILED',
         'Runner requested an empty session input batch',
       );
     }
@@ -872,8 +868,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       );
     }
     if (stillMissing.length > 0) {
-      throw new SandboxBackendError(
-        'MICROVM_UNHEALTHY',
+      throw new SessionFilesError(
+        'SESSION_INPUT_TOO_LARGE',
         `Runner input cache cannot hold the ${refs.length}-object working set`,
       );
     }

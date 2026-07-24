@@ -18,7 +18,7 @@ import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
 import { getExecutionIdentity } from '../execution-identity';
-import { resolveRuntimeSessionIdForRequest, validateRuntimeSessionHint, RuntimeSessionHintError } from '../runtime-session/id';
+import { resolveRuntimeSessionIdForExecRequest, RuntimeSessionHintError } from '../runtime-session/id';
 import { jobsSubmitted } from '../metrics';
 import { captureTraceCarrier, withSpan } from '../telemetry';
 import { Jobs, Languages } from '../enum';
@@ -136,17 +136,12 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
 
   let runtimeSessionId: string | undefined;
   try {
-    /* In stateless mode the hint is ignored entirely, so don't validate it —
-     * a malformed hint that will never be used must not 400 the request. */
-    const hint =
-      env.RUNTIME_SESSION_MODE === 'stateless'
-        ? undefined
-        : validateRuntimeSessionHint(body.runtime_session_hint);
-    runtimeSessionId = resolveRuntimeSessionIdForRequest({
+    runtimeSessionId = resolveRuntimeSessionIdForExecRequest({
       mode: env.RUNTIME_SESSION_MODE,
       storageNamespace: identity.storageNamespace,
       canonicalUserId: identity.canonicalUserId,
-      hint,
+      runtimeSessionHint: body.runtime_session_hint,
+      isSynthetic: isSyntheticRequest,
     });
   } catch (error) {
     if (error instanceof RuntimeSessionHintError) {

@@ -3,6 +3,7 @@ import {
   RUNTIME_SESSION_HINT_MAX_LENGTH,
   RuntimeSessionHintError,
   deriveRuntimeSessionId,
+  resolveRuntimeSessionIdForExecRequest,
   resolveRuntimeSessionIdForRequest,
   validateRuntimeSessionHint,
 } from './id';
@@ -78,5 +79,49 @@ describe('resolveRuntimeSessionIdForRequest', () => {
     expect(() => resolveRuntimeSessionIdForRequest({ mode: 'strict', ...BASE })).toThrow(
       RuntimeSessionHintError,
     );
+  });
+});
+
+describe('resolveRuntimeSessionIdForExecRequest', () => {
+  test('stateless requests continue to ignore malformed hints', () => {
+    expect(resolveRuntimeSessionIdForExecRequest({
+      mode: 'stateless',
+      ...BASE,
+      runtimeSessionHint: { ignored: true },
+      isSynthetic: false,
+    })).toBeUndefined();
+  });
+
+  test('strict-mode synthetic requests remain stateless without a hint', () => {
+    expect(resolveRuntimeSessionIdForExecRequest({
+      mode: 'strict',
+      ...BASE,
+      runtimeSessionHint: undefined,
+      isSynthetic: true,
+    })).toBeUndefined();
+  });
+
+  test('synthetic requests bypass validation for an ignored malformed hint', () => {
+    expect(resolveRuntimeSessionIdForExecRequest({
+      mode: 'strict',
+      ...BASE,
+      runtimeSessionHint: { forged: true },
+      isSynthetic: true,
+    })).toBeUndefined();
+  });
+
+  test('strict-mode ordinary requests still validate and require a hint', () => {
+    expect(() => resolveRuntimeSessionIdForExecRequest({
+      mode: 'strict',
+      ...BASE,
+      runtimeSessionHint: undefined,
+      isSynthetic: false,
+    })).toThrow('runtime_session_hint is required in strict mode');
+    expect(() => resolveRuntimeSessionIdForExecRequest({
+      mode: 'strict',
+      ...BASE,
+      runtimeSessionHint: { forged: true },
+      isSynthetic: false,
+    })).toThrow('runtime_session_hint must be a string');
   });
 });

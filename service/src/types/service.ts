@@ -234,6 +234,9 @@ export interface LanguageConfig {
   runtime?: string;
 }
 
+/** Explicit reasons a queue job may remain stateless in a stateful mode. */
+export type RuntimeSessionExemption = 'programmatic';
+
 export type JobData = {
   code: string;
   userId: string;
@@ -245,8 +248,16 @@ export type JobData = {
   executionId?: string;
   tenantId?: string;
   canonicalUserId?: string;
-  /** Server-derived runtime session identity (absent ⇒ stateless execution). */
+  /**
+   * Server-derived runtime session identity. Absence is stateless unless
+   * strict mode requires it; explicit exemptions document intentional gaps.
+   */
   runtimeSessionId?: string;
+  /**
+   * Intentional stateless exception. Programmatic/replay execution externalizes
+   * continuation state and does not yet bind PTC rounds to a warm session.
+   */
+  runtimeSessionExemption?: RuntimeSessionExemption;
   executionManifestClaims?: ExecutionManifestClaims;
   /** Raw grant claims retained only for service-worker dispatch so grant
    * expiry is anchored to sandbox start, not BullMQ enqueue time. */

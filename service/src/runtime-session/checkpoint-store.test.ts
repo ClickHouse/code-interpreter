@@ -6,6 +6,7 @@ import {
   CheckpointTooLargeError,
   checkpointObjectKey,
   checkpointPrefixFor,
+  resolveS3Endpoint,
 } from './checkpoint-store';
 
 const BIG = 1_000_000;
@@ -23,6 +24,59 @@ async function readStored(
     await artifact.cleanup();
   }
 }
+
+describe('resolveS3Endpoint', () => {
+  const cases: Array<{
+    name: string;
+    options: Parameters<typeof resolveS3Endpoint>[0];
+    expected: string;
+  }> = [
+    {
+      name: 'keeps the HTTPS default for a scheme-qualified S3 endpoint',
+      options: { endpoint: 'https://s3.us-east-1.amazonaws.com' },
+      expected: 'https://s3.us-east-1.amazonaws.com',
+    },
+    {
+      name: 'keeps the HTTP default for a scheme-qualified endpoint',
+      options: { endpoint: 'http://storage.example.com' },
+      expected: 'http://storage.example.com',
+    },
+    {
+      name: 'uses port 9000 for a bare MinIO service name',
+      options: { endpoint: 'minio' },
+      expected: 'http://minio:9000',
+    },
+    {
+      name: 'uses SSL and port 9000 for a bare local endpoint',
+      options: { endpoint: 'localhost', useSsl: true },
+      expected: 'https://localhost:9000',
+    },
+    {
+      name: 'preserves a URL port when MINIO_PORT is absent',
+      options: { endpoint: 'http://minio.internal:9001' },
+      expected: 'http://minio.internal:9001',
+    },
+    {
+      name: 'lets MINIO_PORT override a port already present in the URL',
+      options: {
+        endpoint: 'https://s3.us-east-1.amazonaws.com:8443',
+        port: '9443',
+      },
+      expected: 'https://s3.us-east-1.amazonaws.com:9443',
+    },
+    {
+      name: 'lets MINIO_PORT override the bare-endpoint default',
+      options: { endpoint: 'minio', port: '9001' },
+      expected: 'http://minio:9001',
+    },
+  ];
+
+  for (const { name, options, expected } of cases) {
+    test(name, () => {
+      expect(resolveS3Endpoint(options)).toBe(expected);
+    });
+  }
+});
 
 describe('checkpoint store', () => {
   test('the S3-compatible store aborts a hung underlying operation at its hard deadline', async () => {

@@ -145,6 +145,43 @@ describe('sandbox error formatting', () => {
     });
   });
 
+  test('maps oversized input delivery to 413', () => {
+    const err = new Error('SESSION_INPUT_TOO_LARGE: Session inputs exceed the 536870912-byte budget');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 413,
+      body: {
+        error: 'session_input_too_large',
+        message: 'Input files exceed the delivery limit',
+      },
+    });
+  });
+
+  test('maps unavailable input objects to 422 without exposing object details', () => {
+    const failure = publicExecutionFailure(
+      new Error('SESSION_INPUT_UNAVAILABLE: Failed to fetch private/customer-list.csv from file-server.internal'),
+    );
+    expect(failure).toEqual({
+      status: 422,
+      body: {
+        error: 'session_input_unavailable',
+        message: 'One or more input files are unavailable',
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain('customer-list.csv');
+    expect(JSON.stringify(failure)).not.toContain('file-server.internal');
+  });
+
+  test('maps input source outages to 502 rather than MicroVM unavailability', () => {
+    const err = new Error('SESSION_INPUT_SOURCE_FAILED: upstream request failed with status 503');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 502,
+      body: {
+        error: 'session_input_source_failed',
+        message: 'Input file service is unavailable',
+      },
+    });
+  });
+
   test('does not expose AWS identifiers embedded in backend failures', () => {
     const arn = 'arn:aws:iam::123456789012:role/private-microvm-exec';
     const failure = publicExecutionFailure(

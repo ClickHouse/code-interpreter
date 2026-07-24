@@ -15,6 +15,7 @@ import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveOutputBucketSessionKey, SessionKeyResolutionError } from '../session-key';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { getExecutionIdentity } from '../execution-identity';
+import { PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION } from '../runtime-session/job-policy';
 import {
   jobsSubmitted,
   ptcReplayContinuations,
@@ -401,6 +402,7 @@ async function runReplayIteration(
     executionId: state.execution_id,
     tenantId: state.tenantId,
     canonicalUserId: state.canonicalUserId,
+    runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
     executionManifestClaims: sandboxSecurity.executionManifestClaims,
     egressGrantClaims: sandboxSecurity.egressGrantClaims,
     egressGrantToken: sandboxSecurity.egressGrantToken,
@@ -1368,6 +1370,7 @@ async function handleBlocking(
       executionId: execution_id,
       tenantId: identity.storageNamespace,
       canonicalUserId: identity.canonicalUserId,
+      runtimeSessionExemption: PROGRAMMATIC_RUNTIME_SESSION_EXEMPTION,
       executionManifestClaims: sandboxSecurity.executionManifestClaims,
       egressGrantClaims: sandboxSecurity.egressGrantClaims,
       egressGrantToken: sandboxSecurity.egressGrantToken,

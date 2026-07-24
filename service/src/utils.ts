@@ -109,13 +109,24 @@ export function sandboxErrorMessageFromAxios(error: AxiosError): string {
 export function publicExecutionFailure(error: unknown): { status: number; body: { error: string; message: string } } | null {
   const message = error instanceof Error ? error.message : '';
 
-  /* Lambda MicroVM backend failures are surfaced by the worker as
-   * `<CODE>: <message>`. A busy runtime session in strict mode is a 409;
-   * launch/health failures are transient upstream errors (503). */
-  const backendMatch = message.match(/^(RUNTIME_SESSION_BUSY|MICROVM_[A-Z_]+):\s*(.+)$/);
+  /* Typed worker failures cross BullMQ as `<CODE>: <message>`. Runtime-session
+   * and MicroVM codes describe sandbox availability; SESSION_INPUT_* codes
+   * describe the caller's declared input set or its upstream object source. */
+  const backendMatch = message.match(
+    /^(RUNTIME_SESSION_BUSY|MICROVM_[A-Z_]+|SESSION_INPUT_[A-Z_]+):\s*(.+)$/,
+  );
   if (backendMatch) {
     const code = backendMatch[1];
-    const status = code === 'RUNTIME_SESSION_BUSY' ? 409 : 503;
+    const statuses: Record<string, number> = {
+      RUNTIME_SESSION_BUSY: 409,
+      SESSION_INPUT_TOO_LARGE: 413,
+      SESSION_INPUT_UNAVAILABLE: 422,
+      SESSION_INPUT_SOURCE_FAILED: 502,
+      SESSION_INPUT_PREPARATION_FAILED: 500,
+      SESSION_INPUT_ABORTED: 504,
+    };
+    const sessionInputFailure = code.startsWith('SESSION_INPUT_');
+    const status = statuses[code] ?? (sessionInputFailure ? 500 : 503);
     const publicMessages: Record<string, string> = {
       RUNTIME_SESSION_BUSY: 'Runtime session is busy',
       MICROVM_LAUNCH_FAILED: 'Sandbox launch failed',
@@ -123,15 +134,21 @@ export function publicExecutionFailure(error: unknown): { status: number; body: 
       MICROVM_UNHEALTHY: 'Sandbox runtime is unavailable',
       MICROVM_FENCED: 'Runtime session changed during execution',
       MICROVM_DEADLINE_EXCEEDED: 'Sandbox execution deadline exceeded',
+      SESSION_INPUT_TOO_LARGE: 'Input files exceed the delivery limit',
+      SESSION_INPUT_UNAVAILABLE: 'One or more input files are unavailable',
+      SESSION_INPUT_SOURCE_FAILED: 'Input file service is unavailable',
+      SESSION_INPUT_PREPARATION_FAILED: 'Input files could not be prepared',
+      SESSION_INPUT_ABORTED: 'Input delivery timed out',
     };
     /* The backend message is retained in worker/router logs, but it can contain
-     * AWS validation text, account IDs, ARNs, connector names, or MicroVM IDs.
-     * Only the stable code and a fixed public message cross the API boundary. */
+     * AWS identifiers, internal endpoints, object ids, or file names. Only the
+     * stable code and a fixed public message cross the API boundary. */
     return {
       status,
       body: {
         error: code.toLowerCase(),
-        message: publicMessages[code] ?? 'Sandbox runtime is unavailable',
+        message: publicMessages[code]
+          ?? (sessionInputFailure ? 'Input delivery failed' : 'Sandbox runtime is unavailable'),
       },
     };
   }

@@ -5,7 +5,6 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   SESSION_INPUTS_MAX_COUNT,
-  SessionFilesError,
   buildInputBatch,
   inputCacheKey,
   sessionFileRefs,
@@ -17,7 +16,14 @@ beforeAll(() => {
   server = Bun.serve({
     port: 0,
     fetch(req) {
-      const readOnly = new URL(req.url).pathname.includes('/objects/ro');
+      const pathname = new URL(req.url).pathname;
+      if (pathname.endsWith('/objects/fmissing')) {
+        return new Response('not found', { status: 404 });
+      }
+      if (pathname.endsWith('/objects/fsource')) {
+        return new Response('upstream failure', { status: 503 });
+      }
+      const readOnly = pathname.includes('/objects/ro');
       const headers: Record<string, string> = { 'X-Original-Filename': 'server-name.txt' };
       if (readOnly) headers['X-Read-Only'] = 'true';
       return new Response('0123456789', { status: 200, headers });
@@ -124,20 +130,38 @@ describe('buildInputBatch', () => {
 
   test('rejects deliveries above the object-count cap before any fetch', async () => {
     const refs = Array.from({ length: SESSION_INPUTS_MAX_COUNT + 1 }, (_, i) => ref(i));
-    await expect(buildInputBatch(refs, opts())).rejects.toThrow(SessionFilesError);
+    await expect(buildInputBatch(refs, opts())).rejects.toMatchObject({
+      code: 'SESSION_INPUT_TOO_LARGE',
+    });
   });
 
   test('enforces a CUMULATIVE byte budget, not just per-object size', async () => {
-    await expect(buildInputBatch([ref(1), ref(2), ref(3)], opts({ maxBytes: 25 }))).rejects.toThrow(
-      'budget',
-    );
+    await expect(
+      buildInputBatch([ref(1), ref(2), ref(3)], opts({ maxBytes: 25 })),
+    ).rejects.toMatchObject({
+      code: 'SESSION_INPUT_TOO_LARGE',
+    });
   });
 
   test('honors an aborted signal instead of consuming disk and bandwidth', async () => {
     const controller = new AbortController();
     controller.abort();
-    await expect(buildInputBatch([ref(1)], opts({ signal: controller.signal }))).rejects.toThrow(
-      'aborted',
-    );
+    await expect(
+      buildInputBatch([ref(1)], opts({ signal: controller.signal })),
+    ).rejects.toMatchObject({
+      code: 'SESSION_INPUT_ABORTED',
+    });
+  });
+
+  test('classifies a rejected object reference as unavailable input', async () => {
+    await expect(buildInputBatch([ref('missing')], opts())).rejects.toMatchObject({
+      code: 'SESSION_INPUT_UNAVAILABLE',
+    });
+  });
+
+  test('classifies file-server failures separately from caller input errors', async () => {
+    await expect(buildInputBatch([ref('source')], opts())).rejects.toMatchObject({
+      code: 'SESSION_INPUT_SOURCE_FAILED',
+    });
   });
 });

@@ -36,7 +36,27 @@ import logger from '../logger';
 
 export const SESSION_INPUTS_MAX_COUNT = 256;
 
-export class SessionFilesError extends Error {}
+/**
+ * Stable input-delivery failures. These codes survive the worker/BullMQ
+ * boundary and let the public router distinguish a bad/oversized input set
+ * from a broken MicroVM without exposing file-server or archive details.
+ */
+export type SessionFilesErrorCode =
+  | 'SESSION_INPUT_TOO_LARGE'
+  | 'SESSION_INPUT_UNAVAILABLE'
+  | 'SESSION_INPUT_SOURCE_FAILED'
+  | 'SESSION_INPUT_PREPARATION_FAILED'
+  | 'SESSION_INPUT_ABORTED';
+
+export class SessionFilesError extends Error {
+  constructor(
+    public readonly code: SessionFilesErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'SessionFilesError';
+  }
+}
 
 export interface SessionFileRef {
   id: string;
@@ -97,6 +117,7 @@ export async function buildInputBatch(
   if (refs.length === 0) return undefined;
   if (refs.length > SESSION_INPUTS_MAX_COUNT) {
     throw new SessionFilesError(
+      'SESSION_INPUT_TOO_LARGE',
       `Session delivery of ${refs.length} objects exceeds the ${SESSION_INPUTS_MAX_COUNT} limit`,
     );
   }
@@ -104,11 +125,16 @@ export async function buildInputBatch(
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'codeapi-inputs-'));
   const objects = path.join(tmp, 'objects');
   const archive = path.join(tmp, 'inputs.tar.gz');
-  await fsp.mkdir(objects, { mode: 0o700 });
   try {
+    await fsp.mkdir(objects, { mode: 0o700 });
     let totalBytes = 0;
     for (const ref of refs) {
-      if (opts.signal?.aborted) throw new SessionFilesError('Session input delivery aborted');
+      if (opts.signal?.aborted) {
+        throw new SessionFilesError(
+          'SESSION_INPUT_ABORTED',
+          'Session input delivery aborted',
+        );
+      }
       const key = ref.cache_key;
       const fetched = await fetchFileObjectToPath(
         baseUrl,
@@ -120,7 +146,10 @@ export async function buildInputBatch(
       const metadata = Buffer.from(JSON.stringify({ readOnly: fetched.readOnly }));
       totalBytes += metadata.length;
       if (totalBytes > opts.maxBytes) {
-        throw new SessionFilesError(`Session inputs exceed the ${opts.maxBytes}-byte budget`);
+        throw new SessionFilesError(
+          'SESSION_INPUT_TOO_LARGE',
+          `Session inputs exceed the ${opts.maxBytes}-byte budget`,
+        );
       }
       await fsp.writeFile(
         path.join(objects, `${key}.json`),
@@ -141,7 +170,12 @@ export async function buildInputBatch(
     };
   } catch (error) {
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
-    throw error;
+    if (error instanceof SessionFilesError) throw error;
+    logger.error('Failed to prepare session input batch:', getAxiosErrorDetails(error));
+    throw new SessionFilesError(
+      'SESSION_INPUT_PREPARATION_FAILED',
+      'Failed to prepare session input batch',
+    );
   }
 }
 
@@ -167,7 +201,10 @@ async function fetchFileObjectToPath(
     const announced = Number(response.headers['content-length']);
     if (Number.isFinite(announced) && announced > opts.remainingBytes) {
       response.data.destroy();
-      throw new SessionFilesError(`Session inputs exceed the ${opts.maxBytes}-byte budget`);
+      throw new SessionFilesError(
+        'SESSION_INPUT_TOO_LARGE',
+        `Session inputs exceed the ${opts.maxBytes}-byte budget`,
+      );
     }
     let bytes = 0;
     const limit = new Transform({
@@ -175,7 +212,10 @@ async function fetchFileObjectToPath(
         bytes += chunk.length;
         callback(
           bytes > opts.remainingBytes
-            ? new SessionFilesError(`Session inputs exceed the ${opts.maxBytes}-byte budget`)
+            ? new SessionFilesError(
+              'SESSION_INPUT_TOO_LARGE',
+              `Session inputs exceed the ${opts.maxBytes}-byte budget`,
+            )
             : null,
           chunk,
         );
@@ -187,10 +227,22 @@ async function fetchFileObjectToPath(
   } catch (error) {
     await fsp.rm(destination, { force: true }).catch(() => {});
     if (error instanceof SessionFilesError) throw error;
+    if (opts.signal?.aborted) {
+      throw new SessionFilesError(
+        'SESSION_INPUT_ABORTED',
+        'Session input delivery aborted',
+      );
+    }
     /* Sanitized details only: a raw axios error carries the request config —
      * including the internal service token header — straight into the logs. */
     logger.error(`Failed to fetch session input ${ref.id}:`, getAxiosErrorDetails(error));
-    throw new SessionFilesError(`Failed to fetch input ${ref.name} from file server`);
+    const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    throw new SessionFilesError(
+      status != null && status >= 400 && status < 500
+        ? 'SESSION_INPUT_UNAVAILABLE'
+        : 'SESSION_INPUT_SOURCE_FAILED',
+      `Failed to fetch input ${ref.name} from file server`,
+    );
   }
 }
 
@@ -203,10 +255,18 @@ function tarDirectory(root: string, archive: string, signal?: AbortSignal): Prom
     });
     const errChunks: Buffer[] = [];
     tar.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
-    tar.on('error', reject);
+    tar.on('error', (error) => {
+      reject(new SessionFilesError(
+        'SESSION_INPUT_PREPARATION_FAILED',
+        `Failed to start inputs tar: ${error.message}`,
+      ));
+    });
     tar.on('close', (code) => {
       if (code !== 0) {
-        reject(new SessionFilesError(`inputs tar exited ${code}: ${Buffer.concat(errChunks).toString()}`));
+        reject(new SessionFilesError(
+          'SESSION_INPUT_PREPARATION_FAILED',
+          `inputs tar exited ${code}: ${Buffer.concat(errChunks).toString()}`,
+        ));
         return;
       }
       resolve();

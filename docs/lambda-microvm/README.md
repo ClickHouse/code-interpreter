@@ -267,9 +267,8 @@ FILE_SERVER_URL=http://file-server.internal:3000
 # checkpoints (S3-compatible, same client as file-server)
 CODEAPI_CHECKPOINT_BUCKET=<terraform checkpoint_bucket>
 CODEAPI_CHECKPOINT_MAX_BYTES=536870912
-MINIO_ENDPOINT=s3.us-east-1.amazonaws.com
-MINIO_PORT=443           # required: the client defaults to 9000, which fails against S3
-MINIO_USE_SSL=true
+MINIO_ENDPOINT=https://s3.us-east-1.amazonaws.com
+# MINIO_PORT=443         # optional explicit override; otherwise the URL scheme supplies 443
 MINIO_REGION=us-east-1
 # ECS task role, EC2 instance profile, and IRSA/web identity are loaded
 # automatically. Only non-role/local deployments need a complete static pair:
@@ -367,7 +366,7 @@ operator environment switch.
 | `CODEAPI_CHECKPOINT_MAX_BYTES` | `536870912` | Max checkpoint size (512 MiB). |
 | `SANDBOX_CHECKPOINT_MAX_BYTES` | `536870912` | Runner-side ceiling for streamed checkpoint restores. Bake it into the MicroVM image and keep it equal to worker `CODEAPI_CHECKPOINT_MAX_BYTES`. |
 | `CODEAPI_CHECKPOINT_TIMEOUT_MS` | `60000` | Checkpoint transfer budget. |
-| `MINIO_ENDPOINT` / `_PORT` / `_USE_SSL` / `_REGION` | — | S3-compatible endpoint configuration. Point at real S3 in prod. |
+| `MINIO_ENDPOINT` / `_PORT` / `_USE_SSL` / `_REGION` | — | S3-compatible endpoint configuration. Absolute URLs use their scheme-default port; `MINIO_PORT` explicitly overrides it. Bare MinIO-style endpoints default to port 9000 and use `_USE_SSL` to select the scheme. Point at real S3 in prod. |
 | `MINIO_ACCESS_KEY` / `_SECRET_KEY` / `_SESSION_TOKEN` | workload IAM provider | Optional complete static credential set for local/non-role deployments. ECS, EC2, and web-identity/IRSA credentials are loaded automatically when the pair is absent. |
 
 The worker rejects oversized checkpoint objects before transfer and the runner
@@ -424,7 +423,8 @@ and [Runbook gotchas](#runbook-gotchas).
 
 **Checkpoint store.** The checkpoint client is MinIO-compatible. For local dev,
 point `MINIO_*` at a local MinIO. For prod, point it at real S3 (endpoint
-`s3.<region>.amazonaws.com`, `MINIO_PORT=443`, `MINIO_USE_SSL=true`) and attach
+`https://s3.<region>.amazonaws.com`; its scheme supplies port 443 unless
+`MINIO_PORT` explicitly overrides it) and attach
 `checkpoint_access_policy_arn` to the workload role. The client loads ECS task
 role, EC2 instance-profile, and web-identity/IRSA credentials; a complete static
 `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` pair remains available for local or

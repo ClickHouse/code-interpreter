@@ -763,9 +763,27 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     fileObjectStatus = 404;
     captured = [];
 
-    await expect(backend.execute(request(), sessionContext())).rejects.toThrow(
-      'Session input source fetch failed',
-    );
+    await expect(backend.execute(request(), sessionContext())).rejects.toMatchObject({
+      code: 'SESSION_INPUT_UNAVAILABLE',
+    });
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
+
+  test('an oversized input returns a typed limit error and keeps the warm session VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, {
+      checkpoint: { ...config().checkpoint, maxBytes: 1 },
+    });
+    const warmup = request();
+    warmup.body = { ...warmup.body, files: [] };
+    await backend.execute(warmup, sessionContext());
+    captured = [];
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toMatchObject({
+      code: 'SESSION_INPUT_TOO_LARGE',
+    });
     expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
     expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');

@@ -26,12 +26,33 @@ interface CheckpointStoreClientOptions {
   timeoutMs?: number;
 }
 
-function s3Endpoint(): string {
-  const raw = process.env.MINIO_ENDPOINT ?? 'localhost';
-  const protocol = process.env.MINIO_USE_SSL === 'true' ? 'https:' : 'http:';
-  const parsed = new URL(raw.includes('://') ? raw : `${protocol}//${raw}`);
-  if (!parsed.port) parsed.port = process.env.MINIO_PORT || '9000';
+export function resolveS3Endpoint(options: {
+  endpoint: string;
+  port?: string;
+  useSsl?: boolean;
+}): string {
+  const hasScheme = options.endpoint.includes('://');
+  const protocol = options.useSsl === true ? 'https:' : 'http:';
+  const parsed = new URL(hasScheme ? options.endpoint : `${protocol}//${options.endpoint}`);
+  const explicitPort = options.port?.trim();
+  if (explicitPort) {
+    /* MINIO_PORT is an explicit deployment override, including when the URL
+     * already contains a different port. */
+    parsed.port = explicitPort;
+  } else if (!parsed.port && !hasScheme) {
+    /* A bare endpoint is the local/MinIO shorthand and keeps MinIO's default.
+     * An absolute URL instead keeps its scheme default (80/443). */
+    parsed.port = '9000';
+  }
   return parsed.toString().replace(/\/$/, '');
+}
+
+function s3Endpoint(): string {
+  return resolveS3Endpoint({
+    endpoint: process.env.MINIO_ENDPOINT ?? 'localhost',
+    port: process.env.MINIO_PORT,
+    useSsl: process.env.MINIO_USE_SSL === 'true',
+  });
 }
 
 function createS3Client(): S3Client {

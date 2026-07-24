@@ -11,6 +11,8 @@ import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgr
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
 import { prepareInputDelivery } from './runtime-session/input-delivery';
+import { SessionFilesError } from './runtime-session/files';
+import { resolveRuntimeSessionIdForJob } from './runtime-session/job-policy';
 import { getSandboxBackend, SandboxBackendError } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
 import { withSpan, withTraceContext } from './telemetry';
@@ -86,13 +88,12 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     });
     egressGrantTokenForRestore = egressGrantToken;
 
-    /* Strict mode promises guaranteed session semantics; a job that lost its
-     * session id (router bug, stale enqueue) must fail loudly rather than
-     * silently run stateless. Synthetic health probes are exempt — they are
-     * deliberately sessionless. */
-    if (env.RUNTIME_SESSION_MODE === 'strict' && !isSyntheticJob && !job.data.runtimeSessionId) {
-      throw new Error('strict runtime session mode requires a runtimeSessionId on the job');
-    }
+    const runtimeSessionId = resolveRuntimeSessionIdForJob({
+      mode: env.RUNTIME_SESSION_MODE,
+      runtimeSessionId: job.data.runtimeSessionId,
+      runtimeSessionExemption: job.data.runtimeSessionExemption,
+      isSynthetic: isSyntheticJob,
+    });
 
     const responseRaw = await getSandboxBackend().execute(
       {
@@ -108,7 +109,7 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         deadlineAtMs,
         tenantId: job.data.tenantId,
         canonicalUserId: job.data.canonicalUserId,
-        runtimeSessionId: job.data.runtimeSessionId,
+        runtimeSessionId,
         runtimeSessionMode: env.RUNTIME_SESSION_MODE,
       },
     );
@@ -172,6 +173,11 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     if (controller.signal.aborted) {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
     } else if (error instanceof SandboxBackendError) {
+      throw new Error(`${error.code}: ${error.message}`);
+    } else if (error instanceof SessionFilesError) {
+      /* BullMQ serializes Error rather than preserving custom prototypes.
+       * Carry the stable code in the message so the public router can map the
+       * input failure without confusing it with MicroVM health. */
       throw new Error(`${error.code}: ${error.message}`);
     } else if (isAbortError(error)) {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);

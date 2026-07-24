@@ -71,3 +71,25 @@ export function resolveRuntimeSessionIdForRequest(args: {
   }
   return deriveRuntimeSessionId(args);
 }
+
+/**
+ * `/exec`-specific resolution boundary. Synthetic probes are deliberately
+ * sessionless, so they must bypass both strict-mode hint requirements and
+ * validation of a hint that will never be consumed. Stateless mode has the
+ * same ignore-don't-validate contract.
+ */
+export function resolveRuntimeSessionIdForExecRequest(args: {
+  mode: 'stateless' | 'affinity' | 'strict';
+  storageNamespace: string;
+  canonicalUserId: string;
+  runtimeSessionHint: unknown;
+  isSynthetic: boolean;
+}): string | undefined {
+  if (args.isSynthetic || args.mode === 'stateless') return undefined;
+  return resolveRuntimeSessionIdForRequest({
+    mode: args.mode,
+    storageNamespace: args.storageNamespace,
+    canonicalUserId: args.canonicalUserId,
+    hint: validateRuntimeSessionHint(args.runtimeSessionHint),
+  });
+}
