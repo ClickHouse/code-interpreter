@@ -51,7 +51,7 @@ function s3Endpoint(): string {
   return resolveS3Endpoint({
     endpoint: process.env.MINIO_ENDPOINT ?? 'localhost',
     port: process.env.MINIO_PORT,
-    useSsl: process.env.MINIO_USE_SSL === 'true',
+    useSsl: process.env.MINIO_USE_SSL?.trim().toLowerCase() === 'true',
   });
 }
 
