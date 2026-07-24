@@ -234,7 +234,11 @@ export async function restoreSessionCheckpoint(
    * `tar -xzf` would let a tiny, highly-compressible checkpoint fill the
    * workspace disk before any post-extraction validation could run. */
   const gunzip = createGunzip();
-  const tar = spawn('tar', ['-xf', '-', '-C', restoreStage], {
+  /* Keep reading through zero end markers until the expanded stream reaches
+   * EOF. Without --ignore-zeros, tar can exit after the first marker while
+   * gunzip still has valid tar padding to emit, closing stdin underneath
+   * pipeline with ERR_STREAM_PREMATURE_CLOSE. */
+  const tar = spawn('tar', ['--ignore-zeros', '-xf', '-', '-C', restoreStage], {
     stdio: ['pipe', 'ignore', 'pipe'],
     env: { ...process.env, COPYFILE_DISABLE: '1' },
   });

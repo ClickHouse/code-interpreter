@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'child_process';
 import { PassThrough, Readable } from 'stream';
-import { gunzipSync } from 'zlib';
+import { gzipSync, gunzipSync } from 'zlib';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -427,6 +427,37 @@ describe('restoreSessionCheckpoint', () => {
     expect(res.statusCode).toBe(200);
     expect(await fsp.readFile(path.join(dir, 'restored.csv'), 'utf8')).toBe('a,b\n1,2\n');
     expect(await fsp.lstat(path.join(dir, 'stale.txt')).catch(() => null)).toBeNull();
+  });
+
+  test('consumes tar padding through expanded EOF before closing tar stdin', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_trailing_padding' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    const archive = await makeArchive({ 'restored.csv': 'a,b\n1,2\n' });
+    const paddedArchive = gzipSync(Buffer.concat([
+      gunzipSync(archive),
+      Buffer.alloc(128 * 1024),
+    ]), { level: 0 });
+
+    /* A decompressor may still have valid tar padding to emit after tar sees
+     * the archive's zero end markers. An uncompressed gzip stores a complete
+     * 64 KiB block in the first chunk below, including the tar end markers,
+     * while the delayed remainder keeps the expanded stream open. */
+    async function* delayedArchive(): AsyncGenerator<Buffer> {
+      yield paddedArchive.subarray(0, 70 * 1024);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      yield paddedArchive.subarray(70 * 1024);
+    }
+
+    const res = fakeStreamRes();
+    await restoreSessionCheckpoint(
+      Readable.from(delayedArchive()) as never,
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(await fsp.readFile(path.join(dir, 'restored.csv'), 'utf8')).toBe('a,b\n1,2\n');
   });
 
   test('rejects a checkpoint upload that exceeds the runner-local compressed-byte cap', async () => {
