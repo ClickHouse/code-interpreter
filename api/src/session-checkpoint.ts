@@ -78,8 +78,16 @@ function checkpointControlBytes(session: SessionWorkspace): Buffer {
   );
 }
 
+export interface SessionCheckpointStreamOptions {
+  /** Test seam for deterministic late tar-failure coverage. */
+  tarCommand?: string;
+}
+
 /** Streams a capped `tar.gz` of the session workspace to the response. */
-export async function streamSessionCheckpoint(res: Response): Promise<void> {
+export async function streamSessionCheckpoint(
+  res: Response,
+  options: SessionCheckpointStreamOptions = {},
+): Promise<void> {
   const session = getBoundSessionWorkspace();
   if (!session) {
     res.status(409).json({ message: 'No session workspace is bound' });
@@ -117,7 +125,7 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
      * creation completes is guaranteed to be admissible under the same config.
      * Keeping tar and gzip as separate streaming stages preserves bounded
      * memory, backpressure, and the existing tar.gz wire format. */
-    const tar = spawn('tar', [
+    const tar = spawn(options.tarCommand ?? 'tar', [
       '-cf', '-',
       '-C', SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID,
       '-C', controlStage, CHECKPOINT_CONTROL_FILE,
@@ -148,9 +156,16 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
         createGzip(),
         checkpointStreamLimit(config.checkpoint_max_bytes, 'compressed'),
         res,
+        /* Do not publish a successful HTTP EOF until tar itself exits zero.
+         * A tar process can emit bytes and close stdout before reporting a
+         * late read error. Ending the response inside pipeline would make that
+         * partial archive look complete to the control plane, which could then
+         * commit it and prune the preceding recovery point. */
+        { end: false },
       );
       const code = await closed;
       if (code !== 0) throw new SessionCheckpointError(`checkpoint tar exited ${code}`);
+      res.end();
     } catch (error) {
       /* A downstream disconnect or either byte cap can stop consumption while
        * tar is still writing. Terminate and reap it so no child or temp-stage
@@ -178,6 +193,8 @@ export interface SessionCheckpointOwnershipOps {
 export interface SessionCheckpointRestoreOptions {
   /** Test seam for deterministic ownership-failure coverage. */
   ownershipOps?: SessionCheckpointOwnershipOps;
+  /** Test seam for deterministic commit/rollback failure coverage. */
+  rename?: (source: string, destination: string) => Promise<void>;
   /** Non-root local development cannot chown to the compatibility sandbox UID.
    * Production hardened/per-job-UID mode never enables this fallback. */
   allowUnprivilegedOwnershipFallback?: boolean;
@@ -229,42 +246,50 @@ export async function restoreSessionCheckpoint(
   );
   const restoredWorkspace = path.join(restoreStage, SESSION_WORKSPACE_ID);
   const restoredControl = path.join(restoreStage, CHECKPOINT_CONTROL_FILE);
-  /* Decompress in-process so the runner can independently cap BOTH the
-   * compressed request and the expanded tar stream. Passing gzip directly to
-   * `tar -xzf` would let a tiny, highly-compressible checkpoint fill the
-   * workspace disk before any post-extraction validation could run. */
-  const gunzip = createGunzip();
-  /* Keep reading through zero end markers until the expanded stream reaches
-   * EOF. Without --ignore-zeros, tar can exit after the first marker while
-   * gunzip still has valid tar padding to emit, closing stdin underneath
-   * pipeline with ERR_STREAM_PREMATURE_CLOSE. */
-  const tar = spawn('tar', ['--ignore-zeros', '-xf', '-', '-C', restoreStage], {
-    stdio: ['pipe', 'ignore', 'pipe'],
-    env: { ...process.env, COPYFILE_DISABLE: '1' },
-  });
-  tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'restore tar'));
-  const closed: Promise<number> = new Promise((resolve, reject) => {
-    tar.on('close', resolve);
-    tar.on('error', reject);
-  });
-  /* Observe immediately: a spawn failure may reject the input pipeline first. */
-  closed.catch(() => {});
+  const liveBackup = path.join(restoreStage, '.live-workspace-backup');
+  const rename = options.rename ?? fsp.rename;
+  let liveBackedUp = false;
+  let committed = false;
+  let retainStageForRecovery = false;
   try {
-    /* Register the 'close' listener before awaiting the pipeline (see the create
-     * side): a small upload can finish and 'close' can fire before pipeline
-     * resolves, and a listener attached afterward would hang, never sending the
-     * 200 — the control plane would then hit the restore timeout and recycle a
-     * freshly-launched VM even though the archive was valid. 'error' guards the
-     * spawn-failure case (see the create side). */
-    await pipeline(
-      req,
-      checkpointStreamLimit(config.checkpoint_max_bytes, 'compressed'),
-      gunzip,
-      checkpointStreamLimit(config.checkpoint_max_bytes, 'expanded'),
-      tar.stdin,
-    );
-    const code = await closed;
-    if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
+    /* Decompress in-process so the runner can independently cap BOTH the
+     * compressed request and the expanded tar stream. Passing gzip directly to
+     * `tar -xzf` would let a tiny, highly-compressible checkpoint fill the
+     * workspace disk before any post-extraction validation could run. */
+    const gunzip = createGunzip();
+    /* Keep reading through zero end markers until the expanded stream reaches
+     * EOF. Without --ignore-zeros, tar can exit after the first marker while
+     * gunzip still has valid tar padding to emit, closing stdin underneath
+     * pipeline with ERR_STREAM_PREMATURE_CLOSE. */
+    const tar = spawn('tar', ['--ignore-zeros', '-xf', '-', '-C', restoreStage], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    });
+    tar.stderr.on('data', (chunk: Buffer) => logger.debug({ tar: chunk.toString() }, 'restore tar'));
+    const closed: Promise<number> = new Promise((resolve, reject) => {
+      tar.on('close', resolve);
+      tar.on('error', reject);
+    });
+    /* Observe immediately: a spawn failure may reject the input pipeline first. */
+    closed.catch(() => {});
+    try {
+      /* Register the 'close' listener before awaiting the pipeline (see the
+       * create side): a small upload can finish and 'close' can fire before
+       * pipeline resolves, and a listener attached afterward would hang. */
+      await pipeline(
+        req,
+        checkpointStreamLimit(config.checkpoint_max_bytes, 'compressed'),
+        gunzip,
+        checkpointStreamLimit(config.checkpoint_max_bytes, 'expanded'),
+        tar.stdin,
+      );
+      const code = await closed;
+      if (code !== 0) throw new SessionCheckpointError(`restore tar exited ${code}`);
+    } catch (error) {
+      if (tar.exitCode === null && tar.signalCode === null) tar.kill('SIGKILL');
+      await closed.catch(() => {});
+      throw error;
+    }
 
     const topLevel = await fsp.readdir(restoreStage, { withFileTypes: true });
     const allowed = new Set([SESSION_WORKSPACE_ID, CHECKPOINT_CONTROL_FILE]);
@@ -283,8 +308,7 @@ export async function restoreSessionCheckpoint(
       throw new SessionCheckpointError('checkpoint control metadata is not a regular file');
     }
 
-    await applyRestoredMeta(
-      session,
+    const restoredMeta = await readRestoredMeta(
       restoredWorkspace,
       controlStat ? restoredControl : undefined,
     );
@@ -306,25 +330,53 @@ export async function restoreSessionCheckpoint(
     );
 
     /* Commit only after extraction, metadata validation and ownership all
-     * succeeded. There is no merge: the checkpoint is authoritative. */
-    await fsp.rm(dir, { recursive: true, force: true });
-    await fsp.rename(restoredWorkspace, dir);
+     * succeeded. Rename the old workspace aside first so a failed install can
+     * atomically put it back; deleting it before rename made a staged failure
+     * destroy valid live session state. Both paths share the workspace
+     * filesystem, so each individual rename is atomic. */
+    await rename(dir, liveBackup);
+    liveBackedUp = true;
+    await rename(restoredWorkspace, dir);
+    liveBackedUp = false;
+    session.loadMeta(restoredMeta);
+    committed = true;
+
+    /* The checkpoint is committed before delivery of the HTTP acknowledgement.
+     * A socket/serialization error now causes the control plane to recycle this
+     * VM, but must never roll the successfully restored workspace backward. */
+    await fsp.rm(liveBackup, { recursive: true, force: true }).catch(error => {
+      logger.warn({ err: error, liveBackup }, 'Failed to remove replaced checkpoint workspace');
+    });
     res.status(200).json({ status: 'restored', dir: path.basename(dir) });
   } catch (error) {
-    if (tar.exitCode === null && tar.signalCode === null) tar.kill('SIGKILL');
-    await closed.catch(() => {});
+    if (committed) {
+      logger.error({ err: error }, 'Checkpoint restored but response delivery failed');
+      throw error;
+    }
+
+    if (liveBackedUp) {
+      try {
+        await rename(liveBackup, dir);
+        liveBackedUp = false;
+      } catch (rollbackError) {
+        retainStageForRecovery = true;
+        session.markDirty('checkpoint restore rollback failed');
+        logger.error(
+          { err: error, rollbackErr: rollbackError, recoveryPath: liveBackup },
+          'Failed to roll back checkpoint workspace replacement',
+        );
+      }
+    }
     logger.error({ err: error }, 'Failed to restore session checkpoint');
-    /* A corrupt archive or cut-off upload can leave partially-extracted members
-     * behind. Wipe the workspace to a clean slate before returning failure; the
-     * control plane then recycles this VM and refuses to execute against either
-     * a partial restore or an empty replacement workspace. */
-    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
-    await fsp.mkdir(dir, { recursive: true }).catch(() => {});
-    session.loadMeta({ primed: [], surfaced: [] });
-    session.markDirty('checkpoint restore failed');
+    /* Extraction, validation, and ownership happen only in restoreStage.
+     * Ordinary pre-commit failures therefore leave both the live workspace and
+     * its matching metadata/dirty state untouched. Only an unsuccessful
+     * rollback above marks the session dirty and retains its recovery copy. */
     if (!res.headersSent) res.status(500).json({ message: 'restore failed' });
   } finally {
-    await fsp.rm(restoreStage, { recursive: true, force: true }).catch(() => {});
+    if (!retainStageForRecovery) {
+      await fsp.rm(restoreStage, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
@@ -355,15 +407,13 @@ function isSessionMetaSnapshot(value: unknown): value is SessionMetaSnapshot {
  * Presence of a new control member is authoritative: invalid metadata rejects
  * the restore, and a user file at the legacy name is never reinterpreted or
  * deleted. */
-async function applyRestoredMeta(
-  session: SessionWorkspace,
+async function readRestoredMeta(
   workspaceDir: string,
   controlPath?: string,
-): Promise<void> {
-  /* A restore fully replaces disk state, so in-memory state must also be a
-   * replace. Clear first; absent legacy metadata means cold priming/output-diff
-   * state, while invalid new-format control metadata fails the whole restore. */
-  session.loadMeta({ primed: [], surfaced: [] });
+): Promise<SessionMetaSnapshot> {
+  const empty: SessionMetaSnapshot = { primed: [], surfaced: [] };
+  /* Parse and validate metadata without mutating the live session. The caller
+   * installs the returned snapshot only after the staged workspace commits. */
   if (controlPath) {
     const stat = await fsp.lstat(controlPath).catch(() => null);
     if (!stat?.isFile() || stat.isSymbolicLink()) {
@@ -383,8 +433,7 @@ async function applyRestoredMeta(
     if (!isSessionMetaSnapshot(parsed)) {
       throw new SessionCheckpointError('checkpoint control metadata is malformed or incompatible');
     }
-    session.loadMeta(parsed);
-    return;
+    return parsed;
   }
 
   const metaPath = path.join(workspaceDir, SESSION_META_FILE);
@@ -393,18 +442,18 @@ async function applyRestoredMeta(
      * namespace format. Only trust a runner-owned writable regular file:
      * user-created and read-only-input collisions remain ordinary user data. */
     const stat = await fsp.lstat(metaPath).catch(() => null);
-    if (!stat?.isFile()) return;
+    if (!stat?.isFile()) return empty;
     const trustedOwner = currentUid();
     const ownerMatches = trustedOwner == null || stat.uid === trustedOwner;
     const ownerWritable = (stat.mode & 0o200) !== 0;
     if (!ownerMatches || !ownerWritable) {
       logger.warn('Ignoring untrusted session meta sidecar from restored workspace');
-      return;
+      return empty;
     }
     const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as unknown;
     if (isSessionMetaSnapshot(parsed)) {
-      session.loadMeta(parsed);
       await fsp.rm(metaPath, { force: true }).catch(() => {});
+      return parsed;
     } else if (
       typeof (parsed as { marker?: unknown })?.marker === 'string' &&
       (parsed as { marker: string }).marker.startsWith('codeapi.session-meta.v')
@@ -422,6 +471,7 @@ async function applyRestoredMeta(
   } catch (error) {
     logger.debug({ err: error }, 'No session meta sidecar to restore');
   }
+  return empty;
 }
 
 async function applyOwnership(

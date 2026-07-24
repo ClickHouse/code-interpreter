@@ -187,6 +187,33 @@ describe('session checkpoint gating', () => {
 });
 
 describe('streamSessionCheckpoint', () => {
+  test('does not publish a clean response EOF when tar fails after emitting bytes', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_checkpoint_late_tar_failure' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'checkpoint.txt'), 'checkpoint bytes');
+    const fakeTarDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'late-tar-failure-'));
+    const fakeTar = path.join(fakeTarDir, 'tar');
+    await fsp.writeFile(
+      fakeTar,
+      '#!/bin/sh\nprintf "partial tar bytes"\nexit 23\n',
+      { mode: 0o700 },
+    );
+
+    try {
+      const capture = checkpointCaptureRes();
+      await streamSessionCheckpoint(capture.res as never, { tarCommand: fakeTar });
+
+      expect(capture.archive().length).toBeGreaterThan(0);
+      expect(capture.res.headersSent).toBe(true);
+      expect(capture.res.writableEnded).toBe(false);
+      expect(capture.res.destroyed).toBe(true);
+    } finally {
+      await fsp.rm(fakeTarDir, { recursive: true, force: true });
+    }
+  });
+
   test('rejects creation when the expanded tar exceeds the restore cap', async () => {
     config.session_workspace_enabled = true;
     config.checkpoint_max_bytes = 32 * 1024;
@@ -208,7 +235,6 @@ describe('streamSessionCheckpoint', () => {
     await streamSessionCheckpoint(capture.res as never);
 
     expect(capture.res.headersSent).toBe(true);
-    expect(capture.res.writableEnded).toBe(false);
     expect(capture.res.destroyed).toBe(true);
   });
 
@@ -224,6 +250,8 @@ describe('streamSessionCheckpoint', () => {
     const capture = checkpointCaptureRes();
     await streamSessionCheckpoint(capture.res as never);
 
+    expect(capture.res.writableEnded).toBe(true);
+    expect(capture.res.writableFinished).toBe(true);
     const archive = capture.archive();
     expect(archive.length).toBeLessThanOrEqual(config.checkpoint_max_bytes);
     expect(gunzipSync(archive).length).toBeLessThanOrEqual(config.checkpoint_max_bytes);
@@ -429,6 +457,128 @@ describe('restoreSessionCheckpoint', () => {
     expect(await fsp.lstat(path.join(dir, 'stale.txt')).catch(() => null)).toBeNull();
   });
 
+  test('rolls the live workspace back when staged installation fails', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_install_failure' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'original live bytes');
+    session!.markPrimed('live.txt', 'original-cache-key');
+    let renameCalls = 0;
+
+    const res = fakeStreamRes();
+    await restoreSessionCheckpoint(
+      Readable.from(await makeArchive({ 'restored.txt': 'new checkpoint bytes' })) as never,
+      res as never,
+      {
+        rename: async (source, destination) => {
+          renameCalls += 1;
+          if (renameCalls === 2) throw new Error('injected staged install failure');
+          await fsp.rename(source, destination);
+        },
+      },
+    );
+
+    expect(renameCalls).toBe(3);
+    expect(res.statusCode).toBe(500);
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8')).toBe('original live bytes');
+    expect(await fsp.lstat(path.join(dir, 'restored.txt')).catch(() => null)).toBeNull();
+    expect(session!.primedInputId('live.txt')).toBe('original-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
+  });
+
+  test('retains the live backup and marks dirty when installation rollback also fails', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_rollback_failure' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'recoverable live bytes');
+    const stagesBefore = new Set(
+      (await fsp.readdir(SANDBOX_WORKSPACE_ROOT))
+        .filter(name => name.startsWith('.session-restore-')),
+    );
+    let renameCalls = 0;
+    let retainedStage: string | undefined;
+
+    try {
+      const res = fakeStreamRes();
+      await restoreSessionCheckpoint(
+        Readable.from(await makeArchive({ 'restored.txt': 'new checkpoint bytes' })) as never,
+        res as never,
+        {
+          rename: async (source, destination) => {
+            renameCalls += 1;
+            if (renameCalls >= 2) throw new Error(`injected rename failure ${renameCalls}`);
+            await fsp.rename(source, destination);
+          },
+        },
+      );
+
+      retainedStage = (await fsp.readdir(SANDBOX_WORKSPACE_ROOT))
+        .filter(name => name.startsWith('.session-restore-') && !stagesBefore.has(name))
+        .map(name => path.join(SANDBOX_WORKSPACE_ROOT, name))[0];
+      expect(renameCalls).toBe(3);
+      expect(res.statusCode).toBe(500);
+      expect(session!.dirtyReason).toBe('checkpoint restore rollback failed');
+      expect(await fsp.readFile(
+        path.join(retainedStage!, '.live-workspace-backup', 'live.txt'),
+        'utf8',
+      )).toBe('recoverable live bytes');
+    } finally {
+      if (retainedStage) {
+        await fsp.rm(retainedStage, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('keeps the committed restore when response delivery fails', async () => {
+    config.session_workspace_enabled = true;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_response_failure' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'old live bytes');
+    session!.markPrimed('live.txt', 'old-cache-key');
+    const responseFailure = new Error('injected response failure');
+    const res = {
+      statusCode: 0,
+      headersSent: false,
+      status(code: number) {
+        res.statusCode = code;
+        return {
+          json() {
+            res.headersSent = true;
+            throw responseFailure;
+          },
+        };
+      },
+    };
+    const restoredMeta = JSON.stringify({
+      marker: SESSION_META_MARKER,
+      primed: [['restored.txt', {
+        id: 'restored-cache-key',
+        readOnly: false,
+        hash: 'restored-hash',
+      }]],
+      surfaced: [],
+    });
+
+    await expect(restoreSessionCheckpoint(
+      Readable.from(await makeArchive(
+        { 'restored.txt': 'new checkpoint bytes' },
+        { [CHECKPOINT_CONTROL_FILE]: restoredMeta },
+      )) as never,
+      res as never,
+    )).rejects.toThrow('injected response failure');
+
+    expect(res.statusCode).toBe(200);
+    expect(await fsp.readFile(path.join(dir, 'restored.txt'), 'utf8'))
+      .toBe('new checkpoint bytes');
+    expect(await fsp.lstat(path.join(dir, 'live.txt')).catch(() => null)).toBeNull();
+    expect(session!.primedInputId('live.txt')).toBeUndefined();
+    expect(session!.primedInputId('restored.txt')).toBe('restored-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
+  });
+
   test('consumes tar padding through expanded EOF before closing tar stdin', async () => {
     config.session_workspace_enabled = true;
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_trailing_padding' });
@@ -466,6 +616,8 @@ describe('restoreSessionCheckpoint', () => {
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_oversized_upload' });
     seedNonRootIdentity(session!);
     const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'preserve compressed-cap state');
+    session!.markPrimed('live.txt', 'live-cache-key');
     const archive = await makeArchive({ 'restored.csv': 'new bytes' });
     expect(archive.length).toBeGreaterThan(config.checkpoint_max_bytes);
 
@@ -473,8 +625,10 @@ describe('restoreSessionCheckpoint', () => {
     await restoreSessionCheckpoint(Readable.from(archive) as never, res as never);
 
     expect(res.statusCode).toBe(500);
-    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
-    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8'))
+      .toBe('preserve compressed-cap state');
+    expect(session!.primedInputId('live.txt')).toBe('live-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
   });
 
   test('rejects a checkpoint whose expanded tar stream exceeds the runner-local cap', async () => {
@@ -482,6 +636,8 @@ describe('restoreSessionCheckpoint', () => {
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_expansion_bomb' });
     seedNonRootIdentity(session!);
     const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'preserve expanded-cap state');
+    session!.markPrimed('live.txt', 'live-cache-key');
     const archive = await makeArchive({ 'highly-compressible.txt': 'x'.repeat(32 * 1024) });
     config.checkpoint_max_bytes = archive.length + 1024;
     expect(archive.length).toBeLessThan(config.checkpoint_max_bytes);
@@ -490,8 +646,10 @@ describe('restoreSessionCheckpoint', () => {
     await restoreSessionCheckpoint(Readable.from(archive) as never, res as never);
 
     expect(res.statusCode).toBe(500);
-    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
-    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8'))
+      .toBe('preserve expanded-cap state');
+    expect(session!.primedInputId('live.txt')).toBe('live-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
   });
 
   test('rejects malformed metadata in a present new-format control member', async () => {
@@ -499,7 +657,9 @@ describe('restoreSessionCheckpoint', () => {
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_bad_control' });
     seedNonRootIdentity(session!);
     const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'preserve malformed-control state');
     session!.markPrimed('stale.csv', 'stale-cache-key');
+    session!.markDirty('pre-existing dirty state');
 
     const res = fakeStreamRes();
     await restoreSessionCheckpoint(
@@ -511,9 +671,10 @@ describe('restoreSessionCheckpoint', () => {
     );
 
     expect(res.statusCode).toBe(500);
-    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
-    expect(session!.primedInputId('stale.csv')).toBeUndefined();
-    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8'))
+      .toBe('preserve malformed-control state');
+    expect(session!.primedInputId('stale.csv')).toBe('stale-cache-key');
+    expect(session!.dirtyReason).toBe('pre-existing dirty state');
   });
 
   test('rejects new-format control metadata larger than 16 MiB before parsing it', async () => {
@@ -521,6 +682,8 @@ describe('restoreSessionCheckpoint', () => {
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_large_control' });
     seedNonRootIdentity(session!);
     const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'preserve oversized-control state');
+    session!.markPrimed('live.txt', 'live-cache-key');
     const validButOversized = `${' '.repeat(CHECKPOINT_CONTROL_MAX_BYTES)}${JSON.stringify({
       marker: SESSION_META_MARKER,
       primed: [],
@@ -537,15 +700,18 @@ describe('restoreSessionCheckpoint', () => {
     );
 
     expect(res.statusCode).toBe(500);
-    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
-    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8'))
+      .toBe('preserve oversized-control state');
+    expect(session!.primedInputId('live.txt')).toBe('live-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
   });
 
-  test('fails closed and clears the workspace when restored ownership cannot be applied', async () => {
+  test('preserves the live workspace when restored ownership cannot be applied', async () => {
     config.session_workspace_enabled = true;
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_chown_failure' });
     seedNonRootIdentity(session!);
     const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'preserve ownership-failure state');
     session!.markPrimed('stale.csv', 'stale-cache-key');
     const ownershipFailure = Object.assign(new Error('ownership denied'), { code: 'EPERM' });
 
@@ -563,16 +729,19 @@ describe('restoreSessionCheckpoint', () => {
     );
 
     expect(res.statusCode).toBe(500);
-    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
-    expect(session!.primedInputId('stale.csv')).toBeUndefined();
-    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8'))
+      .toBe('preserve ownership-failure state');
+    expect(session!.primedInputId('stale.csv')).toBe('stale-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
   });
 
-  test('a corrupt archive fails and leaves a clean slate', async () => {
+  test('a corrupt archive fails without touching the live workspace', async () => {
     config.session_workspace_enabled = true;
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_restore_2' });
     seedNonRootIdentity(session!);
     const { dir } = await session!.ownership();
+    await fsp.writeFile(path.join(dir, 'live.txt'), 'preserve corrupt-archive state');
+    session!.markPrimed('live.txt', 'live-cache-key');
 
     const res = fakeStreamRes();
     await restoreSessionCheckpoint(
@@ -581,10 +750,10 @@ describe('restoreSessionCheckpoint', () => {
     );
 
     expect(res.statusCode).toBe(500);
-    /* The control plane treats restore failure as recyclable, so the workspace
-     * is wiped rather than left holding half an archive. */
-    expect(await fsp.readdir(dir).catch(() => [])).toEqual([]);
-    expect(session!.dirtyReason).toBe('checkpoint restore failed');
+    expect(await fsp.readFile(path.join(dir, 'live.txt'), 'utf8'))
+      .toBe('preserve corrupt-archive state');
+    expect(session!.primedInputId('live.txt')).toBe('live-cache-key');
+    expect(session!.dirtyReason).toBeUndefined();
   });
 
   test('does not load or surface metadata from the incompatible v1 identity schema', async () => {
