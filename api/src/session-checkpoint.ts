@@ -5,7 +5,7 @@ import * as path from 'path';
 import type { Request, Response } from 'express';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
-import { createGunzip } from 'zlib';
+import { createGunzip, createGzip } from 'zlib';
 import { config } from './config';
 import { logger } from './logger';
 import { SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID } from './workspace-isolation';
@@ -78,7 +78,7 @@ function checkpointControlBytes(session: SessionWorkspace): Buffer {
   );
 }
 
-/** Streams `tar -czf -` of the session workspace to the response. */
+/** Streams a capped `tar.gz` of the session workspace to the response. */
 export async function streamSessionCheckpoint(res: Response): Promise<void> {
   const session = getBoundSessionWorkspace();
   if (!session) {
@@ -112,8 +112,13 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
 
     res.status(200);
     res.setHeader('Content-Type', CHECKPOINT_CONTENT_TYPE);
+    /* Cap the uncompressed tar before gzip as well as the compressed response.
+     * Restore applies the same two limits in reverse, so every checkpoint that
+     * creation completes is guaranteed to be admissible under the same config.
+     * Keeping tar and gzip as separate streaming stages preserves bounded
+     * memory, backpressure, and the existing tar.gz wire format. */
     const tar = spawn('tar', [
-      '-czf', '-',
+      '-cf', '-',
       '-C', SANDBOX_WORKSPACE_ROOT, SESSION_WORKSPACE_ID,
       '-C', controlStage, CHECKPOINT_CONTROL_FILE,
     ], {
@@ -136,9 +141,24 @@ export async function streamSessionCheckpoint(res: Response): Promise<void> {
      * rejection would then take the whole runner down after we already
      * answered 500. The later `await closed` still sees the same rejection. */
     closed.catch(() => {});
-    await pipeline(tar.stdout, res);
-    const code = await closed;
-    if (code !== 0) throw new SessionCheckpointError(`checkpoint tar exited ${code}`);
+    try {
+      await pipeline(
+        tar.stdout,
+        checkpointStreamLimit(config.checkpoint_max_bytes, 'expanded'),
+        createGzip(),
+        checkpointStreamLimit(config.checkpoint_max_bytes, 'compressed'),
+        res,
+      );
+      const code = await closed;
+      if (code !== 0) throw new SessionCheckpointError(`checkpoint tar exited ${code}`);
+    } catch (error) {
+      /* A downstream disconnect or either byte cap can stop consumption while
+       * tar is still writing. Terminate and reap it so no child or temp-stage
+       * lifetime escapes the failed request. */
+      if (tar.exitCode === null && tar.signalCode === null) tar.kill('SIGKILL');
+      await closed.catch(() => {});
+      throw error;
+    }
   } catch (error) {
     logger.error({ err: error }, 'Failed to stream session checkpoint');
     if (!res.headersSent) res.status(500).json({ message: 'checkpoint failed' });
@@ -174,7 +194,7 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-function checkpointStreamLimit(maxBytes: number, kind: 'upload' | 'expanded'): Transform {
+function checkpointStreamLimit(maxBytes: number, kind: 'compressed' | 'expanded'): Transform {
   let received = 0;
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
@@ -234,7 +254,7 @@ export async function restoreSessionCheckpoint(
      * spawn-failure case (see the create side). */
     await pipeline(
       req,
-      checkpointStreamLimit(config.checkpoint_max_bytes, 'upload'),
+      checkpointStreamLimit(config.checkpoint_max_bytes, 'compressed'),
       gunzip,
       checkpointStreamLimit(config.checkpoint_max_bytes, 'expanded'),
       tar.stdin,

@@ -1156,6 +1156,76 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(restoreIndexes[1]).toBeLessThan(executeIndexes[1]);
   });
 
+  test('still terminates the mutated VM when the rollback registry read fails', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, cfgOn, new MemoryCheckpointStore());
+    const redisWithGet = mock as unknown as {
+      get(key: string): Promise<string | null>;
+    };
+    const originalGet = redisWithGet.get.bind(mock);
+    let failSessionRead = false;
+    redisWithGet.get = async (key: string): Promise<string | null> => {
+      if (failSessionRead && key === 'rtsx:sess:rt_ckpt_1') {
+        throw new Error('registry read unavailable');
+      }
+      return originalGet(key);
+    };
+    const sessionResultFinalizer = async (
+      _result: SandboxRawResponse,
+    ): Promise<SandboxRawResponse> => {
+      failSessionRead = true;
+      throw new Error('egress gateway restore unavailable');
+    };
+
+    try {
+      await expect(backend.execute(
+        request(),
+        sessionContext({ sessionResultFinalizer }),
+      )).rejects.toThrow('egress gateway restore unavailable');
+    } finally {
+      failSessionRead = false;
+    }
+
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    /* The registry could not be quarantined, so provider teardown—not Redis
+     * state—is what prevents reuse of the uncommitted workspace. */
+    expect((await readRuntimeSessionRecord('rt_ckpt_1'))?.state).toBe('RUNNING');
+  });
+
+  test('still terminates the mutated VM when the rollback quarantine write fails', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake, cfgOn, new MemoryCheckpointStore());
+    const redisWithScript = mock as unknown as {
+      writeRuntimeSessionRecordScript(...args: string[]): Promise<number>;
+    };
+    const originalWrite = redisWithScript.writeRuntimeSessionRecordScript.bind(mock);
+    let failQuarantineWrite = false;
+    redisWithScript.writeRuntimeSessionRecordScript = async (
+      ...args: string[]
+    ): Promise<number> => {
+      if (failQuarantineWrite) throw new Error('registry write unavailable');
+      return originalWrite(...args);
+    };
+    const sessionResultFinalizer = async (
+      _result: SandboxRawResponse,
+    ): Promise<SandboxRawResponse> => {
+      failQuarantineWrite = true;
+      throw new Error('egress gateway restore unavailable');
+    };
+
+    try {
+      await expect(backend.execute(
+        request(),
+        sessionContext({ sessionResultFinalizer }),
+      )).rejects.toThrow('egress gateway restore unavailable');
+    } finally {
+      failQuarantineWrite = false;
+    }
+
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    expect((await readRuntimeSessionRecord('rt_ckpt_1'))?.state).toBe('RUNNING');
+  });
+
   test('a relaunched VM restores the checkpoint before the first exec', async () => {
     const store = new MemoryCheckpointStore();
     await store.put('rt_ckpt_1', 1000, Buffer.from('PRIOR_WORKSPACE'));

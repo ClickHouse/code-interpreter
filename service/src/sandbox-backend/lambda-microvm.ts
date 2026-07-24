@@ -479,40 +479,71 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     lockToken: string,
     reason: 'result_finalization_failed' | 'workspace_dirty',
   ): Promise<void> {
-    const record = await readRuntimeSessionRecord(runtimeSessionId);
-    const ownsRecordedVm = record?.microvm_id === vm.microvmId;
-    if (record && ownsRecordedVm) {
-      const quarantined = await writeRuntimeSessionRecord(
-        { ...record, state: 'TERMINATING', last_error: reason },
-        lockToken,
-      );
-      if (!quarantined) {
-        throw new SandboxBackendError(
-          'MICROVM_FENCED',
-          `Lost session lock for ${runtimeSessionId} while quarantining the workspace`,
+    let record: RuntimeSessionRecord | null = null;
+    let ownsRecordedVm = false;
+    let quarantined = false;
+    try {
+      record = await readRuntimeSessionRecord(runtimeSessionId);
+      ownsRecordedVm = record?.microvm_id === vm.microvmId;
+      if (record && ownsRecordedVm) {
+        quarantined = await writeRuntimeSessionRecord(
+          { ...record, state: 'TERMINATING', last_error: reason },
+          lockToken,
         );
+        if (!quarantined) {
+          logger.warn('Lost session lock while quarantining a mutated MicroVM', {
+            runtimeSessionId,
+            microvmId: vm.microvmId,
+            reason,
+          });
+        }
       }
+    } catch (error) {
+      /* Redis can fail exactly when the workspace most needs quarantining.
+       * Registry state is useful for making retries efficient, but provider
+       * termination is the actual safety boundary: never let a failed read or
+       * fenced write skip teardown of a VM whose uncommitted workspace was
+       * already mutated. */
+      logger.error('Failed to quarantine a mutated MicroVM in the session registry', {
+        runtimeSessionId,
+        microvmId: vm.microvmId,
+        reason,
+        error,
+      });
     }
 
     const terminated = await this.terminate(client, vm.microvmId, reason);
-    if (!terminated || !record || !ownsRecordedVm) return;
+    if (!terminated || !record || !ownsRecordedVm || !quarantined) return;
 
-    const terminal = await writeRuntimeSessionRecord(
-      {
-        ...record,
-        microvm_id: undefined,
-        endpoint: undefined,
-        state: 'TERMINATED',
-        last_seen_at: Date.now(),
-        last_error: reason,
-      },
-      lockToken,
-    );
-    if (!terminal) {
-      throw new SandboxBackendError(
-        'MICROVM_FENCED',
-        `Lost session lock for ${runtimeSessionId} after recycling the workspace`,
+    try {
+      const terminal = await writeRuntimeSessionRecord(
+        {
+          ...record,
+          microvm_id: undefined,
+          endpoint: undefined,
+          state: 'TERMINATED',
+          last_seen_at: Date.now(),
+          last_error: reason,
+        },
+        lockToken,
       );
+      if (!terminal) {
+        logger.warn('Lost session lock after recycling a mutated MicroVM', {
+          runtimeSessionId,
+          microvmId: vm.microvmId,
+          reason,
+        });
+      }
+    } catch (error) {
+      /* The provider resource is already gone and the earlier TERMINATING
+       * record remains non-reusable with its prior checkpoint pointer intact.
+       * Preserve the primary execution/finalization error. */
+      logger.error('Failed to mark a recycled MicroVM terminal in the session registry', {
+        runtimeSessionId,
+        microvmId: vm.microvmId,
+        reason,
+        error,
+      });
     }
   }
 

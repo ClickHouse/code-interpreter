@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'child_process';
 import { PassThrough, Readable } from 'stream';
+import { gunzipSync } from 'zlib';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -186,6 +187,58 @@ describe('session checkpoint gating', () => {
 });
 
 describe('streamSessionCheckpoint', () => {
+  test('rejects creation when the expanded tar exceeds the restore cap', async () => {
+    config.session_workspace_enabled = true;
+    config.checkpoint_max_bytes = 32 * 1024;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_checkpoint_expanded_cap' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    const highlyCompressible = 'x'.repeat(64 * 1024);
+    await fsp.writeFile(path.join(dir, 'highly-compressible.txt'), highlyCompressible);
+
+    /* This is the precise failure mode: the gzip is comfortably accepted by
+     * the compressed-byte cap even though restore must reject its expanded tar
+     * stream. Create must reject it before publishing a recovery point. */
+    const compressedFixture = await makeArchive({
+      'highly-compressible.txt': highlyCompressible,
+    });
+    expect(compressedFixture.length).toBeLessThan(config.checkpoint_max_bytes);
+
+    const capture = checkpointCaptureRes();
+    await streamSessionCheckpoint(capture.res as never);
+
+    expect(capture.res.headersSent).toBe(true);
+    expect(capture.res.writableEnded).toBe(false);
+    expect(capture.res.destroyed).toBe(true);
+  });
+
+  test('a checkpoint accepted by both create-side caps round-trips under the same cap', async () => {
+    config.session_workspace_enabled = true;
+    config.checkpoint_max_bytes = 64 * 1024;
+    const session = bindSessionWorkspace({ runtimeSessionId: 'rt_checkpoint_symmetric_cap' });
+    seedNonRootIdentity(session!);
+    const { dir } = await session!.ownership();
+    const checkpointBytes = 'x'.repeat(24 * 1024);
+    await fsp.writeFile(path.join(dir, 'roundtrip.txt'), checkpointBytes);
+
+    const capture = checkpointCaptureRes();
+    await streamSessionCheckpoint(capture.res as never);
+
+    const archive = capture.archive();
+    expect(archive.length).toBeLessThanOrEqual(config.checkpoint_max_bytes);
+    expect(gunzipSync(archive).length).toBeLessThanOrEqual(config.checkpoint_max_bytes);
+
+    await fsp.writeFile(path.join(dir, 'roundtrip.txt'), 'stale');
+    const restoreRes = fakeStreamRes();
+    await restoreSessionCheckpoint(
+      Readable.from(archive) as never,
+      restoreRes as never,
+    );
+
+    expect(restoreRes.statusCode).toBe(200);
+    expect(await fsp.readFile(path.join(dir, 'roundtrip.txt'), 'utf8')).toBe(checkpointBytes);
+  });
+
   test('retains accumulated surfaced state while the full control record fits', async () => {
     config.session_workspace_enabled = true;
     const session = bindSessionWorkspace({ runtimeSessionId: 'rt_checkpoint_surfaced_cap' });
