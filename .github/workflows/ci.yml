@@ -22,6 +22,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  deployment-config-tests:
+    name: Deployment Config Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Block-root package delivery
+        run: tests/block_root_package_delivery.sh
+
+      - name: Validate sandbox Dockerfiles
+        run: |
+          docker buildx build --check -f api/Dockerfile .
+          docker buildx build --check -f docker/Dockerfile.worker-sandbox .
+
   api-unit-tests:
     name: API Unit Tests
     runs-on: ubuntu-latest

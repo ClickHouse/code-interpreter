@@ -3,7 +3,7 @@ Package Init Job
 Runs as a Helm pre-install/pre-upgrade hook to populate the packages PVC
 with Python, Node, Bun, and Bash runtimes for the NsJail sandbox.
 */}}
-{{- if and .Values.workerSandbox.enabled .Values.workerSandbox.packages.initJob.enabled }}
+{{- if and .Values.workerSandbox.enabled (eq (.Values.workerSandbox.packages.source | default "image") "pvc") .Values.workerSandbox.packages.initJob.enabled }}
 {{- $packageInitNodeSelector := .Values.workerSandbox.sandboxRunner.nodeSelector }}
 {{- $packageInitTolerations := .Values.workerSandbox.sandboxRunner.tolerations }}
 {{- if .Values.workerSandbox.sandboxRunner.inheritSharedScheduling }}

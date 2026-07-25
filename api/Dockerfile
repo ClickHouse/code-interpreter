@@ -170,10 +170,12 @@ RUN cargo build --release
 #
 # Split into:
 #   - sandbox-runner-base : everything except the guest rootfs copy
-#   - sandbox-runner      : default target; copies rootfs without packages
-#                           (packages come from a runtime PVC mount)
+#   - sandbox-runner      : legacy/direct target; copies rootfs without
+#                           packages (packages come from a runtime PVC mount)
 #   - sandbox-runner-baked: copies rootfs AND bakes /pkgs from package-builder
 #                           (no PVC needed; runner can spread across nodes)
+#   - sandbox-runner-{true,false}: Compose aliases selected by KVM_ENABLED
+#   - sandbox-runner-default: final alias for the safe baked KVM image
 # ============================================================================
 FROM fedora:43 AS sandbox-runner-base
 
@@ -232,3 +234,12 @@ COPY --from=sandbox-build / /sandbox-rootfs/
 RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
 
 RUN mkdir -p /host-packages
+
+# Compose derives these aliases from KVM_ENABLED so existing no-KVM overrides
+# keep selecting the directory-root image automatically.
+FROM sandbox-runner-baked AS sandbox-runner-true
+FROM sandbox-runner AS sandbox-runner-false
+
+# Keep the safe KVM image as the Dockerfile default. Direct NsJail and legacy
+# virtio-fs deployments can still select --target sandbox-runner explicitly.
+FROM sandbox-runner-true AS sandbox-runner-default

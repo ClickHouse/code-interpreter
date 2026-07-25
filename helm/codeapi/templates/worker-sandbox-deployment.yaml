@@ -19,6 +19,14 @@ Split runtime deployments:
 {{- if not .Values.executionManifest.publicKey }}
 {{- fail "workerSandbox.enabled requires executionManifest.publicKey so sandbox-runner can verify signed execute manifests without a signing secret. The chart ships no default keypair; derive the public key from your Ed25519 private key (see helm/codeapi/README.md 'Execution manifest signing keys') and set it via --set or a values file (base64 DER or PEM with escaped newlines). For minikube local dev use -f values-local.yaml" }}
 {{- end }}
+{{- $packagesSource := .Values.workerSandbox.packages.source | default "image" }}
+{{- if and (ne $packagesSource "image") (ne $packagesSource "pvc") }}
+{{- fail "workerSandbox.packages.source must be image or pvc" }}
+{{- end }}
+{{- $packagesFromPvc := eq $packagesSource "pvc" }}
+{{- if and (not $packagesFromPvc) (not .Values.workerSandbox.kvmEnabled) }}
+{{- fail "workerSandbox.packages.source=image requires workerSandbox.kvmEnabled=true because the baked runner boots from a libkrun block root image" }}
+{{- end }}
 {{- range .Values.workerSandbox.sandboxExtraEnv }}
 {{- $name := .name | default "" }}
 {{- if and $name (or (regexMatch "(?i)(SECRET|TOKEN|PASSWORD|KEY)" $name) (hasPrefix "REDIS_" $name) (hasPrefix "AWS_" $name) (hasPrefix "S3_" $name) (hasPrefix "MINIO_" $name) (hasPrefix "CODEAPI_" $name) (eq $name "FILE_SERVER_URL") (eq $name "TOOL_CALL_SERVER_URL")) }}
@@ -249,7 +257,7 @@ spec:
             - name: LAUNCHER_FILTER_VSOCK_ENOTCONN
               value: {{ .Values.workerSandbox.launcher.filterVsockEnotconn | quote }}
             - name: SANDBOX_RUNNER_FD_LIVENESS_LIMIT
-              value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | default 40000 | quote }}
+              value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | quote }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL
@@ -297,14 +305,18 @@ spec:
             {{- with .Values.workerSandbox.sandboxExtraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if or $packagesFromPvc $useKvmHostPath }}
           volumeMounts:
+            {{- if $packagesFromPvc }}
             - name: packages
               mountPath: /host-packages
               readOnly: true
+            {{- end }}
             {{- if $useKvmHostPath }}
             - name: dev-kvm
               mountPath: /dev/kvm
             {{- end }}
+          {{- end }}
           {{- if .Values.workerSandbox.kvmEnabled }}
           securityContext:
             privileged: false
@@ -369,7 +381,9 @@ spec:
             {{- $_ := set $sandboxResources "limits" $limits }}
             {{- end }}
             {{- toYaml $sandboxResources | nindent 12 }}
+      {{- if or $packagesFromPvc $useKvmHostPath }}
       volumes:
+        {{- if $packagesFromPvc }}
         - name: packages
           {{- if .Values.workerSandbox.packages.hostPath }}
           hostPath:
@@ -384,12 +398,14 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
         {{- if $useKvmHostPath }}
         - name: dev-kvm
           hostPath:
             path: /dev/kvm
             type: CharDevice
         {{- end }}
+      {{- end }}
       {{- with $sandboxRunnerNodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

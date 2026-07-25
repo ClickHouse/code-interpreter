@@ -74,6 +74,9 @@ workerSandbox:
   # Use PVC for packages (fast local storage, no 9p overhead)
   # Populate manually: see cheat sheet pvc-populator section
   packages:
+    # The baked block-root image requires KVM; local direct NsJail mode keeps
+    # the legacy PVC package path.
+    source: pvc
     hostPath: ""  # Don't use hostPath (9p is slow)
     persistence:
       enabled: true
