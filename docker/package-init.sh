@@ -229,7 +229,15 @@ if [ -f "$PIP_PATH" ]; then
         fonttools \
         pytesseract \
         pdfminer \
-        vsdx; then
+        vsdx \
+        rasterio \
+        rioxarray \
+        geopandas \
+        pyogrio \
+        pyproj \
+        osmnx \
+        folium \
+        gpxpy; then
         echo "ERROR: Python package installation failed"
         INSTALL_FAILED=true
     else

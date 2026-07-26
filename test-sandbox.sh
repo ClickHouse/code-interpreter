@@ -174,6 +174,21 @@ test_statsmodels() {
     fi
 }
 
+test_geospatial() {
+    log_info "Testing geospatial stack import and reprojection..."
+    result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import geopandas as gpd\nimport rasterio\nfrom shapely.geometry import Point\ngdf = gpd.GeoDataFrame(geometry=[Point(-74.006, 40.7128)], crs=\"EPSG:4326\").to_crs(\"EPSG:26918\")\nprint(round(float(gdf.geometry.iloc[0].x), 2))"}]}')
+
+    stdout=$(echo "$result" | jq -r '.run.stdout // empty')
+    if [[ "$stdout" =~ ^[0-9.-]+ ]]; then
+        log_success "geospatial: got '$stdout'"
+        return 0
+    else
+        log_error "geospatial: expected numeric UTM 18N easting, got '$stdout'"
+        echo "$result" | jq .
+        return 1
+    fi
+}
+
 test_chdb() {
     log_info "Testing chDB import and query..."
     result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import chdb\nprint(chdb.query(\"SELECT sum(number) FROM numbers(5)\", \"CSV\"))"}]}')
@@ -400,6 +415,7 @@ FAILED=0
 test_basic_python || FAILED=$((FAILED + 1))
 test_numpy || FAILED=$((FAILED + 1))
 test_statsmodels || FAILED=$((FAILED + 1))
+test_geospatial || FAILED=$((FAILED + 1))
 test_chdb || FAILED=$((FAILED + 1))
 test_file_write || FAILED=$((FAILED + 1))
 test_network_blocked || FAILED=$((FAILED + 1))

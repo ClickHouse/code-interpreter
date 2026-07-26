@@ -209,7 +209,15 @@ install_python_packages() {
         fonttools \
         pytesseract \
         pdfminer \
-        vsdx; then
+        vsdx \
+        rasterio \
+        rioxarray \
+        geopandas \
+        pyogrio \
+        pyproj \
+        osmnx \
+        folium \
+        gpxpy; then
         python_packages_installed=true
     else
         echo "ERROR: Python package installation failed"
