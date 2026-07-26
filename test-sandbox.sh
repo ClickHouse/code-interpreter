@@ -179,11 +179,14 @@ test_geospatial() {
     result=$(execute_sandbox '{"language":"python","version":"3.14.4","files":[{"content":"import geopandas as gpd\nimport rasterio\nfrom shapely.geometry import Point\ngdf = gpd.GeoDataFrame(geometry=[Point(-74.006, 40.7128)], crs=\"EPSG:4326\").to_crs(\"EPSG:26918\")\nprint(round(float(gdf.geometry.iloc[0].x), 2))"}]}')
 
     stdout=$(echo "$result" | jq -r '.run.stdout // empty')
-    if [[ "$stdout" =~ ^[0-9.-]+ ]]; then
-        log_success "geospatial: got '$stdout'"
+    code=$(echo "$result" | jq -r '.run.code // empty')
+    easting=$(echo "$stdout" | head -1 | tr -d '\r')
+    if [[ "$code" == "0" ]] && [[ "$easting" =~ ^[0-9]+(\.[0-9]+)?$ ]] &&
+        awk -v e="$easting" 'BEGIN { exit !(e > 100000 && e < 900000) }'; then
+        log_success "geospatial: UTM 18N easting '$easting'"
         return 0
     else
-        log_error "geospatial: expected numeric UTM 18N easting, got '$stdout'"
+        log_error "geospatial: expected UTM 18N easting in 100000..900000 with exit 0, got code='$code' stdout='$stdout'"
         echo "$result" | jq .
         return 1
     fi
