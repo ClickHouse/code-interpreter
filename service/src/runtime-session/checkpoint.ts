@@ -223,14 +223,19 @@ export async function checkpointSession(args: {
   signal?: AbortSignal;
 }): Promise<'stored' | 'skipped_busy' | 'skipped_state' | 'failed'> {
   const heldToken = args.lockToken;
-  const lockToken = heldToken ?? await acquireRuntimeSessionLock(args.runtimeSessionId);
+  const registryOptions = { signal: args.signal };
+  const lockToken = heldToken ?? await acquireRuntimeSessionLock(
+    args.runtimeSessionId,
+    undefined,
+    registryOptions,
+  );
   let data: CheckpointArtifact | undefined;
   if (!lockToken) {
     microvmCheckpoints.inc({ outcome: 'skipped_busy' });
     return 'skipped_busy';
   }
   try {
-    const record = await readRuntimeSessionRecord(args.runtimeSessionId);
+    const record = await readRuntimeSessionRecord(args.runtimeSessionId, registryOptions);
     if (!record || record.state !== 'RUNNING' || !record.microvm_id || !record.endpoint) {
       microvmCheckpoints.inc({ outcome: 'skipped_state' });
       return 'skipped_state';
@@ -251,7 +256,11 @@ export async function checkpointSession(args: {
       Math.min(args.config.timeoutMs, CHECKPOINT_METADATA_TIMEOUT_CAP_MS),
       'checkpoint store.latestSequence',
     );
-    const sequence = await allocateCheckpointSequence(args.runtimeSessionId, retainedMax);
+    const sequence = await allocateCheckpointSequence(
+      args.runtimeSessionId,
+      retainedMax,
+      registryOptions,
+    );
     /* Upload immutable data first. If this times out or we lose the lock before
      * the pointer CAS, it is only an uncommitted orphan: restore ignores it. */
     await withTimeout(
@@ -266,7 +275,7 @@ export async function checkpointSession(args: {
       ...record,
       workspace_checkpoint: checkpointObjectKey(args.runtimeSessionId, sequence),
       checkpointed_at: Date.now(),
-    }, lockToken);
+    }, lockToken, undefined, registryOptions);
     if (!persisted) {
       microvmCheckpoints.inc({ outcome: 'skipped_busy' });
       return 'skipped_busy';

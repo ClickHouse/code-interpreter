@@ -100,4 +100,134 @@ describe('acquireOpBudget', () => {
     })).rejects.toThrow('job deadline');
     expect(Date.now() - started).toBeLessThan(1_000);
   });
+
+  test('throttle sleep catches abort between its precheck and listener registration', async () => {
+    await poisonOpBucket('run', 1_000);
+    const reason = new Error('abort before sleep listener registration');
+    let aborted = false;
+    let registrations = 0;
+    const signal = {
+      get aborted(): boolean {
+        return aborted;
+      },
+      get reason(): Error {
+        return reason;
+      },
+      addEventListener(): void {
+        registrations += 1;
+        /* The Redis PTTL wrapper registers first; sleep registers second. */
+        if (registrations === 2) aborted = true;
+      },
+      removeEventListener(): void {},
+    } as unknown as AbortSignal;
+    const started = Date.now();
+
+    await expect(acquireOpBudget('run', {
+      limitPerSecond: 4,
+      budgetMs: 5_000,
+      signal,
+    })).rejects.toThrow(reason.message);
+    expect(Date.now() - started).toBeLessThan(250);
+  });
+
+  test('a hung poison read is bounded by the caller signal', async () => {
+    const scripted = mock as unknown as {
+      pttl(key: string): Promise<number>;
+    };
+    scripted.pttl = async () => new Promise(() => {});
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('job deadline')), 10);
+
+    await expect(acquireOpBudget('run', {
+      limitPerSecond: 4,
+      budgetMs: 60_000,
+      signal: controller.signal,
+    })).rejects.toThrow('job deadline');
+  });
+
+  test('a hung increment is bounded by the one absolute budget', async () => {
+    const scripted = mock as unknown as {
+      incr(key: string): Promise<number>;
+    };
+    scripted.incr = async () => new Promise(() => {});
+    const started = Date.now();
+
+    await expect(acquireOpBudget('run', {
+      limitPerSecond: 4,
+      budgetMs: 25,
+    })).rejects.toThrow(MicrovmOpThrottledError);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test('a hung first-bucket expiry is bounded by the one absolute budget', async () => {
+    const scripted = mock as unknown as {
+      pexpire(key: string, ttlMs: number): Promise<number>;
+    };
+    scripted.pexpire = async () => new Promise(() => {});
+    const started = Date.now();
+
+    await expect(acquireOpBudget('run', {
+      limitPerSecond: 4,
+      budgetMs: 25,
+    })).rejects.toThrow(MicrovmOpThrottledError);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test('all Redis legs consume one caller-owned absolute budget', async () => {
+    let nowMs = 10_000;
+    const scripted = mock as unknown as {
+      pttl(key: string): Promise<number>;
+      incr(key: string): Promise<number>;
+      pexpire(key: string, ttlMs: number): Promise<number>;
+    };
+    scripted.pttl = async () => {
+      nowMs += 30;
+      return -2;
+    };
+    scripted.incr = async () => {
+      nowMs += 30;
+      return 1;
+    };
+    scripted.pexpire = async () => {
+      nowMs += 50;
+      return 1;
+    };
+
+    await expect(acquireOpBudget('run', {
+      limitPerSecond: 4,
+      budgetMs: 1_000,
+      deadlineAtMs: 10_100,
+      now: () => nowMs,
+    })).rejects.toThrow(MicrovmOpThrottledError);
+  });
+
+  test('poisoning can be canceled without waiting for a hung Redis SET', async () => {
+    const scripted = mock as unknown as {
+      set(...args: unknown[]): Promise<'OK' | null>;
+    };
+    scripted.set = async () => new Promise(() => {});
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('launch deadline')), 10);
+
+    await expect(poisonOpBucket(
+      'run',
+      2_000,
+      { signal: controller.signal },
+    )).rejects.toThrow('launch deadline');
+  });
+
+  test('poisoning observes an absolute deadline when Redis SET hangs', async () => {
+    const scripted = mock as unknown as {
+      set(...args: unknown[]): Promise<'OK' | null>;
+    };
+    scripted.set = async () => new Promise(() => {});
+    const started = Date.now();
+
+    await expect(poisonOpBucket(
+      'run',
+      2_000,
+      { deadlineAtMs: Date.now() + 25 },
+    )).rejects.toThrow('poison deadline exceeded');
+    expect(Date.now() - started).toBeLessThan(500);
+  });
 });

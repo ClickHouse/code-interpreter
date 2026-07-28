@@ -17,6 +17,7 @@ import {
   sessionFileRefs,
 } from '../runtime-session/files';
 import {
+  RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS,
   RUNTIME_SESSION_LOCK_TTL_MS,
   allocateRuntimeSessionGeneration,
   readRuntimeSessionRecord,
@@ -188,6 +189,15 @@ interface LaunchOptions {
   maxDurationSeconds: number;
 }
 
+interface LaunchBudget {
+  /** One absolute budget shared by throttling, both boot attempts, and polling. */
+  deadlineAtMs: number;
+  /** Excludes caller cancellation so ambiguous-launch reconciliation can clean up. */
+  deadlineSignal: AbortSignal;
+  /** Cancels forward launch work on either caller cancellation or budget expiry. */
+  signal: AbortSignal;
+}
+
 /**
  * Lambda MicroVM backend. Two modes, chosen by the runtime session context:
  *
@@ -299,19 +309,35 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
 
 
     const fence = new AbortController();
-    const heartbeat = startRuntimeSessionLockHeartbeat({
-      renew: () => renewRuntimeSessionLock(runtimeSessionId, lockToken),
-      fence,
-      ttlMs: RUNTIME_SESSION_LOCK_TTL_MS,
-    });
     const sessionCtx: SandboxExecuteContext = {
       ...ctx,
       signal: AbortSignal.any([ctx.signal, fence.signal]),
     };
+    const heartbeat = startRuntimeSessionLockHeartbeat({
+      renew: () => renewRuntimeSessionLock(
+        runtimeSessionId,
+        lockToken,
+        undefined,
+        {
+          signal: sessionCtx.signal,
+          onLateLost: () => fence.abort(
+            new SandboxBackendError(
+              'MICROVM_FENCED',
+              `Lost session lock for ${runtimeSessionId}`,
+            ),
+          ),
+        },
+      ),
+      fence,
+      ttlMs: RUNTIME_SESSION_LOCK_TTL_MS,
+    });
     let sessionVm: MicrovmDescription | undefined;
 
     try {
-      const existing = await readRuntimeSessionRecord(runtimeSessionId);
+      const existing = await readRuntimeSessionRecord(
+        runtimeSessionId,
+        { signal: sessionCtx.signal },
+      );
       const { vm } = await this.findOrLaunchSession(
         client,
         sessionCtx,
@@ -325,7 +351,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
          * reuse: recycle so the next call relaunches and restores. */
         const terminated = await this.terminate(client, vm.microvmId, 'error');
         if (terminated) {
-          await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+          await removeRuntimeSession(
+            runtimeSessionId,
+            lockToken,
+            { timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS },
+          ).catch(() => {});
         }
       });
       const result = await this.executeOnSessionVm(
@@ -374,7 +404,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         this.config.checkpoint.timeoutMs,
       );
       const canCheckpoint = !sessionCtx.signal.aborted && remainingBudgetMs > worstCaseCheckpointMs;
-      const settled = await readRuntimeSessionRecord(runtimeSessionId);
+      const settled = await readRuntimeSessionRecord(
+        runtimeSessionId,
+        { signal: sessionCtx.signal },
+      );
       if (!settled) {
         /* Returning success here would strand the known live VM without a
          * registry record: no later caller could reuse or clean it up. Treat
@@ -394,7 +427,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           sessionCtx.signal,
         )
         : { ...settled, state: 'RUNNING' as const, last_seen_at: now };
-      const persisted = await writeRuntimeSessionRecord(nextRecord, lockToken);
+      const persisted = await writeRuntimeSessionRecord(
+        nextRecord,
+        lockToken,
+        undefined,
+        { signal: sessionCtx.signal },
+      );
       if (!persisted) {
         throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} after execute`);
       }
@@ -531,7 +569,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           ctx.signal.aborted ? 'timeout' : 'error',
         );
         if (terminated) {
-          await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+          await removeRuntimeSession(
+            runtimeSessionId,
+            lockToken,
+            { timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS },
+          ).catch(() => {});
         }
       }
       throw error;
@@ -555,12 +597,17 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     let ownsRecordedVm = false;
     let quarantined = false;
     try {
-      record = await readRuntimeSessionRecord(runtimeSessionId);
+      record = await readRuntimeSessionRecord(
+        runtimeSessionId,
+        { timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS },
+      );
       ownsRecordedVm = record?.microvm_id === vm.microvmId;
       if (record && ownsRecordedVm) {
         quarantined = await writeRuntimeSessionRecord(
           { ...record, state: 'TERMINATING', last_error: reason },
           lockToken,
+          undefined,
+          { timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS },
         );
         if (!quarantined) {
           logger.warn('Lost session lock while quarantining a mutated MicroVM', {
@@ -598,6 +645,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           last_error: reason,
         },
         lockToken,
+        undefined,
+        { timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS },
       );
       if (!terminal) {
         logger.warn('Lost session lock after recycling a mutated MicroVM', {
@@ -653,7 +702,9 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         state: 'TERMINATED',
         last_seen_at: Date.now(),
         last_error: error.message,
-      }, lockToken);
+      }, lockToken, undefined, {
+        timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS,
+      });
       if (!retired) {
         logger.warn('Lost session lock while retiring an exhausted launch intent', {
           runtimeSessionId: launchIntent.runtime_session_id,
@@ -755,6 +806,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       : await allocateRuntimeSessionGeneration(
         runtimeSessionId,
         runtimeSessionLaunchGenerationSeed(this.config),
+        { signal: ctx.signal },
       );
     const launchedAt = canReplayPendingLaunch && record?.launched_at != null
       ? record.launched_at
@@ -788,7 +840,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       workspace_checkpoint: record?.workspace_checkpoint,
       checkpointed_at: record?.checkpointed_at,
     };
-    const pendingOk = await writeRuntimeSessionRecord(launchIntent, lockToken);
+    const pendingOk = await writeRuntimeSessionRecord(
+      launchIntent,
+      lockToken,
+      undefined,
+      { signal: ctx.signal },
+    );
     if (!pendingOk) {
       throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} before launch`);
     }
@@ -826,6 +883,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         const migratedGeneration = await allocateRuntimeSessionGeneration(
           runtimeSessionId,
           runtimeSessionLaunchGenerationSeed(this.config),
+          { signal: ctx.signal },
         );
         const migratedClientToken = runtimeSessionLaunchClientToken(runtimeSessionId, migratedGeneration);
         launchIntent = {
@@ -835,7 +893,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           launch_request_fingerprint: launchRequestFingerprint,
           last_seen_at: Date.now(),
         };
-        const migratedPendingOk = await writeRuntimeSessionRecord(launchIntent, lockToken);
+        const migratedPendingOk = await writeRuntimeSessionRecord(
+          launchIntent,
+          lockToken,
+          undefined,
+          { signal: ctx.signal },
+        );
         if (!migratedPendingOk) {
           throw new SandboxBackendError(
             'MICROVM_FENCED',
@@ -870,7 +933,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       /* Publish the launched VM as PENDING before readiness/restore. A worker
        * crash leaves enough information for the successor to terminate it,
        * while never advertising a partial workspace as reusable. */
-      const tracked = await writeRuntimeSessionRecord(launchedRecord, lockToken);
+      const tracked = await writeRuntimeSessionRecord(
+        launchedRecord,
+        lockToken,
+        undefined,
+        { signal: ctx.signal },
+      );
       if (!tracked) {
         throw new SandboxBackendError(
           'MICROVM_FENCED',
@@ -909,6 +977,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       const runningOk = await writeRuntimeSessionRecord(
         { ...launchedRecord, state: 'RUNNING', last_seen_at: Date.now() },
         lockToken,
+        undefined,
+        { signal: ctx.signal },
       );
       if (!runningOk) {
         throw new SandboxBackendError(
@@ -920,7 +990,11 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     } catch (error) {
       const terminated = await this.terminate(client, vm.microvmId, 'error');
       if (terminated) {
-        await removeRuntimeSession(runtimeSessionId, lockToken).catch(() => {});
+        await removeRuntimeSession(
+          runtimeSessionId,
+          lockToken,
+          { timeoutMs: RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS },
+        ).catch(() => {});
       }
       throw error;
     }
@@ -998,7 +1072,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * advances on checkpointed executes and an actively-used session would look
      * idle and relaunch needlessly. */
     if (result === 'stored') {
-      const persisted = await readRuntimeSessionRecord(runtimeSessionId);
+      const persisted = await readRuntimeSessionRecord(
+        runtimeSessionId,
+        { signal },
+      );
       return persisted ? { ...persisted, last_seen_at: now } : base;
     }
     return base;
@@ -1016,10 +1093,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     microvmId: string,
     signal?: AbortSignal,
   ): Promise<MicrovmAuthToken> {
+    const tokenBudgetDeadlineAtMs = Date.now() + this.config.launchTimeoutMs;
     try {
       await acquireOpBudget('token', {
         limitPerSecond: this.config.tokenTps,
         budgetMs: this.config.launchTimeoutMs,
+        deadlineAtMs: tokenBudgetDeadlineAtMs,
         signal,
       });
     } catch (error) {
@@ -1037,7 +1116,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       }, signal);
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
-        await poisonOpBucket('token');
+        await poisonOpBucket('token', undefined, {
+          deadlineAtMs: tokenBudgetDeadlineAtMs,
+          signal,
+        });
         microvmThrottleEvents.inc({ op: 'token' });
         throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
       }
@@ -1309,38 +1391,81 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     ctx: SandboxExecuteContext,
     opts: LaunchOptions,
   ): Promise<MicrovmDescription> {
+    const deadlineSignal = AbortSignal.timeout(this.config.launchTimeoutMs);
+    const budget: LaunchBudget = {
+      deadlineAtMs: Date.now() + this.config.launchTimeoutMs,
+      deadlineSignal,
+      signal: AbortSignal.any([ctx.signal, deadlineSignal]),
+    };
+    const normalizeBudgetFailure = (error: unknown): unknown =>
+      !ctx.signal.aborted && this.launchBudgetExpired(budget)
+        ? this.launchTimeoutError()
+        : error;
+
     try {
-      return await this.launchOnce(client, ctx, opts);
+      return await this.launchOnce(client, ctx, opts, budget);
     } catch (error) {
-      const retryable =
-        error instanceof SandboxBackendError &&
-        error.code === 'MICROVM_LAUNCH_FAILED' &&
-        error.transient &&
-        !ctx.signal.aborted;
-      if (!retryable) {
-        throw error;
+      const normalizedError = normalizeBudgetFailure(error);
+      const retryableError =
+        normalizedError instanceof SandboxBackendError &&
+        normalizedError.code === 'MICROVM_LAUNCH_FAILED' &&
+        normalizedError.transient &&
+        !ctx.signal.aborted
+          ? normalizedError
+          : undefined;
+      if (!retryableError) {
+        throw normalizedError;
       }
       /* Fresh clientToken: RunMicrovm is idempotent per token, so reusing the
-       * original would hand back the same dead VM. */
+       * original would hand back the same dead VM. The retry consumes only the
+       * first attempt's remaining launch budget. */
       logger.warn(
-        `[${ctx.executionId}] MicroVM died during boot (${error.message}); retrying launch once`,
+        `[${ctx.executionId}] MicroVM died during boot (${retryableError.message}); retrying launch once`,
       );
       microvmLaunches.inc({ outcome: 'retried' });
-      return this.launchOnce(client, ctx, { ...opts, clientToken: `${opts.clientToken}-r1` });
+      try {
+        return await this.launchOnce(
+          client,
+          ctx,
+          { ...opts, clientToken: `${opts.clientToken}-r1` },
+          budget,
+        );
+      } catch (retryError) {
+        throw normalizeBudgetFailure(retryError);
+      }
     }
+  }
+
+  private launchBudgetExpired(budget: LaunchBudget): boolean {
+    return budget.deadlineSignal.aborted || Date.now() >= budget.deadlineAtMs;
+  }
+
+  private launchTimeoutError(): SandboxBackendError {
+    return new SandboxBackendError(
+      'MICROVM_LAUNCH_FAILED',
+      `MicroVM launch did not reach RUNNING within ${this.config.launchTimeoutMs}ms`,
+    );
+  }
+
+  private assertLaunchBudget(ctx: SandboxExecuteContext, budget: LaunchBudget): void {
+    ctx.signal.throwIfAborted();
+    if (this.launchBudgetExpired(budget)) throw this.launchTimeoutError();
   }
 
   private async launchOnce(
     client: LambdaMicrovmClient,
     ctx: SandboxExecuteContext,
     opts: LaunchOptions,
+    budget: LaunchBudget,
   ): Promise<MicrovmDescription> {
     const endLaunchTimer = microvmLaunchDuration.startTimer();
+    this.assertLaunchBudget(ctx, budget);
     try {
       await acquireOpBudget('run', {
         limitPerSecond: this.config.launchTps,
-        budgetMs: this.config.launchTimeoutMs,
-        signal: ctx.signal,
+        budgetMs: Math.max(1, budget.deadlineAtMs - Date.now()),
+        deadlineAtMs: budget.deadlineAtMs,
+        signal: budget.signal,
       });
     } catch (error) {
       if (error instanceof MicrovmOpThrottledError) {
@@ -1350,6 +1475,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       }
       throw error;
     }
+    this.assertLaunchBudget(ctx, budget);
 
     let vm: MicrovmDescription;
     try {
@@ -1363,10 +1489,13 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         maximumDurationSeconds: opts.maxDurationSeconds,
         idlePolicy: opts.idlePolicy,
         clientToken: opts.clientToken,
-      }, ctx.signal);
+      }, budget.signal, budget.deadlineSignal);
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
-        await poisonOpBucket('run');
+        await poisonOpBucket('run', undefined, {
+          deadlineAtMs: budget.deadlineAtMs,
+          signal: budget.signal,
+        });
         microvmThrottleEvents.inc({ op: 'run' });
         microvmLaunches.inc({ outcome: 'throttled' });
         throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
@@ -1380,7 +1509,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     }
 
     try {
-      const ready = await this.waitUntilRunning(client, vm, ctx);
+      const ready = await this.waitUntilRunning(client, vm, ctx, budget);
       microvmLaunches.inc({ outcome: 'ok' });
       endLaunchTimer();
       return ready;
@@ -1400,7 +1529,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
        * surfaces as a public MICROVM_LAUNCH_* failure, not a generic 500. */
       if (error instanceof SandboxBackendError) throw error;
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
-        await poisonOpBucket('run');
+        await poisonOpBucket('run', undefined, {
+          deadlineAtMs: budget.deadlineAtMs,
+          signal: budget.signal,
+        });
         microvmThrottleEvents.inc({ op: 'run' });
         throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
       }
@@ -1416,13 +1548,15 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     client: LambdaMicrovmClient,
     vm: MicrovmDescription,
     ctx: SandboxExecuteContext,
+    budget: LaunchBudget,
   ): Promise<MicrovmDescription> {
-    const deadline = Date.now() + this.config.launchTimeoutMs;
     let current = vm;
-    while (current.state !== 'RUNNING' || !current.endpoint) {
+    for (;;) {
       if (ctx.signal.aborted) {
         throw new SandboxBackendError('MICROVM_LAUNCH_FAILED', 'Execution aborted while MicroVM was launching');
       }
+      if (this.launchBudgetExpired(budget)) throw this.launchTimeoutError();
+      if (current.state === 'RUNNING' && current.endpoint) return current;
       if (current.state === 'TERMINATED' || current.state === 'TERMINATING') {
         /* A boot-time death is a fast, provider-side transient (observed in
          * the field a few times a day) — mark it retryable so `launch` can
@@ -1434,16 +1568,10 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
           true,
         );
       }
-      if (Date.now() + this.pollIntervalMs > deadline) {
-        throw new SandboxBackendError(
-          'MICROVM_LAUNCH_FAILED',
-          `MicroVM ${current.microvmId} did not reach RUNNING within ${this.config.launchTimeoutMs}ms`,
-        );
-      }
-      await sleep(this.pollIntervalMs, ctx.signal);
-      current = await client.getMicrovm(current.microvmId, ctx.signal);
+      if (Date.now() + this.pollIntervalMs > budget.deadlineAtMs) throw this.launchTimeoutError();
+      await sleep(this.pollIntervalMs, budget.signal);
+      current = await client.getMicrovm(current.microvmId, budget.signal);
     }
-    return current;
   }
 
   private async assertHealthy(base: string, token: string, ctx: SandboxExecuteContext): Promise<void> {

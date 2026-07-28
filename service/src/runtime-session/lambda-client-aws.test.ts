@@ -230,6 +230,42 @@ describe('AwsLambdaMicrovmClient command mapping', () => {
     expect(sent[1].signal?.aborted).toBe(false);
   });
 
+  test('an explicit reconcile signal bounds ambiguous launch recovery', async () => {
+    const sent: Array<{ command: SentCommand; signal?: AbortSignal }> = [];
+    const sender: MicrovmCommandSender = {
+      send(command, options): Promise<unknown> {
+        sent.push({ command: command as SentCommand, signal: options?.abortSignal });
+        if (sent.length === 1) return Promise.reject(new Error('connection reset'));
+        return new Promise((_resolve, reject) => {
+          const signal = options?.abortSignal;
+          const onAbort = (): void => reject(signal?.reason ?? new Error('aborted'));
+          if (signal?.aborted) {
+            onAbort();
+          } else {
+            signal?.addEventListener('abort', onAbort, { once: true });
+          }
+        });
+      },
+    };
+    const client = new AwsLambdaMicrovmClient({ client: sender, requestTimeoutMs: 5_000 });
+    const reconcile = new AbortController();
+    const pending = client.runMicrovm({
+      imageIdentifier: 'arn:image',
+      maximumDurationSeconds: 120,
+      clientToken: 'exec-budgeted-1',
+    }, undefined, reconcile.signal);
+    while (sent.length < 2) await Promise.resolve();
+    reconcile.abort(new Error('launch budget expired'));
+
+    await expect(pending).rejects.toMatchObject({
+      kind: 'other',
+      operation: 'RunMicrovm',
+      message: 'connection reset',
+    });
+    expect(sent).toHaveLength(2);
+    expect(sent[1].signal?.aborted).toBe(true);
+  });
+
   test('does not reconcile a deterministic RunMicrovm rejection', async () => {
     const { sender, sent } = stubSender([namedError('ValidationException')]);
     const client = new AwsLambdaMicrovmClient({ client: sender });

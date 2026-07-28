@@ -29,6 +29,7 @@ interface WalkerInternals {
   pendingSurfaced: Map<string, { name: string; signature: string }>;
   inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string; readOnly?: boolean }>;
   files: TFile[];
+  writeFile: (file: TFile) => Promise<void>;
   walkDir: (dir: string, depth: number, inputByName: Map<string, TFile>) => Promise<'collected' | 'empty' | 'skipped'>;
   handleSessionFiles: () => Promise<void>;
 }
@@ -469,6 +470,51 @@ describe('walkDir / regular file handling', () => {
      * carry the `inherited` flag (callers should download it like any output). */
     expect(internals.sessionFiles[0].inherited).toBeUndefined();
     expect(internals.inheritedRefs).toHaveLength(0);
+  });
+
+  it('surfaces a primed input changed back to bytes matching a prior output', async () => {
+    const name = 'artifact.txt';
+    const priorOutput = 'prior output bytes';
+    const replacementInput = 'new input bytes';
+    const session = new SessionWorkspace({ runtimeSessionId: 'rt_replaced_output' });
+    session.markSurfaced(name, sha256(priorOutput));
+
+    /* A later request successfully replaces the old output with a new inline
+     * session input at the same path. Priming must invalidate the old output
+     * signature before this state can be checkpointed. */
+    const primeJob = makeJob({ session });
+    const primeInternals = asInternals(primeJob);
+    primeInternals.submissionDir = tmpDir;
+    await primeInternals.writeFile({ name, content: replacementInput });
+    expect(session.isSurfaced(name, sha256(priorOutput))).toBe(false);
+
+    /* On a subsequent turn, sandbox code changes the persisted input back to
+     * the old output bytes. The primed baseline proves this is a modification,
+     * so the stale signature must not suppress the refreshed artifact. */
+    await fsp.writeFile(path.join(tmpDir, name), priorOutput);
+    const nextJob = makeJob({ session });
+    const nextInternals = asInternals(nextJob);
+    nextInternals.submissionDir = tmpDir;
+    await nextInternals.walkDir(tmpDir, 0, new Map());
+
+    expect(nextInternals.generatedFiles.map(file => file.name)).toEqual([name]);
+    expect(nextInternals.sessionFiles.map(file => file.name)).toEqual([name]);
+    const refreshed = [...nextInternals.pendingSurfaced.values()];
+    expect(refreshed).toEqual([{
+      name,
+      signature: sha256(priorOutput),
+    }]);
+
+    /* Once that refreshed artifact uploads, normal output deduplication still
+     * applies. This guards against fixing the stale lineage by globally
+     * bypassing surfaced checks for every modified primed path. */
+    session.markSurfaced(refreshed[0].name, refreshed[0].signature);
+    const dedupJob = makeJob({ session });
+    const dedupInternals = asInternals(dedupJob);
+    dedupInternals.submissionDir = tmpDir;
+    await dedupInternals.walkDir(tmpDir, 0, new Map());
+    expect(dedupInternals.generatedFiles).toHaveLength(0);
+    expect(dedupInternals.sessionFiles).toHaveLength(0);
   });
 
   it('filters out unsupported extensions', async () => {

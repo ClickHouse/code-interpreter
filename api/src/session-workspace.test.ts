@@ -158,6 +158,24 @@ describe('SessionWorkspace state', () => {
     expect(relaunched.primedInputId('skill.py')).toBeUndefined();
   });
 
+  test('priming a path invalidates only that path\'s prior surfaced signature', () => {
+    const workspace = new SessionWorkspace({ runtimeSessionId: 'rt_reprime' });
+    workspace.markSurfaced('artifact.txt', 'old-output-hash');
+    workspace.markSurfaced('untouched.txt', 'unrelated-output-hash');
+
+    workspace.markPrimed('artifact.txt', 'new-input-id', false, 'new-input-hash');
+
+    expect(workspace.isSurfaced('artifact.txt', 'old-output-hash')).toBe(false);
+    expect(workspace.isSurfaced('untouched.txt', 'unrelated-output-hash')).toBe(true);
+    expect(workspace.snapshotMeta()).toEqual({
+      primed: [[
+        'artifact.txt',
+        { id: 'new-input-id', readOnly: false, hash: 'new-input-hash' },
+      ]],
+      surfaced: [['untouched.txt', 'unrelated-output-hash']],
+    });
+  });
+
   test('a partial prime stays fail-closed until a successful restore loads metadata', () => {
     const workspace = new SessionWorkspace({ runtimeSessionId: 'rt_dirty' });
     workspace.markDirty('partial input prime');

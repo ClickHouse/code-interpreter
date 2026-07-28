@@ -194,6 +194,11 @@ export class SessionWorkspace {
   }
 
   markPrimed(relPath: string, storageFileId: string, readOnly = false, hash?: string): void {
+    /* A successful prime replaces whatever previously occupied this path.
+     * Any surfaced signature therefore belongs to an older output lineage:
+     * retaining it could suppress a later modification of the new input when
+     * its bytes happen to match that prior output. */
+    this.forget(relPath);
     this.primed.set(relPath, { id: storageFileId, readOnly, hash });
   }
 

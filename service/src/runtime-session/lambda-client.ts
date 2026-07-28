@@ -86,7 +86,17 @@ export function microvmPortHeaders(port: number): Record<string, string> {
 }
 
 export interface LambdaMicrovmClient {
-  runMicrovm(args: RunMicrovmArgs, signal?: AbortSignal): Promise<MicrovmDescription>;
+  /**
+   * `signal` bounds the initial provider request. `reconcileSignal` optionally
+   * bounds the independent same-token recovery request made after an ambiguous
+   * failure. When omitted, recovery keeps its own request deadline so a caller
+   * cancellation can still recover the VM id for cleanup.
+   */
+  runMicrovm(
+    args: RunMicrovmArgs,
+    signal?: AbortSignal,
+    reconcileSignal?: AbortSignal,
+  ): Promise<MicrovmDescription>;
   getMicrovm(microvmId: string, signal?: AbortSignal): Promise<MicrovmDescription>;
   suspendMicrovm(microvmId: string, signal?: AbortSignal): Promise<void>;
   resumeMicrovm(microvmId: string, signal?: AbortSignal): Promise<MicrovmDescription>;

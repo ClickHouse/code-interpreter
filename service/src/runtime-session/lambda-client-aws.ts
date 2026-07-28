@@ -111,7 +111,11 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
     }
   }
 
-  async runMicrovm(args: RunMicrovmArgs, signal?: AbortSignal): Promise<MicrovmDescription> {
+  async runMicrovm(
+    args: RunMicrovmArgs,
+    signal?: AbortSignal,
+    reconcileSignal?: AbortSignal,
+  ): Promise<MicrovmDescription> {
     const input = {
       imageIdentifier: args.imageIdentifier,
       imageVersion: args.imageVersion,
@@ -140,9 +144,11 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
     } catch (firstError) {
       /* A timeout/abort or broken response is ambiguous: AWS may have accepted
        * RunMicrovm before the client lost the response. Replay the SAME
-       * idempotency token once on an independent bounded request. If AWS
-       * accepted it, this recovers the MicroVM id so the backend can either
-       * continue or (when the job signal is already aborted) terminate it.
+       * idempotency token once on a request independent of caller cancellation.
+       * A higher-level launch budget may still bound that reconciliation via
+       * `reconcileSignal`. If AWS accepted it, this recovers the MicroVM id so
+       * the backend can either continue or (when the job signal is already
+       * aborted) terminate it.
        * Never reconcile deterministic validation/quota/throttle failures, and
        * never replay a launch that lacks an idempotency token. */
       const ambiguous =
@@ -153,6 +159,7 @@ export class AwsLambdaMicrovmClient implements LambdaMicrovmClient {
         const recovered = await this.send<Parameters<typeof toDescription>[0]>(
           'RunMicrovmReconcile',
           new RunMicrovmCommand(input),
+          reconcileSignal,
         );
         return toDescription(recovered);
       } catch {

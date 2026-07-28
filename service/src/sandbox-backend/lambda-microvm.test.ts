@@ -347,6 +347,67 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
   });
 
+  test('shares one launch budget across throttle, RunMicrovm, and control-plane polling', async () => {
+    const fake = fakeClient();
+    const runMicrovm = fake.runMicrovm.bind(fake);
+    const getMicrovm = fake.getMicrovm.bind(fake);
+    await mock.set('rtsx:tps:poison:run', '1', 'PX', 20);
+    fake.delayNextLaunch(100);
+    fake.runMicrovm = async (args) => {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      return runMicrovm(args);
+    };
+    fake.getMicrovm = async (microvmId: string, signal?: AbortSignal) => {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, 200);
+        const onAbort = (): void => {
+          clearTimeout(timer);
+          reject(signal?.reason ?? new Error('launch aborted'));
+        };
+        if (signal?.aborted) {
+          onAbort();
+        } else {
+          signal?.addEventListener('abort', onAbort, { once: true });
+        }
+      });
+      fake.setState(microvmId, 'RUNNING');
+      return getMicrovm(microvmId);
+    };
+
+    await expect(
+      makeBackend(fake, { launchTimeoutMs: 120 }).execute(request(), context()),
+    ).rejects.toMatchObject({
+      code: 'MICROVM_LAUNCH_FAILED',
+      message: 'MicroVM launch did not reach RUNNING within 120ms',
+      transient: false,
+    });
+    expect(captured.some(request => request.path === '/api/v2/execute')).toBe(false);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+  });
+
+  test('rejects and terminates a RUNNING response returned after the launch deadline', async () => {
+    const fake = fakeClient();
+    const runMicrovm = fake.runMicrovm.bind(fake);
+    fake.runMicrovm = async (args) => {
+      /* Models same-token reconciliation returning after the forward launch
+       * signal expired: cleanup still needs the recovered VM id. */
+      await new Promise(resolve => setTimeout(resolve, 80));
+      return runMicrovm(args);
+    };
+
+    await expect(
+      makeBackend(fake, { launchTimeoutMs: 40 }).execute(request(), context()),
+    ).rejects.toMatchObject({
+      code: 'MICROVM_LAUNCH_FAILED',
+      message: 'MicroVM launch did not reach RUNNING within 40ms',
+    });
+    expect(captured.some(request => request.path === '/api/v2/execute')).toBe(false);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+  });
+
   test('control-plane throttle surfaces MICROVM_LAUNCH_THROTTLED and poisons the run bucket', async () => {
     const fake = fakeClient();
     fake.failNext('runMicrovm', new LambdaMicrovmApiError('throttled', 'RunMicrovm', 'rate exceeded'));
@@ -419,6 +480,31 @@ describe('LambdaMicrovmSandboxBackend stateless execution', () => {
     const tokens = runCalls.map((call) => (call.args as { clientToken?: string }).clientToken);
     expect(tokens[0]).toBe('exec-exec_42');
     expect(tokens[1]).toBe('exec-exec_42-r1');
+  });
+
+  test('the boot-death retry consumes only the first attempt remaining launch budget', async () => {
+    const fake = fakeClient();
+    const runMicrovm = fake.runMicrovm.bind(fake);
+    fake.terminateNextLaunch();
+    let attempt = 0;
+    fake.runMicrovm = async (args) => {
+      attempt += 1;
+      await new Promise(resolve => setTimeout(resolve, attempt === 1 ? 100 : 250));
+      return runMicrovm(args);
+    };
+
+    await expect(
+      makeBackend(fake, { launchTimeoutMs: 300 }).execute(request(), context()),
+    ).rejects.toMatchObject({
+      code: 'MICROVM_LAUNCH_FAILED',
+      message: 'MicroVM launch did not reach RUNNING within 300ms',
+      transient: false,
+    });
+    const tokens = fake.callsFor('runMicrovm')
+      .map(call => (call.args as { clientToken?: string }).clientToken);
+    expect(tokens).toEqual(['exec-exec_42', 'exec-exec_42-r1']);
+    expect(captured.some(request => request.path === '/api/v2/execute')).toBe(false);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(2);
   });
 
   test('a second boot-time death fails the request — single retry only', async () => {
@@ -1175,6 +1261,34 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
   });
 
+  test('an aborted stateful execute bounds hung registry work and still bounds lock cleanup', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    const scripted = mock as unknown as {
+      get(key: string): Promise<string | null>;
+      releaseRuntimeSessionLockScript(lockKey: string, token: string): Promise<number>;
+    };
+    scripted.get = async () => new Promise(() => {});
+    let releaseCalls = 0;
+    scripted.releaseRuntimeSessionLockScript = async () => {
+      releaseCalls += 1;
+      return new Promise(() => {});
+    };
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('job deadline')), 20);
+    const started = Date.now();
+
+    await expect(
+      backend.execute(request(), sessionContext({ signal: controller.signal })),
+    ).rejects.toThrow('job deadline');
+
+    /* Forward Redis work inherits the job signal, while final lock release
+     * deliberately uses its own two-second cleanup budget. */
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(releaseCalls).toBe(1);
+    expect(fake.callsFor('runMicrovm')).toHaveLength(0);
+  });
+
   test('a fresh session VM returning a proxy 502 is recycled immediately', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
@@ -1362,7 +1476,7 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     };
 
     await expect(makeBackend(fake).execute(request(), sessionContext())).rejects.toThrow(
-      'Redis unavailable after launch',
+      'Lost session lock for rt_session_1 after launch',
     );
     expect(fake.callsFor('runMicrovm')).toHaveLength(1);
     expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
@@ -1612,17 +1726,19 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     let now = 1_000_000;
     Date.now = () => now;
     onExecute = () => {
-      /* Leaves 45ms: more than the old 10 + 3*10 guard, but less than the
-       * actual token wait + GET + list + put + commit worst case (50ms). */
-      now += 55;
+      /* Leaves 1035ms: more than the old 1000 + 3*10 guard, but less than the
+       * actual token wait + GET + list + put + commit worst case (1040ms).
+       * The roomy launch timeout keeps this clock-focused test independent of
+       * real event-loop scheduling under the full suite. */
+      now += 65;
     };
     try {
       const fake = fakeClient();
       const store = new MemoryCheckpointStore();
       const backend = makeBackend(fake, {
         checkpointsEnabled: true,
-        jobTimeoutMs: 100,
-        launchTimeoutMs: 10,
+        jobTimeoutMs: 1_100,
+        launchTimeoutMs: 1_000,
         checkpoint: {
           port: 8080,
           authTokenTtlSeconds: 300,
@@ -1668,10 +1784,10 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
       const store = new MemoryCheckpointStore();
       const backend = makeBackend(fake, {
         checkpointsEnabled: true,
-        /* A backend-local 100ms clock would allow the 50ms pipeline. The
-         * worker deadline has only 49ms left after earlier egress/setup work. */
-        jobTimeoutMs: 100,
-        launchTimeoutMs: 10,
+        /* A backend-local 1100ms clock would allow the 1040ms pipeline. The
+         * worker deadline has only 1039ms left after earlier setup work. */
+        jobTimeoutMs: 1_100,
+        launchTimeoutMs: 1_000,
         checkpoint: {
           port: 8080,
           authTokenTtlSeconds: 300,
@@ -1682,7 +1798,7 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
 
       expect(await backend.execute(
         request(),
-        sessionContext({ deadlineAtMs: now + 49 }),
+        sessionContext({ deadlineAtMs: now + 1_039 }),
       )).toEqual(EXECUTE_RESPONSE);
       expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(0);
       expect(store.objects.size).toBe(0);
