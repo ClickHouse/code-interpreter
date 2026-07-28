@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  jobCompletionWaitTimeoutMs,
   jobDeadlineAtMs,
   languageConfig,
   lambdaMicrovmNumericConfigError,
@@ -105,6 +106,10 @@ describe('job deadline accounting', () => {
   it('falls back to worker start only when enqueue time is unavailable', () => {
     expect(jobDeadlineAtMs(undefined, 300_000, 50_000)).toBe(350_000);
     expect(jobDeadlineAtMs(Number.NaN, 300_000, 50_000)).toBe(350_000);
+  });
+
+  it('gives the worker bounded cleanup time after the execution deadline', () => {
+    expect(jobCompletionWaitTimeoutMs(300_000, 60_000, 5_000)).toBe(370_000);
   });
 });
 

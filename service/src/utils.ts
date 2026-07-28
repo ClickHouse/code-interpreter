@@ -109,6 +109,24 @@ export function sandboxErrorMessageFromAxios(error: AxiosError): string {
 export function publicExecutionFailure(error: unknown): { status: number; body: { error: string; message: string } } | null {
   const message = error instanceof Error ? error.message : '';
 
+  /* The worker normally publishes a typed deadline failure before this wait
+   * expires. If cleanup itself consumes the bounded completion grace, BullMQ
+   * supplies its own timeout string; keep both internal shapes sanitized and
+  * caller-correct rather than falling through to a generic 500. */
+  const workerDeadlineExpired = /^Job timed out after \d+ms$/.test(message);
+  const bullmqWaitExpired =
+    /^Job wait .+ timed out before finishing, no finish notification arrived after \d+ms \(id=.+\)$/
+      .test(message);
+  if (workerDeadlineExpired || bullmqWaitExpired) {
+    return {
+      status: 504,
+      body: {
+        error: 'execution_timeout',
+        message: 'Execution timed out',
+      },
+    };
+  }
+
   /* Typed worker failures cross BullMQ as `<CODE>: <message>`. Runtime-session
    * and MicroVM codes describe sandbox availability; SESSION_INPUT_* codes
    * describe the caller's declared input set or its upstream object source. */

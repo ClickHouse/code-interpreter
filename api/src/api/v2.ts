@@ -290,7 +290,14 @@ function getJob(
      * one-shot under another session's workspace/UID; conflict loudly instead
      * so the control plane recycles this VM. */
     if (!session) {
-      throw { status: 409, message: 'Runner is bound to a different runtime session' };
+      throw {
+        status: 409,
+        /* `session_workspace_dirty` is the established control-plane recycle
+         * signal. Reuse it so a new runner remains safe behind an older
+         * service during a rolling deployment. */
+        code: 'session_workspace_dirty',
+        message: 'Runner is bound to a different runtime session',
+      };
     }
     if (session.dirtyReason) {
       throw {

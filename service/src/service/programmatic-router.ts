@@ -24,7 +24,7 @@ import {
   ptcReplayStateOversize,
 } from '../metrics';
 import { Jobs } from '../enum';
-import { env } from '../config';
+import { env, jobCompletionWaitTimeoutMs } from '../config';
 import {
   normalizeEgressGatewayUrl,
   normalizeProgrammaticTimeoutMs,
@@ -67,6 +67,11 @@ const TOOL_CALL_SERVER_RETRY_DELAY = 1000; // ms
 const MAX_TOOLS_PER_REQUEST = 100;
 const STALE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const DEBUG_MODE = env.PTC_DEBUG;
+const JOB_COMPLETION_WAIT_TIMEOUT_MS = jobCompletionWaitTimeoutMs(
+  env.JOB_TIMEOUT,
+  env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS,
+  env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
+);
 
 const router = Router();
 
@@ -413,7 +418,7 @@ async function runReplayIteration(
   });
   jobsSubmitted.inc({ language });
 
-  return job.waitUntilFinished(events, env.JOB_TIMEOUT);
+  return job.waitUntilFinished(events, JOB_COMPLETION_WAIT_TIMEOUT_MS);
 }
 
 function isSandboxRunSuccess(result: t.ExecuteResult): boolean {
@@ -1397,7 +1402,7 @@ async function handleBlocking(
       }
     });
 
-    job.waitUntilFinished(pyQueueEvents, env.JOB_TIMEOUT)
+    job.waitUntilFinished(pyQueueEvents, JOB_COMPLETION_WAIT_TIMEOUT_MS)
       .then(async (result) => {
         if (clientDisconnected) return;
         await setExecutionResult(execution_id, result);

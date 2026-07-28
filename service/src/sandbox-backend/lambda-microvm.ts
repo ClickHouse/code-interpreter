@@ -486,21 +486,36 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       const transportFailure = axios.isAxiosError(error) && error.response == null;
       const unhealthy = error instanceof SandboxBackendError && error.code === 'MICROVM_UNHEALTHY';
       const gatewayUnreachable = status >= 502 && status <= 504;
-      const sessionWorkspaceDirty =
-        axios.isAxiosError(error) &&
-        error.response?.status === 409 &&
-        (error.response.data as { error?: unknown } | undefined)?.error === 'session_workspace_dirty';
-      if (sessionWorkspaceDirty) {
+      const sessionConflictBody = axios.isAxiosError(error) && error.response?.status === 409
+        ? error.response.data as { error?: unknown; message?: unknown } | undefined
+        : undefined;
+      const sessionConflictCode = sessionConflictBody?.error;
+      /* Older runner images returned this exact conflict without a stable
+       * error code. Recognize only that legacy shape so service-first rolling
+       * deploys self-heal without treating unrelated 409s as VM failures. */
+      const legacySessionBindingConflict =
+        sessionConflictCode === undefined &&
+        sessionConflictBody?.message === 'Runner is bound to a different runtime session';
+      if (
+        sessionConflictCode === 'session_workspace_dirty' ||
+        sessionConflictCode === 'session_binding_conflict' ||
+        legacySessionBindingConflict
+      ) {
+        const reason = sessionConflictCode === 'session_workspace_dirty'
+          ? 'workspace_dirty'
+          : 'session_binding_conflict';
         await this.recycleUncommittedSessionVm(
           client,
           vm,
           runtimeSessionId,
           lockToken,
-          'workspace_dirty',
+          reason,
         );
         throw new SandboxBackendError(
           'MICROVM_UNHEALTHY',
-          `Runtime session ${runtimeSessionId} workspace was dirty and has been recycled`,
+          sessionConflictCode === 'session_workspace_dirty'
+            ? `Runtime session ${runtimeSessionId} workspace was dirty and has been recycled`
+            : `Runtime session ${runtimeSessionId} runner binding conflicted and has been recycled`,
           error,
         );
       }
@@ -534,7 +549,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     vm: MicrovmDescription,
     runtimeSessionId: string,
     lockToken: string,
-    reason: 'result_finalization_failed' | 'workspace_dirty',
+    reason: 'result_finalization_failed' | 'workspace_dirty' | 'session_binding_conflict',
   ): Promise<void> {
     let record: RuntimeSessionRecord | null = null;
     let ownsRecordedVm = false;
@@ -1183,6 +1198,15 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     onUnhealthy: (() => Promise<void>) | undefined,
     message: string,
   ): Promise<never> {
+    /* Probe/push/token waits share the worker deadline but surface several
+     * lower-level abort shapes. Preserve input-delivery semantics before
+     * classifying VM health so the worker can return a sanitized 504. */
+    if (signal.aborted) {
+      throw new SessionFilesError(
+        'SESSION_INPUT_ABORTED',
+        'Session input delivery aborted',
+      );
+    }
     if (this.inputDeliveryProvesVmUnhealthy(error, signal)) {
       await onUnhealthy?.();
     }

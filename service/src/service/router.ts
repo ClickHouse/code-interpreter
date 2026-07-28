@@ -12,7 +12,7 @@ import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
-import { env, planLimits, resolveLanguage } from '../config';
+import { env, jobCompletionWaitTimeoutMs, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
@@ -27,6 +27,11 @@ import { prepareSandboxJobSecurity } from '../sandbox-egress';
 import logger from '../logger';
 
 const { INSTANCE_ID } = env;
+const JOB_COMPLETION_WAIT_TIMEOUT_MS = jobCompletionWaitTimeoutMs(
+  env.JOB_TIMEOUT,
+  env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS,
+  env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
+);
 
 const UPLOAD_TIMEOUT_MS = 30_000;
 /* Batch cap sized for skill-priming uploads: a single skill (e.g. pptx)
@@ -269,7 +274,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+    }, () => job.waitUntilFinished(queueEvents, JOB_COMPLETION_WAIT_TIMEOUT_MS), 'CONSUMER');
 
     if (!isSyntheticRequest) {
       logger.info('Execution completed', { session_id, user_id });

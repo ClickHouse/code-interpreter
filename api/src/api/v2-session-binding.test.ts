@@ -99,4 +99,35 @@ describe('per-request session binding', () => {
       Job.prototype.cleanup = originalCleanup;
     }
   });
+
+  test('a different session receives a typed conflict so the control plane can recycle the runner', async () => {
+    config.session_workspace_enabled = true;
+    config.require_execution_manifest = false;
+
+    const originalPrime = Job.prototype.prime;
+    const originalExecute = Job.prototype.execute;
+    const originalCleanup = Job.prototype.cleanup;
+
+    Job.prototype.prime = async function primeWithoutFilesystem(): Promise<void> {};
+    Job.prototype.execute = async function executeWithoutSandbox() {
+      return {} as Awaited<ReturnType<Job['execute']>>;
+    };
+    Job.prototype.cleanup = async function cleanupWithoutFilesystem(): Promise<void> {};
+
+    try {
+      expect((await execute('rt_bound_once')).status).toBe(200);
+
+      const response = await execute('rt_different_session');
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        error: 'session_workspace_dirty',
+        message: 'Runner is bound to a different runtime session',
+      });
+      expect(getBoundSessionWorkspace()?.runtimeSessionId).toBe('rt_bound_once');
+    } finally {
+      Job.prototype.prime = originalPrime;
+      Job.prototype.execute = originalExecute;
+      Job.prototype.cleanup = originalCleanup;
+    }
+  });
 });

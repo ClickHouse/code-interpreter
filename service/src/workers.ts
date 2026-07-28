@@ -16,6 +16,7 @@ import { resolveRuntimeSessionIdForJob } from './runtime-session/job-policy';
 import { getSandboxBackend, SandboxBackendError, type SandboxRawResponse } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
 import { withSpan, withTraceContext } from './telemetry';
+import { workerDeadlineFailure } from './worker-error';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
@@ -192,8 +193,13 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     const errorDetails = getAxiosErrorDetails(error);
     logger.error('Error processing job', errorDetails);
 
-    if (controller.signal.aborted) {
-      throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
+    const deadlineFailure = workerDeadlineFailure(
+      error,
+      controller.signal.aborted,
+      env.JOB_TIMEOUT,
+    );
+    if (deadlineFailure) {
+      throw deadlineFailure;
     } else if (error instanceof SandboxBackendError) {
       throw new Error(`${error.code}: ${error.message}`);
     } else if (error instanceof SessionFilesError) {

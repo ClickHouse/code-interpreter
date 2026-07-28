@@ -196,6 +196,44 @@ describe('sandbox error formatting', () => {
     });
   });
 
+  test('maps an input-delivery deadline to a sanitized 504', () => {
+    const failure = publicExecutionFailure(
+      new Error('SESSION_INPUT_ABORTED: Fetching private/customer-list.csv timed out'),
+    );
+    expect(failure).toEqual({
+      status: 504,
+      body: {
+        error: 'session_input_aborted',
+        message: 'Input delivery timed out',
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain('customer-list.csv');
+  });
+
+  test('maps worker and BullMQ deadline fallbacks to sanitized 504s', () => {
+    expect(publicExecutionFailure(new Error('Job timed out after 300000ms'))).toEqual({
+      status: 504,
+      body: {
+        error: 'execution_timeout',
+        message: 'Execution timed out',
+      },
+    });
+
+    const bullmqFailure = publicExecutionFailure(
+      new Error(
+        'Job wait execute timed out before finishing, no finish notification arrived after 370000ms (id=private-session-id)',
+      ),
+    );
+    expect(bullmqFailure).toEqual({
+      status: 504,
+      body: {
+        error: 'execution_timeout',
+        message: 'Execution timed out',
+      },
+    });
+    expect(JSON.stringify(bullmqFailure)).not.toContain('private-session-id');
+  });
+
   test('does not expose AWS identifiers embedded in backend failures', () => {
     const arn = 'arn:aws:iam::123456789012:role/private-microvm-exec';
     const failure = publicExecutionFailure(

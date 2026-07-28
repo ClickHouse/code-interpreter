@@ -41,6 +41,7 @@ let executeDelayMs = 0;
 let executeStatus = 200;
 let executeResponseBody: unknown;
 let sessionFilesStatus = 200;
+let sessionProbeDelayMs = 0;
 let lastSessionFilesBody: Buffer | null = null;
 let stealSessionLockOnExecute = false;
 let fileReadOnly = false;
@@ -87,6 +88,9 @@ beforeAll(() => {
         });
       }
       if (path === '/api/v2/session/inputs/probe') {
+        if (sessionProbeDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, sessionProbeDelayMs));
+        }
         const refs = (JSON.parse(raw.toString()) as {
           refs: Array<{ cache_key: string }>;
         }).refs;
@@ -161,6 +165,7 @@ beforeEach(async () => {
   executeStatus = 200;
   executeResponseBody = EXECUTE_RESPONSE;
   sessionFilesStatus = 200;
+  sessionProbeDelayMs = 0;
   lastSessionFilesBody = null;
   stealSessionLockOnExecute = false;
   fileReadOnly = false;
@@ -873,6 +878,21 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(record?.state).toBe('RUNNING');
   });
 
+  test('an unrelated runner 409 keeps the warm VM', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    executeStatus = 409;
+    executeResponseBody = {
+      error: 'request_conflict',
+      message: 'The request conflicts with current state',
+    };
+
+    await expect(backend.execute(request(), sessionContext())).rejects.toThrow();
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
+
   test('a partial-prime signal recycles the dirty session workspace', async () => {
     const fake = fakeClient();
     const backend = makeBackend(fake);
@@ -901,12 +921,52 @@ describe('LambdaMicrovmSandboxBackend session execution', () => {
     expect(fake.callsFor('runMicrovm')).toHaveLength(2);
   });
 
+  test('a legacy untagged session-binding conflict recycles the mismatched runner', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    executeStatus = 409;
+    executeResponseBody = {
+      message: 'Runner is bound to a different runtime session',
+    };
 
+    await expect(backend.execute(request(), sessionContext())).rejects.toMatchObject({
+      code: 'MICROVM_UNHEALTHY',
+    });
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(1);
+    const recycled = await readRuntimeSessionRecord('rt_session_1');
+    expect(recycled?.state).toBe('TERMINATED');
+    expect(recycled?.microvm_id).toBeUndefined();
+    expect(recycled?.last_error).toBe('session_binding_conflict');
 
+    executeStatus = 200;
+    executeResponseBody = EXECUTE_RESPONSE;
+    await expect(backend.execute(request(), sessionContext())).resolves.toEqual(EXECUTE_RESPONSE);
+    expect(fake.callsFor('runMicrovm')).toHaveLength(2);
+  });
 
+  test('an aborted input probe remains a typed timeout and keeps the warm session reusable', async () => {
+    const fake = fakeClient();
+    const backend = makeBackend(fake);
+    await backend.execute(request(), sessionContext());
+    captured = [];
+    sessionProbeDelayMs = 100;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10);
 
-
-
+    try {
+      await expect(
+        backend.execute(request(), sessionContext({ signal: controller.signal })),
+      ).rejects.toMatchObject({
+        code: 'SESSION_INPUT_ABORTED',
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(captured.filter((c) => c.path === '/api/v2/execute')).toHaveLength(0);
+    expect(fake.callsFor('terminateMicrovm')).toHaveLength(0);
+    expect((await readRuntimeSessionRecord('rt_session_1'))?.state).toBe('RUNNING');
+  });
 
   test('probes the VM and pushes only what it is missing', async () => {
     const fake = fakeClient();

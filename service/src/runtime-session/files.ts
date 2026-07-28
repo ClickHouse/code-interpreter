@@ -170,6 +170,15 @@ export async function buildInputBatch(
     };
   } catch (error) {
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    /* An abort can surface from axios, stream.pipeline, fs, or the tar child.
+     * The shared signal is the authoritative cause; preserve the stable code
+     * instead of whichever lower-level error happened to win the race. */
+    if (opts.signal?.aborted) {
+      throw new SessionFilesError(
+        'SESSION_INPUT_ABORTED',
+        'Session input delivery aborted',
+      );
+    }
     if (error instanceof SessionFilesError) throw error;
     logger.error('Failed to prepare session input batch:', getAxiosErrorDetails(error));
     throw new SessionFilesError(
@@ -257,8 +266,10 @@ function tarDirectory(root: string, archive: string, signal?: AbortSignal): Prom
     tar.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
     tar.on('error', (error) => {
       reject(new SessionFilesError(
-        'SESSION_INPUT_PREPARATION_FAILED',
-        `Failed to start inputs tar: ${error.message}`,
+        signal?.aborted ? 'SESSION_INPUT_ABORTED' : 'SESSION_INPUT_PREPARATION_FAILED',
+        signal?.aborted
+          ? 'Session input delivery aborted'
+          : `Failed to start inputs tar: ${error.message}`,
       ));
     });
     tar.on('close', (code) => {

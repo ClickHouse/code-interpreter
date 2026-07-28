@@ -82,6 +82,23 @@ export function jobDeadlineAtMs(
     : nowMs + timeoutMs;
 }
 
+/** The worker stops user work at JOB_TIMEOUT, then may still need to terminate
+ * a MicroVM, revoke an egress grant, release locks, and publish the BullMQ
+ * failure. Keep HTTP waiters alive for those bounded cleanup legs so they
+ * receive the typed failure instead of racing BullMQ's own wait timeout. */
+export const WORKER_COMPLETION_OVERHEAD_MS = 5_000;
+
+export function jobCompletionWaitTimeoutMs(
+  jobTimeoutMs: number,
+  backendCleanupTimeoutMs: number,
+  egressRevokeTimeoutMs: number,
+): number {
+  return jobTimeoutMs
+    + backendCleanupTimeoutMs
+    + egressRevokeTimeoutMs
+    + WORKER_COMPLETION_OVERHEAD_MS;
+}
+
 export function parseArnList(raw: string | undefined): string[] | undefined {
   if (raw == null) return undefined;
   const entries = raw.split(',').map((entry) => entry.trim()).filter((entry) => entry.length > 0);
