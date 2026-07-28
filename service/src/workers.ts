@@ -12,7 +12,7 @@ import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
 import { prepareInputDelivery } from './runtime-session/input-delivery';
 import { SessionFilesError } from './runtime-session/files';
-import { resolveRuntimeSessionIdForJob } from './runtime-session/job-policy';
+import { resolveRuntimeSessionForJob } from './runtime-session/job-policy';
 import { getSandboxBackend, SandboxBackendError, type SandboxRawResponse } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
 import { withSpan, withTraceContext } from './telemetry';
@@ -89,8 +89,10 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     });
     egressGrantTokenForRestore = egressGrantToken;
 
-    const runtimeSessionId = resolveRuntimeSessionIdForJob({
-      mode: env.RUNTIME_SESSION_MODE,
+    const runtimeSession = resolveRuntimeSessionForJob({
+      workerMode: env.RUNTIME_SESSION_MODE,
+      workerBackend: env.SANDBOX_BACKEND,
+      runtimeSessionMode: job.data.runtimeSessionMode,
       runtimeSessionId: job.data.runtimeSessionId,
       runtimeSessionExemption: job.data.runtimeSessionExemption,
       isSynthetic: isSyntheticJob,
@@ -134,8 +136,8 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         deadlineAtMs,
         tenantId: job.data.tenantId,
         canonicalUserId: job.data.canonicalUserId,
-        runtimeSessionId,
-        runtimeSessionMode: env.RUNTIME_SESSION_MODE,
+        runtimeSessionId: runtimeSession.runtimeSessionId,
+        runtimeSessionMode: runtimeSession.runtimeSessionMode,
         /* Stateful backends run this as a commit barrier after user code but
          * before checkpointing/reusing the mutated workspace. Stateless/HTTP
          * paths retain the worker-owned fallback immediately below. */

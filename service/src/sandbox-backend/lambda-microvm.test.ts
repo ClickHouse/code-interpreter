@@ -50,6 +50,8 @@ let probeMissingOverride: Array<{ cache_key: string }> | undefined;
 let evictAfterPush = false;
 let recordDuringRestore: Awaited<ReturnType<typeof readRuntimeSessionRecord>> | undefined;
 let onExecute: (() => void | Promise<void>) | undefined;
+let checkpointChunkIntervalMs = 0;
+let checkpointChunkCount = 0;
 /** Models the runner's input cache so probe/push behave like the real VM. */
 let lastProbedRefs: Array<{ cache_key: string }> = [];
 const vmInputCache = new Set<string>();
@@ -134,6 +136,33 @@ beforeAll(() => {
         });
       }
       if (path === '/api/v2/session/checkpoint') {
+        if (checkpointChunkIntervalMs > 0 && checkpointChunkCount > 0) {
+          let timer: ReturnType<typeof setInterval> | undefined;
+          const intervalMs = checkpointChunkIntervalMs;
+          const chunkCount = checkpointChunkCount;
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              let emitted = 0;
+              const emit = (): void => {
+                try {
+                  controller.enqueue(Buffer.from('x'));
+                  emitted += 1;
+                  if (emitted >= chunkCount) {
+                    if (timer) clearInterval(timer);
+                    controller.close();
+                  }
+                } catch {
+                  if (timer) clearInterval(timer);
+                }
+              };
+              emit();
+              if (emitted < chunkCount) timer = setInterval(emit, intervalMs);
+            },
+            cancel() {
+              if (timer) clearInterval(timer);
+            },
+          }), { status: 200, headers: { 'Content-Type': 'application/x-gtar' } });
+        }
         return new Response(checkpointBlob, { status: 200, headers: { 'Content-Type': 'application/x-gtar' } });
       }
       if (path === '/api/v2/session/restore') {
@@ -174,6 +203,8 @@ beforeEach(async () => {
   evictAfterPush = false;
   recordDuringRestore = undefined;
   onExecute = undefined;
+  checkpointChunkIntervalMs = 0;
+  checkpointChunkCount = 0;
   lastProbedRefs = [];
   vmInputCache.clear();
 });
@@ -1721,13 +1752,14 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(store.objects.size).toBe(0);
   });
 
-  test('skips a checkpoint unless the budget covers all four bounded I/O legs', async () => {
+  test('skips a checkpoint unless the budget covers the complete bounded pipeline', async () => {
     const originalNow = Date.now;
     let now = 1_000_000;
     Date.now = () => now;
     onExecute = () => {
-      /* Leaves 1035ms: more than the old 1000 + 3*10 guard, but less than the
-       * actual token wait + GET + list + put + commit worst case (1040ms).
+      /* Leaves 31035ms: more than the old 1000 + 3*10 guard, but less than the
+       * actual token wait + GET + list + put + commit + six independently
+       * bounded registry commands worst case (31040ms).
        * The roomy launch timeout keeps this clock-focused test independent of
        * real event-loop scheduling under the full suite. */
       now += 65;
@@ -1737,7 +1769,7 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
       const store = new MemoryCheckpointStore();
       const backend = makeBackend(fake, {
         checkpointsEnabled: true,
-        jobTimeoutMs: 1_100,
+        jobTimeoutMs: 31_100,
         launchTimeoutMs: 1_000,
         checkpoint: {
           port: 8080,
@@ -1775,6 +1807,79 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
     expect(store.objects.size).toBe(1);
   });
 
+  test('shares one absolute token deadline across checkpoint throttle and SDK legs', async () => {
+    const fake = fakeClient();
+    const originalMint = fake.createMicrovmAuthToken.bind(fake);
+    let mintCalls = 0;
+    fake.createMicrovmAuthToken = async (args, signal?: AbortSignal) => {
+      mintCalls += 1;
+      /* A fresh VM mints once for readiness and once for execute before the
+       * post-run checkpoint requests the third token. */
+      if (mintCalls <= 2) return originalMint(args);
+      return new Promise((_, reject) => {
+        if (!signal) {
+          reject(new Error('checkpoint token mint omitted its deadline signal'));
+          return;
+        }
+        const onAbort = (): void => reject(signal.reason ?? new Error('token mint aborted'));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      });
+    };
+    /* Set the poison only after the execute token was minted. The checkpoint
+     * token must spend part of its one budget waiting here, then give the SDK
+     * only the remainder instead of starting a second full window. */
+    onExecute = () => mock.set('rtsx:tps:poison:token', '1', 'PX', 80).then(() => undefined);
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, {
+      checkpointsEnabled: true,
+      launchTimeoutMs: 200,
+    }, store);
+    const req = request();
+    req.body.files = [];
+    const controller = new AbortController();
+    const fallback = setTimeout(() => controller.abort(), 2_000);
+    try {
+      expect(await backend.execute(
+        req,
+        sessionContext({ signal: controller.signal }),
+      )).toEqual(EXECUTE_RESPONSE);
+    } finally {
+      clearTimeout(fallback);
+    }
+
+    expect(controller.signal.aborted).toBe(false);
+    expect(mintCalls).toBe(3);
+    expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(0);
+    expect(store.objects.size).toBe(0);
+  });
+
+  test('aborts a slow-trickle guest checkpoint on the absolute transfer deadline', async () => {
+    /* Each chunk arrives before Axios' inactivity timeout, while the complete
+     * response takes much longer. The explicit transfer signal must still
+     * stop it at the configured wall-clock deadline. */
+    checkpointChunkIntervalMs = 20;
+    checkpointChunkCount = 10;
+    const fake = fakeClient();
+    const store = new MemoryCheckpointStore();
+    const backend = makeBackend(fake, {
+      checkpointsEnabled: true,
+      launchTimeoutMs: 100,
+      checkpoint: {
+        port: 8080,
+        authTokenTtlSeconds: 300,
+        maxBytes: 512 * 1024 * 1024,
+        timeoutMs: 100,
+      },
+    }, store);
+    const req = request();
+    req.body.files = [];
+
+    expect(await backend.execute(req, sessionContext())).toEqual(EXECUTE_RESPONSE);
+    expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(1);
+    expect(store.objects.size).toBe(0);
+  });
+
   test('uses the worker deadline so pre-backend setup consumes checkpoint budget', async () => {
     const originalNow = Date.now;
     const now = 1_000_000;
@@ -1784,9 +1889,9 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
       const store = new MemoryCheckpointStore();
       const backend = makeBackend(fake, {
         checkpointsEnabled: true,
-        /* A backend-local 1100ms clock would allow the 1040ms pipeline. The
-         * worker deadline has only 1039ms left after earlier setup work. */
-        jobTimeoutMs: 1_100,
+        /* A backend-local 31100ms clock would allow the 31040ms pipeline. The
+         * worker deadline has only 31039ms left after earlier setup work. */
+        jobTimeoutMs: 31_100,
         launchTimeoutMs: 1_000,
         checkpoint: {
           port: 8080,
@@ -1798,7 +1903,7 @@ describe('LambdaMicrovmSandboxBackend auto-checkpoint', () => {
 
       expect(await backend.execute(
         request(),
-        sessionContext({ deadlineAtMs: now + 1_039 }),
+        sessionContext({ deadlineAtMs: now + 31_039 }),
       )).toEqual(EXECUTE_RESPONSE);
       expect(captured.filter((c) => c.path === '/api/v2/session/checkpoint')).toHaveLength(0);
       expect(store.objects.size).toBe(0);

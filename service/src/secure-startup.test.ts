@@ -206,8 +206,10 @@ describe('sandbox backend policy', () => {
     expect(() => validateSandboxBackendPolicy()).not.toThrow();
   });
 
-  test('strict runtime sessions require the lambda backend', () => {
+  test('stateful runtime session modes require the lambda backend', () => {
     env.SANDBOX_BACKEND = 'http';
+    env.RUNTIME_SESSION_MODE = 'affinity';
+    expect(() => validateSandboxBackendPolicy()).toThrow('requires the lambda-microvm backend');
     env.RUNTIME_SESSION_MODE = 'strict';
     expect(() => validateSandboxBackendPolicy()).toThrow('requires the lambda-microvm backend');
   });
@@ -235,13 +237,14 @@ describe('sandbox backend policy', () => {
   test('accepts the production checkpoint budget and rejects an impossible one', () => {
     configureValidLambda();
     env.RUNTIME_SESSION_MODE = 'affinity';
-    /* Production defaults reserve 60s for token throttling, 60s for each
-     * archive transfer, and 5s for each metadata operation: 190s total. */
+    /* Production defaults reserve 60s for the whole token mint, 60s for each
+     * archive transfer, 5s for each object metadata operation, and 5s for
+     * each of the six registry operations: 220s total. */
     expect(() => validateSandboxBackendPolicy()).not.toThrow();
 
-    env.JOB_TIMEOUT = 190_000;
+    env.JOB_TIMEOUT = 220_000;
     expect(() => validateSandboxBackendPolicy()).toThrow(
-      'JOB_TIMEOUT must exceed the full session checkpoint reserve (190000ms)',
+      'JOB_TIMEOUT must exceed the full session checkpoint reserve (220000ms)',
     );
   });
 

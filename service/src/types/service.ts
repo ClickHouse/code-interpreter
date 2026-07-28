@@ -234,6 +234,8 @@ export interface LanguageConfig {
   runtime?: string;
 }
 
+export type RuntimeSessionMode = 'stateless' | 'affinity' | 'strict';
+
 /** Explicit reasons a queue job may remain stateless in a stateful mode. */
 export type RuntimeSessionExemption = 'programmatic';
 
@@ -253,6 +255,14 @@ export type JobData = {
    * strict mode requires it; explicit exemptions document intentional gaps.
    */
   runtimeSessionId?: string;
+  /**
+   * Producer-owned effective execution mode. This crosses the BullMQ boundary
+   * so API/worker rollout skew cannot reinterpret a stateful job as stateless
+   * (or reject an intentional stateless fallback). Optional only for queued
+   * jobs created before this field existed; workers infer those from the
+   * presence of runtimeSessionId.
+   */
+  runtimeSessionMode?: RuntimeSessionMode;
   /**
    * Intentional stateless exception. Programmatic/replay execution externalizes
    * continuation state and does not yet bind PTC rounds to a warm session.

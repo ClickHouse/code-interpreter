@@ -3,7 +3,6 @@ import {
   env,
   lambdaMicrovmNumericConfigError,
 } from './config';
-import logger from './logger';
 import { INTERNAL_SERVICE_TOKEN_ENV } from './internal-service-auth';
 
 export class SecureStartupConfigError extends Error {
@@ -69,18 +68,10 @@ export function validateWorkerHardenedConfig(): void {
  * unconditionally: a misconfigured backend must never half-start.
  */
 export function validateSandboxBackendPolicy(): void {
-  if (env.RUNTIME_SESSION_MODE === 'strict' && env.SANDBOX_BACKEND === 'http') {
+  if (env.RUNTIME_SESSION_MODE !== 'stateless' && env.SANDBOX_BACKEND === 'http') {
     throw new SecureStartupConfigError(
-      'CODEAPI_RUNTIME_SESSION_MODE=strict requires the lambda-microvm backend',
-    );
-  }
-  /* affinity+http is the documented graceful fallback (runs stateless), but a
-   * silent no-op hides a likely misconfiguration — surface it loudly. */
-  if (env.RUNTIME_SESSION_MODE === 'affinity' && env.SANDBOX_BACKEND === 'http') {
-    logger.warn(
-      'CODEAPI_RUNTIME_SESSION_MODE=affinity has no effect with the http backend: '
-        + 'requests run stateless (no session reuse or checkpoint/restore). '
-        + 'Use CODEAPI_SANDBOX_BACKEND=lambda-microvm for stateful sessions.',
+      `CODEAPI_RUNTIME_SESSION_MODE=${env.RUNTIME_SESSION_MODE} requires `
+        + 'the lambda-microvm backend; use stateless mode with the http backend',
     );
   }
   if (env.SANDBOX_BACKEND !== 'lambda-microvm') return;
@@ -147,8 +138,9 @@ export function validateSandboxBackendPolicy(): void {
     if (env.JOB_TIMEOUT <= checkpointBudgetMs) {
       throw new SecureStartupConfigError(
         `JOB_TIMEOUT must exceed the full session checkpoint reserve (${checkpointBudgetMs}ms): `
-          + 'LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS + two CODEAPI_CHECKPOINT_TIMEOUT_MS '
-          + '+ two capped metadata operations',
+          + 'one shared LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS token budget '
+          + '+ two CODEAPI_CHECKPOINT_TIMEOUT_MS + two capped object metadata '
+          + 'operations + six bounded registry operations',
       );
     }
     const missing = ['MINIO_ENDPOINT'].filter(

@@ -154,6 +154,9 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     }
     throw error;
   }
+  const runtimeSessionMode: t.RuntimeSessionMode = runtimeSessionId == null
+    ? 'stateless'
+    : env.RUNTIME_SESSION_MODE;
 
   let authorizedFiles: t.RequestFile[];
   try {
@@ -242,6 +245,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         tenantId: identity.storageNamespace,
         canonicalUserId: identity.canonicalUserId,
         ...(runtimeSessionId != null ? { runtimeSessionId } : {}),
+        runtimeSessionMode,
         executionManifestClaims: sandboxSecurity.executionManifestClaims,
         egressGrantClaims: sandboxSecurity.egressGrantClaims,
         egressGrantToken: sandboxSecurity.egressGrantToken,

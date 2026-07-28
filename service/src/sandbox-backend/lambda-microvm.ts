@@ -397,8 +397,9 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       const remainingBudgetMs = deadlineAtMs - now;
       /* Reserve the WHOLE checkpoint path, not just one transfer timeout:
        * token-budget wait + guest GET + object-store list + object upload +
-       * durable marker. Metadata calls use their tighter cap; the two archive
-       * transfers receive the configured checkpoint timeout. */
+       * durable marker + all six sequential registry commands. Metadata calls
+       * use their tighter cap; the two archive transfers receive the configured
+       * checkpoint timeout. */
       const worstCaseCheckpointMs = checkpointPipelineBudgetMs(
         this.config.launchTimeoutMs,
         this.config.checkpoint.timeoutMs,
@@ -1093,18 +1094,35 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     microvmId: string,
     signal?: AbortSignal,
   ): Promise<MicrovmAuthToken> {
+    /* Throttle admission and the SDK request share one absolute control-plane
+     * budget. Starting a fresh SDK window after a long throttle wait would make
+     * the post-exec checkpoint reserve underestimate this stage. */
+    const tokenDeadlineSignal = AbortSignal.timeout(this.config.launchTimeoutMs);
+    const tokenSignal = signal
+      ? AbortSignal.any([signal, tokenDeadlineSignal])
+      : tokenDeadlineSignal;
     const tokenBudgetDeadlineAtMs = Date.now() + this.config.launchTimeoutMs;
     try {
       await acquireOpBudget('token', {
         limitPerSecond: this.config.tokenTps,
         budgetMs: this.config.launchTimeoutMs,
         deadlineAtMs: tokenBudgetDeadlineAtMs,
-        signal,
+        signal: tokenSignal,
       });
     } catch (error) {
-      if (error instanceof MicrovmOpThrottledError) {
+      if (
+        error instanceof MicrovmOpThrottledError
+        || (tokenDeadlineSignal.aborted && !signal?.aborted)
+      ) {
+        const throttleError = error instanceof MicrovmOpThrottledError
+          ? error
+          : new MicrovmOpThrottledError('token', this.config.launchTimeoutMs);
         microvmThrottleEvents.inc({ op: 'token' });
-        throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);
+        throw new SandboxBackendError(
+          'MICROVM_LAUNCH_THROTTLED',
+          throttleError.message,
+          throttleError,
+        );
       }
       throw error;
     }
@@ -1113,12 +1131,12 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
         microvmId,
         port: this.config.port,
         ttlSeconds: this.config.authTokenTtlSeconds,
-      }, signal);
+      }, tokenSignal);
     } catch (error) {
       if (error instanceof LambdaMicrovmApiError && error.kind === 'throttled') {
         await poisonOpBucket('token', undefined, {
           deadlineAtMs: tokenBudgetDeadlineAtMs,
-          signal,
+          signal: tokenSignal,
         });
         microvmThrottleEvents.inc({ op: 'token' });
         throw new SandboxBackendError('MICROVM_LAUNCH_THROTTLED', error.message, error);

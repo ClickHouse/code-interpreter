@@ -52,10 +52,21 @@ const EGRESS_GRANT_GRACE_MS = 10 * 60 * 1000;
  * checkpoint transfers. Bound each tightly so the post-exec checkpoint
  * reserve does not consume a full transfer timeout for a tiny request. */
 export const CHECKPOINT_METADATA_TIMEOUT_CAP_MS = 5_000;
+/** Hard caller-side deadline for one direct runtime-session registry command.
+ * Keep this beside the checkpoint budget calculation so the optional
+ * post-exec pipeline and the registry implementation share one value without
+ * making config import the Redis-backed registry module. */
+export const RUNTIME_SESSION_REDIS_COMMAND_TIMEOUT_MS = 5_000;
+
+/** Registry operations on the successful post-exec checkpoint path:
+ * outer settled read, checkpoint read, sequence allocation, pointer CAS,
+ * post-store reread, and final record CAS. */
+const POST_EXEC_CHECKPOINT_REGISTRY_COMMANDS = 6;
 
 /** Worst-case time reserved after a successful session execute for the
  * checkpoint pipeline:
- *   token throttle + guest pull + object listing + object upload + marker.
+ *   shared token-mint budget + guest pull + object listing + object upload +
+ *   marker + every sequential runtime-session registry command.
  * The two large transfers receive the configured transfer timeout; the two
  * metadata operations receive the smaller metadata cap. */
 export function checkpointPipelineBudgetMs(
@@ -66,7 +77,11 @@ export function checkpointPipelineBudgetMs(
     checkpointTimeoutMs,
     CHECKPOINT_METADATA_TIMEOUT_CAP_MS,
   );
-  return launchTimeoutMs + 2 * checkpointTimeoutMs + 2 * metadataTimeoutMs;
+  return launchTimeoutMs
+    + 2 * checkpointTimeoutMs
+    + 2 * metadataTimeoutMs
+    + POST_EXEC_CHECKPOINT_REGISTRY_COMMANDS
+      * RUNTIME_SESSION_REDIS_COMMAND_TIMEOUT_MS;
 }
 
 /** BullMQ's `timestamp` is the enqueue time. Anchor the worker deadline to it

@@ -1,8 +1,13 @@
 import { nanoid } from 'nanoid';
 import type { Redis } from 'ioredis';
 import { connection } from '../queue';
-import { env } from '../config';
+import {
+  env,
+  RUNTIME_SESSION_REDIS_COMMAND_TIMEOUT_MS,
+} from '../config';
 import logger from '../logger';
+
+export { RUNTIME_SESSION_REDIS_COMMAND_TIMEOUT_MS } from '../config';
 
 /**
  * Redis-backed registry mapping a `runtime_session_id` to its live (or
@@ -65,7 +70,6 @@ const CKPT_SEQ_PREFIX = 'rtsx:ckptseq:';
  * timed-out mutation may still execute after the connection recovers. The
  * lock-token Lua guards and monotonic counter scripts below are deliberately
  * safe under that ambiguous outcome. */
-export const RUNTIME_SESSION_REDIS_COMMAND_TIMEOUT_MS = 5_000;
 export const RUNTIME_SESSION_REDIS_CLEANUP_TIMEOUT_MS = 2_000;
 
 export interface RuntimeSessionRedisCommandOptions {
@@ -315,10 +319,19 @@ export async function waitForRuntimeSessionLock(
 ): Promise<string | null> {
   const pollMs = args.pollMs ?? 250;
   const deadline = Date.now() + args.waitMs;
+  let firstAttempt = true;
   for (;;) {
     args.signal?.throwIfAborted();
     const remainingWaitMs = deadline - Date.now();
-    if (remainingWaitMs <= 0) return null;
+    /* `waitMs: 0` disables contention polling; it must not disable the one
+     * uncontended SET needed to start every session execution. Give that
+     * immediate attempt the normal Redis command bound. Positive wait budgets
+     * continue to bound the SET itself by their remaining time. */
+    if (!firstAttempt && remainingWaitMs <= 0) return null;
+    const commandTimeoutMs = args.waitMs > 0
+      ? Math.max(1, remainingWaitMs)
+      : RUNTIME_SESSION_REDIS_COMMAND_TIMEOUT_MS;
+    firstAttempt = false;
     let token: string | null;
     try {
       token = await acquireRuntimeSessionLock(
@@ -326,7 +339,7 @@ export async function waitForRuntimeSessionLock(
         args.ttlMs,
         {
           signal: args.signal,
-          timeoutMs: remainingWaitMs,
+          timeoutMs: commandTimeoutMs,
         },
       );
     } catch (error) {
@@ -341,6 +354,7 @@ export async function waitForRuntimeSessionLock(
       args.signal.throwIfAborted();
     }
     if (token != null) return token;
+    if (args.waitMs <= 0) return null;
     if (Date.now() + pollMs > deadline) return null;
     await new Promise<void>((resolve, reject) => {
       let settled = false;

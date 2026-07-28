@@ -1915,8 +1915,12 @@ export class Job {
       }
     }
 
-    /* Skip a pure output already surfaced with identical content. */
-    if (this.session && inputFileInfo == null && contentHash != null
+    /* Skip any output already surfaced with identical content. This includes a
+     * writable primed input whose original ref was re-sent after its modified
+     * bytes were surfaced: reuse populates inputFileInfo for modification
+     * detection, but must not upload the same modified bytes every turn.
+     * Fresh primes call markPrimed and clear stale surfaced lineage first. */
+    if (this.session && contentHash != null
       && this.session.isSurfaced(relativePath, contentHash)) {
       return { collected: false, truncated: false, stopLoop: false };
     }

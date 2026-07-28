@@ -310,7 +310,7 @@ appear in `api/src/config.ts`.
 | Env | Default | Meaning |
 |---|---|---|
 | `CODEAPI_SANDBOX_BACKEND` | `http` | `http` (byte-identical to today) or `lambda-microvm`. |
-| `CODEAPI_RUNTIME_SESSION_MODE` | `stateless` | `stateless` \| `affinity` \| `strict`. See [Operating modes](#operating-modes). |
+| `CODEAPI_RUNTIME_SESSION_MODE` | `stateless` | `stateless` \| `affinity` \| `strict`. `affinity` and `strict` require the `lambda-microvm` backend. See [Operating modes](#operating-modes). |
 | `CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS` | `15000` | How long a stateful execution waits for the session lock before returning `RUNTIME_SESSION_BUSY` (HTTP 409). |
 
 ### MicroVM launch
@@ -390,6 +390,14 @@ while a larger runner limit weakens the receiver-side fail-closed ceiling.
   use the stateless path.
 - **`strict`** — same serialized stateful behavior, but requests without a
   session hint are rejected instead of degrading to stateless.
+
+The API records its effective mode on each queued execution so workers do not
+reinterpret session semantics from their own environment during a rollout.
+When upgrading from a version that predates that queue field, replace and drain
+workers before enabling `affinity` or `strict` on API pods. Updated workers can
+infer legacy jobs from whether they carry a session id; old workers cannot
+honor the new producer-owned marker. Keep API and worker mode configuration
+aligned after the rollout.
 
 ---
 

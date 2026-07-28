@@ -39,7 +39,7 @@ export interface SandboxExecuteContext {
   canonicalUserId?: string;
   /** Absent ⇒ stateless execution (no runtime session affinity). */
   runtimeSessionId?: string;
-  runtimeSessionMode: 'stateless' | 'affinity' | 'strict';
+  runtimeSessionMode: t.RuntimeSessionMode;
   /**
    * Worker-owned result transformation that must succeed before a stateful
    * backend makes workspace mutations reusable or durable. Stateless backends

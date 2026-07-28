@@ -65,6 +65,24 @@ describe('runtime session lock', () => {
     expect(token).not.toBeNull();
   });
 
+  test('zero wait still attempts one uncontended lock acquisition', async () => {
+    const token = await waitForRuntimeSessionLock('rt_zero_wait_free', { waitMs: 0 });
+    expect(token).not.toBeNull();
+    await releaseRuntimeSessionLock('rt_zero_wait_free', token as string);
+  });
+
+  test('zero wait returns immediately when the lock is contended', async () => {
+    const holder = await acquireRuntimeSessionLock('rt_zero_wait_busy');
+    const started = Date.now();
+    const token = await waitForRuntimeSessionLock('rt_zero_wait_busy', {
+      waitMs: 0,
+      pollMs: 1_000,
+    });
+    expect(token).toBeNull();
+    expect(Date.now() - started).toBeLessThan(500);
+    await releaseRuntimeSessionLock('rt_zero_wait_busy', holder as string);
+  });
+
   test('waitForRuntimeSessionLock gives up after waitMs', async () => {
     await acquireRuntimeSessionLock('rt_abc123');
     const started = Date.now();

@@ -29,6 +29,7 @@ interface WalkerInternals {
   pendingSurfaced: Map<string, { name: string; signature: string }>;
   inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string; readOnly?: boolean }>;
   files: TFile[];
+  reusePrimedInput: (file: TFile) => Promise<boolean>;
   writeFile: (file: TFile) => Promise<void>;
   walkDir: (dir: string, depth: number, inputByName: Map<string, TFile>) => Promise<'collected' | 'empty' | 'skipped'>;
   handleSessionFiles: () => Promise<void>;
@@ -470,6 +471,48 @@ describe('walkDir / regular file handling', () => {
      * carry the `inherited` flag (callers should download it like any output). */
     expect(internals.sessionFiles[0].inherited).toBeUndefined();
     expect(internals.inheritedRefs).toHaveLength(0);
+  });
+
+  it('deduplicates a surfaced modified input when its original ref is re-sent', async () => {
+    const name = 'data.csv';
+    const original = 'original';
+    const firstModification = 'first modification';
+    const secondModification = 'second modification';
+    const stableCacheKey = 'a'.repeat(64);
+    const downloaded: TFile = {
+      id: 'orig-id',
+      storage_session_id: 'orig-session',
+      input_cache_key: stableCacheKey,
+      name,
+    };
+    const session = new SessionWorkspace({ runtimeSessionId: 'rt_resent_ref' });
+    session.markPrimed(name, stableCacheKey, false, sha256(original));
+    session.markSurfaced(name, sha256(firstModification));
+    await fsp.writeFile(path.join(tmpDir, name), firstModification);
+
+    const reusedJob = makeJob({ session });
+    const reused = asInternals(reusedJob);
+    reused.submissionDir = tmpDir;
+    expect(await reused.reusePrimedInput(downloaded)).toBe(true);
+    await reused.walkDir(tmpDir, 0, buildInputByName([downloaded]));
+
+    expect(reused.generatedFiles).toHaveLength(0);
+    expect(reused.sessionFiles).toHaveLength(0);
+
+    /* A later mutation no longer matches the surfaced signature and must be
+     * emitted as a fresh modified-input output. */
+    await fsp.writeFile(path.join(tmpDir, name), secondModification);
+    const changedAgainJob = makeJob({ session });
+    const changedAgain = asInternals(changedAgainJob);
+    changedAgain.submissionDir = tmpDir;
+    expect(await changedAgain.reusePrimedInput(downloaded)).toBe(true);
+    await changedAgain.walkDir(tmpDir, 0, buildInputByName([downloaded]));
+
+    expect(changedAgain.generatedFiles.map(file => file.name)).toEqual([name]);
+    expect(changedAgain.sessionFiles[0].modified_from).toEqual({
+      id: 'orig-id',
+      storage_session_id: 'orig-session',
+    });
   });
 
   it('surfaces a primed input changed back to bytes matching a prior output', async () => {

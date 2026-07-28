@@ -86,6 +86,13 @@ export async function pullCheckpoint(
   config: CheckpointConfig,
 ): Promise<CheckpointArtifact> {
   const token = await args.mintToken();
+  /* Axios' Node `timeout` is a socket-inactivity timeout. A peer that keeps
+   * trickling bytes can therefore outlive it, so add an absolute transfer
+   * deadline that remains attached until the response stream finishes. */
+  const transferDeadlineSignal = AbortSignal.timeout(config.timeoutMs);
+  const transferSignal = args.signal
+    ? AbortSignal.any([args.signal, transferDeadlineSignal])
+    : transferDeadlineSignal;
   const response = await axios.get<Readable>(`${args.endpointBase}/api/v2/session/checkpoint`, {
     headers: {
       [token.headerName]: token.token,
@@ -94,7 +101,7 @@ export async function pullCheckpoint(
     },
     responseType: 'stream',
     timeout: config.timeoutMs,
-    signal: args.signal,
+    signal: transferSignal,
   });
   const announced = Number(response.headers['content-length']);
   if (Number.isFinite(announced) && announced > config.maxBytes) {
