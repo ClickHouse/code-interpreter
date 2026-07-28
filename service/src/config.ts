@@ -194,6 +194,39 @@ function configuredNumber(raw: string | undefined, fallback: number): number {
   return raw == null || raw.trim() === '' ? fallback : Number(raw);
 }
 
+function configuredChoice<T extends string>(
+  raw: string | undefined,
+  name: string,
+  fallback: T,
+  allowed: readonly T[],
+): T {
+  if (raw == null) return fallback;
+  if (allowed.includes(raw as T)) return raw as T;
+  throw new Error(`${name} must be one of: ${allowed.join(', ')}`);
+}
+
+export function resolveSandboxBackend(
+  raw: string | undefined,
+): 'http' | 'lambda-microvm' {
+  return configuredChoice(
+    raw,
+    'CODEAPI_SANDBOX_BACKEND',
+    'http',
+    ['http', 'lambda-microvm'],
+  );
+}
+
+export function resolveRuntimeSessionMode(
+  raw: string | undefined,
+): 'stateless' | 'affinity' | 'strict' {
+  return configuredChoice(
+    raw,
+    'CODEAPI_RUNTIME_SESSION_MODE',
+    'stateless',
+    ['stateless', 'affinity', 'strict'],
+  );
+}
+
 export const env = {
   PORT: process.env.SERVICE_PORT ?? 3112,
   LOCAL_MODE: process.env.LOCAL_MODE === 'true',
@@ -279,9 +312,7 @@ export const env = {
    *   (current Kubernetes/libkrun sandbox-runner).
    * - `lambda-microvm`: AWS Lambda MicroVM backend.
    */
-  SANDBOX_BACKEND: (process.env.CODEAPI_SANDBOX_BACKEND === 'lambda-microvm'
-    ? 'lambda-microvm'
-    : 'http') as 'http' | 'lambda-microvm',
+  SANDBOX_BACKEND: resolveSandboxBackend(process.env.CODEAPI_SANDBOX_BACKEND),
   /**
    * Runtime session affinity for stateful sandbox backends.
    * - `stateless` (default): no runtime sessions; `runtime_session_hint` ignored.
@@ -290,10 +321,7 @@ export const env = {
    * - `strict`: same serialized session semantics, and a session hint is
    *   required instead of degrading requests without one to stateless.
    */
-  RUNTIME_SESSION_MODE: (process.env.CODEAPI_RUNTIME_SESSION_MODE === 'affinity'
-    || process.env.CODEAPI_RUNTIME_SESSION_MODE === 'strict'
-    ? process.env.CODEAPI_RUNTIME_SESSION_MODE
-    : 'stateless') as 'stateless' | 'affinity' | 'strict',
+  RUNTIME_SESSION_MODE: resolveRuntimeSessionMode(process.env.CODEAPI_RUNTIME_SESSION_MODE),
   RUNTIME_SESSION_LOCK_WAIT_MS: configuredNumber(
     process.env.CODEAPI_RUNTIME_SESSION_LOCK_WAIT_MS,
     15_000,

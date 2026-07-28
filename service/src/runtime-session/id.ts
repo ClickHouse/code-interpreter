@@ -43,7 +43,19 @@ export function deriveRuntimeSessionId(args: {
   canonicalUserId: string;
   hint?: string;
 }): string {
-  const material = `${args.storageNamespace}\u0000${args.canonicalUserId}\u0000${args.hint ?? DEFAULT_HINT}`;
+  const fields = [
+    args.storageNamespace,
+    args.canonicalUserId,
+    args.hint ?? DEFAULT_HINT,
+  ];
+  /* Preserve the established IDs for ordinary principals so a rolling deploy
+   * does not abandon their warm VMs/checkpoints. If an authenticated identity
+   * contains the legacy NUL delimiter, switch that identity to an injective
+   * encoding. JSON escapes NUL, so the v2 material cannot equal legacy
+   * material (which always contains two raw NUL bytes). */
+  const material = fields.some(field => field.includes('\u0000'))
+    ? `v2:${JSON.stringify(fields)}`
+    : fields.join('\u0000');
   return `rt_${createHash('sha256').update(material, 'utf8').digest('hex').slice(0, 40)}`;
 }
 

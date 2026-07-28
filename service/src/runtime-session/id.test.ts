@@ -18,6 +18,11 @@ describe('deriveRuntimeSessionId', () => {
     expect(first).toMatch(/^rt_[0-9a-f]{40}$/);
   });
 
+  test('preserves established ids for ordinary identity fields', () => {
+    expect(deriveRuntimeSessionId({ ...BASE, hint: 'conv-1' }))
+      .toBe('rt_27ecde4cf502ef6bc0610e7bd8e025bf889ffec1');
+  });
+
   test('separates tenants, users, and hints', () => {
     const base = deriveRuntimeSessionId({ ...BASE, hint: 'conv-1' });
     expect(deriveRuntimeSessionId({ storageNamespace: 'tenant-b', canonicalUserId: 'user-1', hint: 'conv-1' })).not.toBe(base);
@@ -33,6 +38,20 @@ describe('deriveRuntimeSessionId', () => {
   test('field boundaries cannot be forged across namespace/user/hint', () => {
     const a = deriveRuntimeSessionId({ storageNamespace: 'ten', canonicalUserId: 'ant-user', hint: 'h' });
     const b = deriveRuntimeSessionId({ storageNamespace: 'ten-ant', canonicalUserId: 'user', hint: 'h' });
+    expect(a).not.toBe(b);
+  });
+
+  test('NUL in authenticated identity fields cannot forge field boundaries', () => {
+    const a = deriveRuntimeSessionId({
+      storageNamespace: 'a',
+      canonicalUserId: 'b\u0000c',
+      hint: 'd',
+    });
+    const b = deriveRuntimeSessionId({
+      storageNamespace: 'a\u0000b',
+      canonicalUserId: 'c',
+      hint: 'd',
+    });
     expect(a).not.toBe(b);
   });
 });
