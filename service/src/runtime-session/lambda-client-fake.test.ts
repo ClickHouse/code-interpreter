@@ -49,6 +49,20 @@ describe('FakeLambdaMicrovmClient state machine', () => {
     expect(fake.vms.size).toBe(2);
   });
 
+  test('rejects a clientToken reused with different launch parameters', async () => {
+    const fake = new FakeLambdaMicrovmClient();
+    await fake.runMicrovm({ ...RUN_ARGS, clientToken: 'launch-1' });
+    await expect(fake.runMicrovm({
+      ...RUN_ARGS,
+      maximumDurationSeconds: 3_600,
+      clientToken: 'launch-1',
+    })).rejects.toMatchObject({
+      kind: 'validation',
+      operation: 'RunMicrovm',
+    });
+    expect(fake.vms.size).toBe(1);
+  });
+
   test('failNext raises once then recovers, and unknown VMs are not_found', async () => {
     const fake = new FakeLambdaMicrovmClient();
     fake.failNext('runMicrovm');

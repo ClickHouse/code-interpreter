@@ -26,6 +26,20 @@ export interface FakeMicrovm {
 
 type FakeOp = 'runMicrovm' | 'getMicrovm' | 'suspendMicrovm' | 'resumeMicrovm' | 'terminateMicrovm' | 'createMicrovmAuthToken';
 
+function runMicrovmRequestFingerprint(args: RunMicrovmArgs): string {
+  return JSON.stringify({
+    imageIdentifier: args.imageIdentifier,
+    imageVersion: args.imageVersion,
+    executionRoleArn: args.executionRoleArn,
+    ingressConnectorArns: args.ingressConnectorArns,
+    egressConnectorArns: args.egressConnectorArns,
+    maximumDurationSeconds: args.maximumDurationSeconds,
+    idlePolicy: args.idlePolicy,
+    logGroup: args.logGroup,
+    runHookPayload: args.runHookPayload,
+  });
+}
+
 /**
  * In-memory control-plane fake for bun tests. Transport-free: the test
  * supplies `endpointProvider` (usually a Bun.serve URL) so the backend's real
@@ -39,6 +53,7 @@ export class FakeLambdaMicrovmClient implements LambdaMicrovmClient {
   readonly vms = new Map<string, FakeMicrovm>();
   readonly calls: Array<{ op: FakeOp; args: unknown }> = [];
   private readonly failures = new Map<FakeOp, Error[]>();
+  private readonly requestByClientToken = new Map<string, string>();
   private pendingPollsByClientToken = new Map<string, number>();
   private vmSeq = 0;
 
@@ -108,8 +123,18 @@ export class FakeLambdaMicrovmClient implements LambdaMicrovmClient {
     this.takeFailure('runMicrovm');
 
     if (args.clientToken != null) {
+      const requestFingerprint = runMicrovmRequestFingerprint(args);
+      const priorRequest = this.requestByClientToken.get(args.clientToken);
+      if (priorRequest != null && priorRequest !== requestFingerprint) {
+        throw new LambdaMicrovmApiError(
+          'validation',
+          'RunMicrovm',
+          'A request with the same client token but different parameters was already made',
+        );
+      }
       const existing = [...this.vms.values()].find((vm) => vm.clientToken === args.clientToken);
       if (existing) return this.describe(existing);
+      this.requestByClientToken.set(args.clientToken, requestFingerprint);
     }
 
     const microvmId = `fake-mvm-${++this.vmSeq}-${nanoid(6)}`;

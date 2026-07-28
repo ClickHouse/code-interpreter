@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { nanoid } from 'nanoid';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 import type { LambdaMicrovmClient, MicrovmAuthToken, MicrovmDescription, MicrovmIdlePolicy } from '../runtime-session/lambda-client';
 import type { SandboxBackend, SandboxExecuteContext, SandboxRawResponse, SandboxTransportRequest } from './types';
 import type { RuntimeSessionRecord } from '../runtime-session/registry';
@@ -91,6 +92,62 @@ export function runtimeSessionLaunchFingerprint(config: LambdaMicrovmBackendConf
       autoResume: true,
     },
   });
+}
+
+/** Generations below this boundary were allocated by the original INCR-only
+ * scheme. New launches start in a fingerprint-seeded namespace so losing the
+ * Redis counter cannot reuse an AWS clientToken after launch inputs change.
+ *
+ * Keep the provider token itself in the legacy `sess-<id>-<generation>` shape:
+ * an older worker taking over a PENDING record during a rolling deployment
+ * will derive exactly the same token instead of double-launching a VM. */
+export const RUNTIME_SESSION_NAMESPACED_GENERATION_MIN = 1_000_000_000_000_000;
+
+function runtimeSessionLaunchRequestFingerprint(config: LambdaMicrovmBackendConfig): string {
+  return JSON.stringify({
+    launchFingerprint: runtimeSessionLaunchFingerprint(config),
+    runMicrovm: {
+      imageIdentifier: config.imageArn,
+      imageVersion: config.imageVersion,
+      executionRoleArn: config.executionRoleArn,
+      logGroup: config.logGroup,
+      ingressConnectorArns: config.ingressConnectorArns,
+      egressConnectorArns: config.egressConnectorArns,
+      maximumDurationSeconds: config.maxDurationSeconds,
+      idlePolicy: {
+        maxIdleSeconds: config.idleSeconds,
+        suspendedSeconds: config.suspendedSeconds,
+        autoResume: true,
+      },
+    },
+  });
+}
+
+/** A 52-bit digest leaves ample safe-integer headroom for later INCRs while
+ * making a reset counter's first generation depend on the exact launch
+ * request. Token collisions are scoped to one runtime session. */
+export function runtimeSessionLaunchGenerationSeed(config: LambdaMicrovmBackendConfig): number {
+  const offset = Number.parseInt(
+    createHash('sha256')
+      .update(runtimeSessionLaunchRequestFingerprint(config), 'utf8')
+      .digest('hex')
+      .slice(0, 13),
+    16,
+  );
+  return RUNTIME_SESSION_NAMESPACED_GENERATION_MIN + offset;
+}
+
+export function runtimeSessionLaunchClientToken(runtimeSessionId: string, generation: number): string {
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('Runtime session generation must be a positive safe integer');
+  }
+  const token = `sess-${runtimeSessionId}-${generation}`;
+  /* launch() can add "-r1" after a clean boot-time death. Reserve those three
+   * characters up front so both attempts stay within AWS's 128-byte limit. */
+  if (token.length > 125) {
+    throw new Error('Runtime session launch clientToken exceeds the AWS length limit');
+  }
+  return token;
 }
 
 interface LambdaMicrovmBackendDeps {
@@ -552,6 +609,49 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     return runtimeSessionLaunchFingerprint(this.config);
   }
 
+  private isValidationLaunchFailure(error: unknown): boolean {
+    return error instanceof SandboxBackendError
+      && error.code === 'MICROVM_LAUNCH_FAILED'
+      && error.cause instanceof LambdaMicrovmApiError
+      && error.cause.kind === 'validation';
+  }
+
+  /** Both the base token and its single retry reached a terminal state and
+   * were successfully terminated. Keeping that PENDING intent would replay
+   * two known-dead tokens forever, so let the next request allocate a new
+   * generation. Ambiguous provider failures remain persisted for recovery. */
+  private async retireExhaustedLaunchIntent(
+    launchIntent: RuntimeSessionRecord,
+    lockToken: string,
+    error: unknown,
+  ): Promise<void> {
+    const cleanlyExhausted =
+      error instanceof SandboxBackendError
+      && error.code === 'MICROVM_LAUNCH_FAILED'
+      && error.transient;
+    if (!cleanlyExhausted) return;
+    try {
+      const retired = await writeRuntimeSessionRecord({
+        ...launchIntent,
+        microvm_id: undefined,
+        endpoint: undefined,
+        state: 'TERMINATED',
+        last_seen_at: Date.now(),
+        last_error: error.message,
+      }, lockToken);
+      if (!retired) {
+        logger.warn('Lost session lock while retiring an exhausted launch intent', {
+          runtimeSessionId: launchIntent.runtime_session_id,
+        });
+      }
+    } catch (cleanupError) {
+      logger.warn('Failed to retire an exhausted launch intent', {
+        runtimeSessionId: launchIntent.runtime_session_id,
+        error: cleanupError,
+      });
+    }
+  }
+
   private async findOrLaunchSession(
     client: LambdaMicrovmClient,
     ctx: SandboxExecuteContext,
@@ -570,11 +670,15 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
      * launched by an older deploy — relaunch on the current config rather than
      * reuse it (a changed port would otherwise health-check the wrong port and
      * fail as UNHEALTHY instead of cleanly relaunching). */
+    const launchFingerprint = this.launchFingerprint();
+    const launchRequestFingerprint = runtimeSessionLaunchRequestFingerprint(this.config);
     const configMatches = record
       && record.image_arn === this.config.imageArn
       && record.image_version === this.config.imageVersion
       && record.port === this.config.port
-      && record.launch_fingerprint === this.launchFingerprint();
+      && record.launch_fingerprint === launchFingerprint;
+    const pendingRequestMatches = record?.launch_request_fingerprint == null
+      || record.launch_request_fingerprint === launchRequestFingerprint;
     /* Past idle+suspended, AWS auto-terminates the suspended VM while the record
      * still reads RUNNING until the 8h hard deadline. Treat that as non-reusable
      * so the first request after idle expiry relaunches + restores, instead of
@@ -624,6 +728,7 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       && record.state === 'PENDING'
       && !record.microvm_id
       && configMatches
+      && pendingRequestMatches
       && Number.isSafeInteger(record.generation)
       && record.generation > 0
       && record.launched_at != null
@@ -632,21 +737,34 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
     );
     const generation = canReplayPendingLaunch && record
       ? record.generation
-      : await allocateRuntimeSessionGeneration(runtimeSessionId);
+      : await allocateRuntimeSessionGeneration(
+        runtimeSessionId,
+        runtimeSessionLaunchGenerationSeed(this.config),
+      );
     const launchedAt = canReplayPendingLaunch && record?.launched_at != null
       ? record.launched_at
       : Date.now();
     const hardDeadlineAt = canReplayPendingLaunch && record?.hard_deadline_at != null
       ? record.hard_deadline_at
       : launchedAt + this.config.maxDurationSeconds * 1_000 - 60_000;
-    const launchIntent: RuntimeSessionRecord = {
+    const launchClientToken = canReplayPendingLaunch && record
+      ? record.launch_client_token ?? runtimeSessionLaunchClientToken(runtimeSessionId, generation)
+      : runtimeSessionLaunchClientToken(runtimeSessionId, generation);
+    let launchIntent: RuntimeSessionRecord = {
       runtime_session_id: runtimeSessionId,
       tenant_id: ctx.tenantId ?? '',
       canonical_user_id: ctx.canonicalUserId ?? '',
       port: this.config.port,
       image_arn: this.config.imageArn,
       image_version: this.config.imageVersion,
-      launch_fingerprint: this.launchFingerprint(),
+      launch_fingerprint: launchFingerprint,
+      /* Preserve absence on a compatibility replay. A crash or ambiguous
+       * failure must not make a legacy/high-generation record look fully
+       * migrated before AWS accepts it. Successful launch fills both fields. */
+      launch_client_token: canReplayPendingLaunch ? record?.launch_client_token : launchClientToken,
+      launch_request_fingerprint: canReplayPendingLaunch
+        ? record?.launch_request_fingerprint
+        : launchRequestFingerprint,
       state: 'PENDING',
       generation,
       launched_at: launchedAt,
@@ -660,8 +778,8 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       throw new SandboxBackendError('MICROVM_FENCED', `Lost session lock for ${runtimeSessionId} before launch`);
     }
 
-    const vm = await this.launch(client, ctx, {
-      clientToken: `sess-${runtimeSessionId}-${generation}`,
+    const launchWithToken = (clientToken: string): Promise<MicrovmDescription> => this.launch(client, ctx, {
+      clientToken,
       idlePolicy: {
         maxIdleSeconds: this.config.idleSeconds,
         suspendedSeconds: this.config.suspendedSeconds,
@@ -670,8 +788,61 @@ export class LambdaMicrovmSandboxBackend implements SandboxBackend {
       maxDurationSeconds: this.config.maxDurationSeconds,
     });
 
+    let vm: MicrovmDescription;
+    try {
+      vm = await launchWithToken(launchClientToken);
+    } catch (error) {
+      /* A pre-upgrade PENDING record may carry a token that AWS already
+       * accepted (lost response), so replay it first. AWS exposes an
+       * idempotency mismatch as generic ValidationException with no structured
+       * discriminator. For an incomplete compatibility record only, treat the
+       * first validation as a possible collision: atomically promote the Redis
+       * counter, persist the replacement intent, and try once with the
+       * fingerprint-seeded generation. Genuine invalid configuration fails
+       * again, and the completed replacement record cannot rotate repeatedly. */
+      const compatibilityPending = canReplayPendingLaunch
+        && record != null
+        && (
+          record.generation < RUNTIME_SESSION_NAMESPACED_GENERATION_MIN
+          || record.launch_client_token == null
+          || record.launch_request_fingerprint == null
+        );
+      if (compatibilityPending && this.isValidationLaunchFailure(error)) {
+        const migratedGeneration = await allocateRuntimeSessionGeneration(
+          runtimeSessionId,
+          runtimeSessionLaunchGenerationSeed(this.config),
+        );
+        const migratedClientToken = runtimeSessionLaunchClientToken(runtimeSessionId, migratedGeneration);
+        launchIntent = {
+          ...launchIntent,
+          generation: migratedGeneration,
+          launch_client_token: migratedClientToken,
+          launch_request_fingerprint: launchRequestFingerprint,
+          last_seen_at: Date.now(),
+        };
+        const migratedPendingOk = await writeRuntimeSessionRecord(launchIntent, lockToken);
+        if (!migratedPendingOk) {
+          throw new SandboxBackendError(
+            'MICROVM_FENCED',
+            `Lost session lock for ${runtimeSessionId} while migrating its launch intent`,
+          );
+        }
+        try {
+          vm = await launchWithToken(migratedClientToken);
+        } catch (migratedError) {
+          await this.retireExhaustedLaunchIntent(launchIntent, lockToken, migratedError);
+          throw migratedError;
+        }
+      } else {
+        await this.retireExhaustedLaunchIntent(launchIntent, lockToken, error);
+        throw error;
+      }
+    }
+
     const launchedRecord: RuntimeSessionRecord = {
       ...launchIntent,
+      launch_client_token: launchIntent.launch_client_token ?? launchClientToken,
+      launch_request_fingerprint: launchIntent.launch_request_fingerprint ?? launchRequestFingerprint,
       microvm_id: vm.microvmId,
       endpoint: vm.endpoint,
       image_arn: vm.imageArn ?? this.config.imageArn,

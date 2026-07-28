@@ -156,6 +156,23 @@ describe('generation counter', () => {
     expect(await allocateRuntimeSessionGeneration('rt_abc123')).toBe(3);
     expect(await allocateRuntimeSessionGeneration('rt_other')).toBe(1);
   });
+
+  test('atomically promotes a legacy counter to a caller-provided namespace', async () => {
+    expect(await allocateRuntimeSessionGeneration('rt_abc123')).toBe(1);
+    expect(await allocateRuntimeSessionGeneration('rt_abc123', 1_000_000_000_000_123))
+      .toBe(1_000_000_000_000_123);
+    expect(await allocateRuntimeSessionGeneration('rt_abc123', 1_000_000_000_000_100))
+      .toBe(1_000_000_000_000_124);
+  });
+
+  test('serializes concurrent promotion attempts without reusing the seed', async () => {
+    const seed = 1_000_000_000_000_321;
+    const generations = await Promise.all([
+      allocateRuntimeSessionGeneration('rt_abc123', seed),
+      allocateRuntimeSessionGeneration('rt_abc123', seed),
+    ]);
+    expect(generations.sort((a, b) => a - b)).toEqual([seed, seed + 1]);
+  });
 });
 
 describe('checkpoint sequence counter', () => {

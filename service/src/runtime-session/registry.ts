@@ -33,6 +33,14 @@ export interface RuntimeSessionRecord {
   /** Fingerprint of every immutable launch/security input. A deploy that
    * changes one must not reuse a VM launched under the old policy. */
   launch_fingerprint?: string;
+  /** Exact provider idempotency token for this persisted launch intent.
+   * Optional so workers can safely replay records written before this field
+   * existed. */
+  launch_client_token?: string;
+  /** Exact fingerprint of the RunMicrovm request paired with
+   * `launch_client_token`. Unlike `launch_fingerprint`, this preserves
+   * wire-level distinctions such as connector ordering for safe replay. */
+  launch_request_fingerprint?: string;
   state: RuntimeSessionState;
   generation: number;
   launched_at?: number;
@@ -87,6 +95,11 @@ type RedisWithScripts = Redis & {
     retainedMax: string,
     ttlSeconds: string,
   ): Promise<number>;
+  allocateRuntimeSessionGenerationScript(
+    generationKey: string,
+    initialGeneration: string,
+    ttlSeconds: string,
+  ): Promise<string>;
 };
 
 const SCRIPTS_REGISTERED = Symbol.for('runtime-session-registry.scriptsRegistered');
@@ -128,6 +141,23 @@ if retained > current then current = retained end
 local sequence = current + 1
 redis.call('set', KEYS[1], tostring(sequence), 'EX', ARGV[2])
 return sequence`,
+  });
+  client.defineCommand('allocateRuntimeSessionGenerationScript', {
+    numberOfKeys: 1,
+    lua: `local current = redis.call('get', KEYS[1]) or '0'
+local initial = ARGV[1]
+local generation
+local below_initial = string.len(current) < string.len(initial)
+  or (string.len(current) == string.len(initial) and current < initial)
+if below_initial then
+  generation = ARGV[1]
+  redis.call('set', KEYS[1], generation, 'EX', ARGV[2])
+else
+  redis.call('incr', KEYS[1])
+  redis.call('expire', KEYS[1], ARGV[2])
+  generation = redis.call('get', KEYS[1])
+end
+return generation`,
   });
   tagged[SCRIPTS_REGISTERED] = true;
   return client as RedisWithScripts;
@@ -272,11 +302,26 @@ export async function writeRuntimeSessionRecord(
 
 /** Monotonic generation for launch fencing: allocated while holding the lock,
  *  before RunMicrovm, so a stale worker's record can never outrank a newer
- *  launch. */
-export async function allocateRuntimeSessionGeneration(runtimeSessionId: string): Promise<number> {
+ *  launch. `initialGeneration` lets a caller atomically move a lost/legacy
+ *  counter into a collision-resistant namespace while remaining compatible
+ *  with older workers, which derive the provider token from this number. */
+export async function allocateRuntimeSessionGeneration(
+  runtimeSessionId: string,
+  initialGeneration = 1,
+): Promise<number> {
+  if (!Number.isSafeInteger(initialGeneration) || initialGeneration < 1) {
+    throw new Error('Runtime session generation must be a positive safe integer');
+  }
   const key = `${GEN_PREFIX}${runtimeSessionId}`;
-  const generation = await redis.incr(key);
-  await redis.expire(key, RUNTIME_SESSION_RECORD_TTL_SECONDS);
+  const rawGeneration = await redis.allocateRuntimeSessionGenerationScript(
+    key,
+    String(initialGeneration),
+    String(RUNTIME_SESSION_RECORD_TTL_SECONDS),
+  );
+  const generation = Number(rawGeneration);
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('Runtime session generation exceeded the safe integer range');
+  }
   return generation;
 }
 
