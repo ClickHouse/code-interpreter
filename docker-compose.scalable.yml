@@ -169,6 +169,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker-sandbox
+      target: worker-sandbox-${KVM_ENABLED:-true}
     privileged: false
     devices:
       - ${KVM_DEVICE_PATH:-/dev/kvm}:/dev/kvm
@@ -207,6 +208,7 @@ services:
       - SANDBOX_DISABLE_NETWORKING=true
       - SANDBOX_ALLOWED_LOCAL_NETWORK_PORT=3033
       - SANDBOX_FORWARD_TARGET=tool_call_server:3033
+      - LAUNCHER_PACKAGES_HOST=/disabled-host-packages
     volumes:
       - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
     depends_on:

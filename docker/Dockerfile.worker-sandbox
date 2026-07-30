@@ -5,7 +5,7 @@
 #
 # Architecture within this container:
 # ┌──────────────────────────────────────────────────────────────────────────┐
-# │  Worker-Sandbox Container (Fedora 41, libkrun)                          │
+# │  Worker-Sandbox Container (Fedora 43, libkrun)                          │
 # │                                                                         │
 # │  ┌─────────────────┐        ┌──────────────────────────────────────────┐│
 # │  │  Worker Process │ ──────▶│  libkrun MicroVM (own kernel)            ││
@@ -44,6 +44,36 @@ RUN make -j$(nproc)
 COPY api/src/spec-guard.c /tmp/spec-guard.c
 RUN gcc -O2 -static -o /usr/local/bin/spec-guard /tmp/spec-guard.c \
     && chmod 0111 /usr/local/bin/spec-guard
+
+# ============================================================================
+# Stage 1b: Build language runtime packages for the baked KVM root disk
+#
+# Mirrors docker/Dockerfile.package-init, but populates /pkgs at image-build
+# time so the combined worker can boot without a long-lived /host-packages
+# virtio-fs mount.
+# ============================================================================
+FROM buildpack-deps:bookworm AS package-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHON_VERSION=3.14.4
+ENV BUN_VERSION=1.3.14
+
+COPY docker/apt-install.sh /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install
+
+RUN apt-install \
+    curl unzip wget ca-certificates \
+    build-essential libssl-dev libffi-dev libsqlite3-dev \
+    zlib1g-dev libbz2-dev libreadline-dev libncurses5-dev \
+    tk-dev xz-utils libcurl4-openssl-dev libfontconfig1-dev \
+    libudunits2-dev libpng-dev libxml2-dev libcairo2-dev \
+    libfreetype6-dev
+
+RUN mkdir -p /pkgs
+
+COPY docker/package-init.sh /package-init.sh
+COPY javascript-packages.txt /javascript-packages.txt
+RUN chmod +x /package-init.sh && FORCE_REBUILD=true /package-init.sh
 
 # ============================================================================
 # Stage 2: Build worker
@@ -153,9 +183,35 @@ COPY launcher/src/ ./src/
 RUN cargo build --release
 
 # ============================================================================
-# Stage 6: Final combined image (Fedora for libkrun runtime)
+# Stage 5b: Build the read-only ext4 guest root disk
 # ============================================================================
-FROM fedora:43
+FROM debian:bookworm AS worker-sandbox-rootfs-image
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    e2fsprogs \
+    coreutils \
+    gawk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=sandbox-rootfs / /sandbox-rootfs/
+COPY --from=package-builder /pkgs /sandbox-rootfs/pkgs
+COPY docker/build-rootfs-image.sh /usr/local/bin/build-rootfs-image.sh
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
+RUN chmod +x /usr/local/bin/build-rootfs-image.sh \
+    && /usr/local/bin/build-rootfs-image.sh /sandbox-rootfs /sandbox-rootfs.img
+
+# ============================================================================
+# Stage 6: Shared combined worker host (Fedora for libkrun runtime)
+#
+# Final targets:
+#   - worker-sandbox-baked: KVM default; packages live in a read-only ext4
+#                           block root, so no package virtio-fs mount is needed
+#   - worker-sandbox-legacy: directory root plus /host-packages for legacy KVM
+#                            deployments and KVM_ENABLED=false direct mode
+#   - worker-sandbox-{true,false}: Compose aliases selected by KVM_ENABLED
+# ============================================================================
+FROM fedora:43 AS worker-sandbox-base
 
 RUN dnf install -y --setopt=install_weak_deps=False \
     libkrun \
@@ -175,13 +231,6 @@ ENV PATH="/root/.bun/bin:${PATH}"
 
 # --- Launcher (runs on host, boots microVM) ---
 COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/local/bin/launcher
-
-# --- Sandbox rootfs (becomes the microVM guest filesystem) ---
-COPY --from=sandbox-rootfs / /sandbox-rootfs/
-
-RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
-
-RUN mkdir -p /host-packages
 
 # --- Launcher entrypoint (DNS resolution + socat relay before VM boot) ---
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
@@ -207,3 +256,31 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -f http://localhost:3113/health || exit 1
 
 CMD ["/supervisor.sh"]
+
+# Legacy directory-root target. Keep this for deployments that intentionally
+# mount packages at /host-packages, and for the KVM_ENABLED=false direct path.
+FROM worker-sandbox-base AS worker-sandbox-legacy
+
+COPY --from=sandbox-rootfs / /sandbox-rootfs/
+
+RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg \
+    && mkdir -p /host-packages
+
+# KVM production default. The package tree is part of the read-only block root,
+# avoiding host file-descriptor retention from package lookups over virtio-fs.
+FROM worker-sandbox-base AS worker-sandbox-baked
+
+COPY --from=worker-sandbox-rootfs-image /sandbox-rootfs.img /sandbox-rootfs.img
+
+ENV LAUNCHER_ROOT_DISK=/sandbox-rootfs.img \
+    LAUNCHER_ROOT_DISK_READ_ONLY=true \
+    LAUNCHER_ROOT_DEVICE=/dev/vda \
+    LAUNCHER_ROOT_FSTYPE=ext4 \
+    LAUNCHER_ROOT_OPTIONS=ro
+
+# Compose derives these aliases from KVM_ENABLED so the direct path keeps
+# selecting the directory-root image without duplicating the baked rootfs.
+FROM worker-sandbox-baked AS worker-sandbox-true
+FROM worker-sandbox-legacy AS worker-sandbox-false
+
+FROM worker-sandbox-true AS worker-sandbox-default

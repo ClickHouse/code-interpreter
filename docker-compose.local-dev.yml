@@ -12,6 +12,7 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
+      target: sandbox-runner-${KVM_ENABLED:-true}
     container_name: sandbox
     privileged: false
     devices:
@@ -22,6 +23,7 @@ services:
       - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
     environment:
       - KVM_ENABLED=${KVM_ENABLED:-true}
+      - LAUNCHER_PACKAGES_HOST=/disabled-host-packages
       - LAUNCHER_VCPUS=2
       - LAUNCHER_RAM_MIB=2048
       - LAUNCHER_LOG_LEVEL=3
@@ -40,6 +42,11 @@ services:
       - CODEAPI_INTERNAL_SERVICE_TOKEN=${CODEAPI_INTERNAL_SERVICE_TOKEN:-localdev-internal-service-token}
       - SANDBOX_ALLOWED_LOCAL_NETWORK_PORT=3033
       - SANDBOX_FORWARD_TARGET=tool_call_server:3033
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sandbox-runner-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     depends_on:
       - tool_call_server
 

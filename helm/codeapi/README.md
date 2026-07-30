@@ -78,6 +78,30 @@ For development only, `LOCAL_MODE=true` bypasses authentication — see
 **TLS to Redis.** Set `REDIS_TLS=true` via `extraEnv` on each component when
 your Redis (e.g. a managed cache) requires TLS.
 
+**Package delivery.** KVM deployments default to
+`workerSandbox.packages.source=image`. Build and publish the baked runner target
+under the existing `workerSandbox.sandboxImage` repository and tag:
+
+```bash
+docker build \
+  --target sandbox-runner-baked \
+  -t codeapi-sandbox-runner:latest \
+  -f api/Dockerfile .
+```
+
+That image boots the guest and its `/pkgs` tree from a read-only ext4 block
+image. It intentionally does not expose `/host-packages` through virtio-fs,
+which prevents package imports from pinning host-side launcher file
+descriptors. Set `workerSandbox.packages.source=pvc` only for compatibility with
+runtime package rebuilds; Kubernetes will then use the FD-aware liveness probe
+to recycle the runner before descriptor exhaustion.
+
+When upgrading from chart 0.2.x, rebuild the configured `sandboxImage` from the
+baked target before enabling the 0.3.x default. To keep an existing
+directory-root image during migration, set
+`workerSandbox.packages.source=pvc`; the established image repository/tag
+override remains unchanged in either mode.
+
 ## Quick Start (Local Development)
 
 ### 1. Start Minikube
@@ -93,7 +117,7 @@ eval $(minikube docker-env)
 # Build all images, from the codeapi root
 docker build -t codeapi-api:latest -f service/Dockerfile.api .
 docker build -t codeapi-worker:latest -f service/Dockerfile.worker .
-docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
+docker build --target sandbox-runner -t codeapi-sandbox-runner:latest -f api/Dockerfile .
 docker build -t codeapi-file-server:latest -f service/Dockerfile --target production .
 docker build -t codeapi-tool-call-server:latest -f service/Dockerfile.tool-call-server --target production .
 docker build -t codeapi-package-init:latest -f docker/Dockerfile.package-init .
@@ -113,9 +137,13 @@ helm dependency update
 helm install codeapi . -f values-local.yaml
 ```
 
-### 4. Language Packages (Automatic)
+### 4. Language Packages (Local PVC Mode)
 
-The chart includes a **package-init Job** that runs as a Helm `pre-install` hook. It automatically compiles Python, downloads Node/Bun, installs offline package sets, and registers Bash into the packages PVC before the worker pods start.
+`values-local.yaml` disables KVM and selects the legacy PVC package source. In
+that mode the chart includes a **package-init Job** that runs as a Helm
+`pre-install` hook. It compiles Python, downloads Node/Bun, installs offline
+package sets, and registers Bash into the packages PVC before the worker pods
+start.
 
 This happens automatically on `helm install`. To force a rebuild:
 
@@ -168,7 +196,7 @@ curl http://localhost:3112/v1/health
 # Start minikube
 minikube start
 
-# Deploy (package-init job runs automatically)
+# Deploy local direct mode (package-init job runs automatically)
 helm install codeapi ./helm/codeapi -f ./helm/codeapi/values-local.yaml
 
 # Port forward
@@ -204,7 +232,7 @@ helm upgrade codeapi ./helm/codeapi -f ./helm/codeapi/values-local.yaml \
 # Rebuild images (must be in minikube docker env)
 eval $(minikube docker-env)
 docker build -t codeapi-worker:latest -f service/Dockerfile.worker .
-docker build -t codeapi-sandbox-runner:latest -f api/Dockerfile .
+docker build --target sandbox-runner -t codeapi-sandbox-runner:latest -f api/Dockerfile .
 
 # Restart deployments to pick up new images
 kubectl rollout restart deployment/codeapi-service-worker
@@ -285,9 +313,9 @@ kubectl logs deployment/codeapi-service-worker --tail=5
 |  +--------------+  +--------------+  +--------------+                |
 |                                                                      |
 |  +---------------------------------------------------------------+   |
-|  |              PersistentVolume (Packages)                       |   |
-|  |  /pkgs - Python, Node, Bun runtimes                            |   |
-|  |  ReadOnlyMany - shared across all sandbox-runner pods          |   |
+|  |                 Package delivery                               |   |
+|  |  KVM default: /pkgs in each baked ext4 block-root image        |   |
+|  |  Direct mode: shared package PVC populated by package-init     |   |
 |  +---------------------------------------------------------------+   |
 |                                                                      |
 |  Total sandbox capacity: 3 pods x 8 concurrent jobs = 24 jobs        |
@@ -315,7 +343,7 @@ kubectl describe pod <pod-name>
 
 ### "runtime is unknown" error
 ```bash
-# Language packages PVC is empty. Check if the init job ran:
+# In source=pvc mode, check whether the package-init job populated the PVC:
 kubectl get jobs -l app.kubernetes.io/component=package-init
 kubectl logs job/codeapi-package-init
 
@@ -325,6 +353,10 @@ helm upgrade codeapi . --set workerSandbox.packages.initJob.forceRebuild=true
 # Then restart sandbox-runner pods
 kubectl rollout restart deployment/codeapi-sandbox-runner
 ```
+
+In the default `source=image` mode, rebuild and publish
+`workerSandbox.sandboxImage` from the `sandbox-runner-baked` target instead; no
+package-init Job or packages PVC is rendered.
 
 ### Connection refused on port 3112
 ```bash
