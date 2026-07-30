@@ -3,6 +3,23 @@ set -e
 
 echo "Starting NsJail sandbox API..."
 
+# Raise the RLIMIT_NOFILE limits so per-job nsjail can set its own soft
+# limit (SANDBOX_MAX_OPEN_FILES) without EPERM. The AWS Lambda MicroVM base
+# image ships a 1024 hard cap, below the sandbox default of 2048; nsjail
+# runs the child with keep_caps:false, so the hard limit must already be
+# high before the API starts. Only ever RAISE, never lower: `ulimit -n`
+# clamps downward too, so an unconditional set would shrink Docker's ~1M
+# default (and any SANDBOX_MAX_OPEN_FILES above 65536) instead of no-op'ing.
+raise_nofile() {
+  local kind="$1" want=65536 cur
+  cur="$(ulimit "$kind" 2>/dev/null || echo unlimited)"
+  if [ "$cur" != "unlimited" ] && [ "$cur" -lt "$want" ] 2>/dev/null; then
+    ulimit "$kind" "$want" 2>/dev/null || true
+  fi
+}
+raise_nofile -Hn   # hard first, so the soft raise below is permitted
+raise_nofile -Sn
+
 SANDBOX_USE_CGROUPV2="${SANDBOX_USE_CGROUPV2:-true}"
 SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP="${SANDBOX_REMOVE_UMOUNT_AFTER_STARTUP:-true}"
 NSJAIL_CONFIG_SOURCE="${NSJAIL_CONFIG:-/sandbox_api/config/sandbox.cfg}"
@@ -119,24 +136,11 @@ if [ "$ALLOWED_PORT" -gt 0 ] 2>/dev/null; then
         exit 1
     fi
 
-    echo "Configuring tool call server forwarding for UID $SANDBOX_UID (port $ALLOWED_PORT)"
-
-    # Start a narrow Unix-socket proxy for sandbox-originated tool calls.
-    # NsJail bind-mounts this socket and runs a relay inside the sandbox,
-    # keeping clone_newnet: true (fully isolated network namespace).
-    # Only POST /tool-call is exposed; health, readiness, metrics, and
-    # internal gateway routes remain outside the sandbox contract.
-    FORWARD_TARGET="${SANDBOX_FORWARD_TARGET:-}"
-    TCS_SOCKET="/tmp/tcs.sock"
-    if [ -n "$FORWARD_TARGET" ]; then
-        echo "Starting tool-call socket proxy: $TCS_SOCKET -> $FORWARD_TARGET/tool-call"
-        # Run under Node, not Bun: Bun's node:http compat layer never fires
-        # 'connection' events and Bun.serve's idleTimeout does not close
-        # silent unix-socket connections, which silently disables the
-        # proxy's DoS defenses. The .build artifact is produced at image
-        # build time by `bun build --target=node`. See api/Dockerfile.
-        TCS_SOCKET="$TCS_SOCKET" TCS_SOCKET_UID="$SANDBOX_UID" TCS_SOCKET_GID="$SANDBOX_UID" SANDBOX_FORWARD_TARGET="$FORWARD_TARGET" node /sandbox_api/.build/tool-call-socket-proxy.cjs &
-    fi
+    echo "Tool-call socket forwarding enabled for UID $SANDBOX_UID (port $ALLOWED_PORT)"
+    # Do not start Node here. Lambda MicroVM image creation snapshots this
+    # already-running container, and the official Node binary embeds OpenSSL.
+    # The API starts and awaits the narrow Unix-socket proxy only after a
+    # post-restore /execute is authorized for tool calls.
 fi
 
 # Package permissions are finalized by package-init when the PVC is populated.

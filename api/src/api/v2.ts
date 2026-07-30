@@ -4,7 +4,12 @@ import type { TFile } from '../job';
 import { getLatestRuntimeMatchingLanguageVersion, getRuntimes } from '../runtime';
 import { logger } from '../logger';
 import { config } from '../config';
-import { Job, ValidationError } from '../job';
+import {
+  Job,
+  SessionWorkspaceDirtyError,
+  ValidationError,
+  validateFilePath,
+} from '../job';
 import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError, type ExecutionManifestClaims } from '../execution-manifest';
 import { verifyExecuteRequestManifest } from '../execution-manifest-request';
 import { EGRESS_GRANT_HEADER } from '../egress';
@@ -12,9 +17,111 @@ import { activeSandboxExecutions, recordSandboxExecution } from '../metrics';
 import { classifySandboxSafeError } from '../safe-error';
 import { withSpan } from '../telemetry';
 import { checkSandboxWorkspaceHealth } from '../workspace-isolation';
+import type { SessionWorkspace } from '../session-workspace';
+import {
+  RUNTIME_SESSION_ID_HEADER,
+  bindSessionWorkspace,
+  parseSessionBindingFromHeader,
+} from '../session-workspace';
+import { streamSessionCheckpoint, restoreSessionCheckpoint } from '../session-checkpoint';
+import { ensureToolCallSocketProxyReady } from '../tool-call-socket-process';
+import {
+  SESSION_INPUT_CACHE_MAX_OBJECTS,
+  hasCachedInput,
+  pruneInputCache,
+  storeCachedInputs,
+} from '../session-inputs';
 
 const router = express.Router();
 const SYNTHETIC_PRINCIPAL_SOURCE = 'synthetic_test';
+
+function existingDestinationConflictMessage(existing: string, destination: string): string {
+  return existing === destination
+    ? `files contains duplicate destination "${destination}"`
+    : `files contains conflicting destinations "${existing}" and "${destination}"`;
+}
+
+export function validateExecuteFiles(files: TFile[]): void {
+  if (files.length > config.max_input_files) {
+    throw { message: `files cannot contain more than ${config.max_input_files} destinations` };
+  }
+  const destinations = new Set<string>();
+  for (const [i, value] of files.entries()) {
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+      throw { message: `files[${i}] must be an object` };
+    }
+    const file = value as TFile;
+    const inline = typeof file.content === 'string';
+    const byRef = typeof file.id === 'string' && file.id.length > 0;
+    if (inline === byRef) {
+      throw {
+        message: `files[${i}] must contain exactly one of non-empty id or string content`,
+      };
+    }
+    if (file.id !== undefined && !byRef) {
+      throw { message: `files[${i}].id must be a non-empty string if provided` };
+    }
+    if (byRef) {
+      if (typeof file.storage_session_id !== 'string' || file.storage_session_id.length === 0) {
+        throw { message: `files[${i}].storage_session_id is required as a non-empty string for file refs` };
+      }
+    } else if (file.storage_session_id !== undefined || file.input_cache_key !== undefined) {
+      throw {
+        message: `files[${i}] inline content cannot include storage_session_id or input_cache_key`,
+      };
+    }
+    if (file.name !== undefined && typeof file.name !== 'string') {
+      throw { message: `files[${i}].name must be a string if provided` };
+    }
+    if (
+      file.encoding !== undefined
+      && !(['base64', 'hex', 'utf8'] as const).includes(file.encoding)
+    ) {
+      throw { message: `files[${i}].encoding must be base64, hex, or utf8 if provided` };
+    }
+    if (file.entity_id !== undefined && typeof file.entity_id !== 'string') {
+      throw { message: `files[${i}].entity_id must be a string if provided` };
+    }
+    if (
+      file.input_cache_key !== undefined &&
+      (
+        typeof file.input_cache_key !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(file.input_cache_key)
+      )
+    ) {
+      throw { message: `files[${i}].input_cache_key must be a 64-character lowercase hex digest` };
+    }
+    const destination = file.name || `file${i}.code`;
+    try {
+      validateFilePath(destination, '/tmp/codeapi-request-validation');
+    } catch (error) {
+      throw {
+        message: error instanceof Error
+          ? `files[${i}].name is invalid: ${error.message}`
+          : `files[${i}].name is invalid`,
+      };
+    }
+    const conflict = [...destinations].find(
+      existing =>
+        existing === destination ||
+        existing.startsWith(`${destination}/`) ||
+        destination.startsWith(`${existing}/`),
+    );
+    if (conflict) {
+      throw { message: existingDestinationConflictMessage(conflict, destination) };
+    }
+    destinations.add(destination);
+  }
+}
+
+export function validateExecuteArguments(args: unknown, stdin: unknown): void {
+  if (args !== undefined && (!Array.isArray(args) || args.some(value => typeof value !== 'string'))) {
+    throw { message: 'args must be an array of strings if provided' };
+  }
+  if (stdin !== undefined && typeof stdin !== 'string') {
+    throw { message: 'stdin must be a string if provided' };
+  }
+}
 
 export interface ExecuteRequestBody {
   /** Top-level execution session id (one sandbox `/exec` invocation).
@@ -130,6 +237,7 @@ function getJob(
   egressGrantToken?: string,
   toolCallSocketEnabled = false,
   isSynthetic = false,
+  runtimeSessionHeader?: string | string[],
 ): Job {
   const {
     session_id, language, version, args, stdin, files,
@@ -151,11 +259,8 @@ function getJob(
   if (body.tool_call_socket !== undefined && typeof body.tool_call_socket !== 'boolean') {
     throw { message: 'tool_call_socket must be a boolean if specified' };
   }
-  for (const [i, file] of files.entries()) {
-    if (typeof file.content !== 'string' && typeof file.id !== 'string') {
-      throw { message: `files[${i}].content is required as a string if no id is provided` };
-    }
-  }
+  validateExecuteArguments(args, stdin);
+  validateExecuteFiles(files);
 
   const rt = getLatestRuntimeMatchingLanguageVersion(language, version);
   if (!rt) {
@@ -170,6 +275,38 @@ function getJob(
   }
 
   validateConstraints(body, rt);
+
+  /* Session mode is per-request opt-in: only run in the persistent workspace
+   * when THIS request carried a valid X-Runtime-Session-Id. A headerless or
+   * malformed-header request must NOT inherit a previously bound session, or it
+   * would reuse that session's files/UID (defense-in-depth — the backend always
+   * sends the header for a session VM, so this only guards stray requests). */
+  const binding = parseSessionBindingFromHeader(runtimeSessionHeader);
+  let session: SessionWorkspace | null = null;
+  if (binding) {
+    session = bindSessionWorkspace(binding) ?? null;
+    /* The runner is already pinned to a DIFFERENT session. Falling through
+     * with `session = null` would silently run the request as a stateless
+     * one-shot under another session's workspace/UID; conflict loudly instead
+     * so the control plane recycles this VM. */
+    if (!session) {
+      throw {
+        status: 409,
+        /* `session_workspace_dirty` is the established control-plane recycle
+         * signal. Reuse it so a new runner remains safe behind an older
+         * service during a rolling deployment. */
+        code: 'session_workspace_dirty',
+        message: 'Runner is bound to a different runtime session',
+      };
+    }
+    if (session.dirtyReason) {
+      throw {
+        status: 409,
+        code: 'session_workspace_dirty',
+        message: 'Session workspace must be restored before another execute',
+      };
+    }
+  }
 
   return new Job({
     session_id: session_id ?? null,
@@ -194,6 +331,7 @@ function getJob(
     egress_grant: egressGrantToken,
     tool_call_socket_enabled: toolCallSocketEnabled,
     is_synthetic: isSynthetic,
+    session,
   });
 }
 
@@ -238,6 +376,8 @@ function manifestErrorStatus(error: ExecutionManifestError): number {
 
 router.use((req: Request, res: Response, next: NextFunction) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  /* Checkpoint restore and additive file delivery stream tar.gz bodies, not JSON. */
+  if (req.path === '/session/restore' || req.path === '/session/inputs') return next();
   if (!req.headers['content-type']?.startsWith('application/json')) {
     return res.status(415).json({ message: 'requests must be of type application/json' });
   }
@@ -259,6 +399,7 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
   let activeExecution = false;
   let metricsLanguage = 'unknown';
   let metricsOutcome: Parameters<typeof recordSandboxExecution>[0]['outcome'] = 'execution_error';
+  let primeCompleted = false;
 
   const cleanupHandler = async (): Promise<void> => {
     if (!job || cleanedUp) return;
@@ -322,6 +463,7 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
         tokenFromBodyOrHeader(req.body, 'egress_grant', req.header(EGRESS_GRANT_HEADER) ?? undefined),
         toolCallSocketEnabled,
         verifiedManifest?.principal_source === SYNTHETIC_PRINCIPAL_SOURCE,
+        req.headers[RUNTIME_SESSION_ID_HEADER],
       );
       metricsLanguage = job.runtime.language;
       markActiveExecution();
@@ -339,13 +481,27 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       const message = error instanceof Error
         ? error.message
         : (error as { message?: unknown })?.message;
-      return res.status(400).json({ message: message || 'Bad request' });
+      /* Most validation paths are 400; a session-binding conflict carries its
+       * own status so the control plane can tell "bad request" from "this VM
+       * belongs to another session, recycle me". */
+      const status = (error as { status?: unknown })?.status;
+      const code = (error as { code?: unknown })?.code;
+      return res
+        .status(typeof status === 'number' ? status : 400)
+        .json({
+          ...(typeof code === 'string' ? { error: code } : {}),
+          message: message || 'Bad request',
+        });
     }
 
     try {
+      if (toolCallSocketEnabled) {
+        await ensureToolCallSocketProxyReady();
+      }
       await withSpan('codeapi.sandbox.prime', {
         'codeapi.language': job.runtime.language,
       }, () => job!.prime());
+      primeCompleted = true;
       const result = await withSpan('codeapi.sandbox.run', {
         'codeapi.language': job.runtime.language,
       }, () => job!.execute());
@@ -387,6 +543,22 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       metricsOutcome = 'success';
       return res.status(200).json(result);
     } catch (error) {
+      if (primeCompleted && job?.markSessionDirty('execution failed after input priming')) {
+        metricsOutcome = 'execution_error';
+        logger.error({ job: job.uuid, err: error }, 'Session execution left workspace state unknown');
+        return res.status(409).json({
+          error: 'session_workspace_dirty',
+          message: 'Session workspace must be restored before another execute',
+        });
+      }
+      if (error instanceof SessionWorkspaceDirtyError) {
+        metricsOutcome = 'execution_error';
+        logger.error({ job: job?.uuid, err: error }, 'Session input priming left a partial workspace');
+        return res.status(409).json({
+          error: error.code,
+          message: error.message,
+        });
+      }
       if (error instanceof ValidationError) {
         metricsOutcome = 'validation_error';
         return res.status(400).json({ message: error.message });
@@ -440,5 +612,136 @@ router.get('/runtimes', (_req: Request, res: Response) => {
   }));
   return res.status(200).json(runtimes);
 });
+
+/* Session workspace checkpoint / restore — control-plane driven, session-mode
+ * only. GET streams a tar.gz of the whole workspace (captures state the
+ * file-ref path drops: installed packages, chDB dirs, unsupported-extension
+ * files); POST replaces the workspace from one. No body parser on restore:
+ * the handler consumes the raw request stream. */
+/* Bind the session from the header before checkpoint/restore. These run BEFORE
+ * the first /execute on a relaunched VM, so in the hookless design nothing else
+ * has bound the workspace yet; without this the handlers 409 and a real restore
+ * silently continues with an empty workspace (checkpoint state lost on expiry).
+ * Returns false (→ fail closed) when this request carries no valid header, so a
+ * headerless/malformed request never operates on a stale prior session. */
+function bindSessionFromHeader(req: Request): boolean {
+  const binding = parseSessionBindingFromHeader(req.headers[RUNTIME_SESSION_ID_HEADER]);
+  if (!binding) return false;
+  /* A REJECTED bind (this runner is already pinned to a different session)
+   * must fail the request too — proceeding would run checkpoint/restore/file
+   * delivery for the requested session against the previously bound session's
+   * workspace. */
+  return bindSessionWorkspace(binding) != null;
+}
+
+/* Express 4 (pinned) does NOT auto-forward rejected route-handler promises, so
+ * `.catch(next)` is required or a rejection (e.g. session.ownership()) hangs the
+ * request and surfaces as an unhandled rejection instead of a 5xx. */
+router.get('/session/checkpoint', (req: Request, res: Response, next: NextFunction) => {
+  if (!bindSessionFromHeader(req)) {
+    return res.status(409).json({ message: 'Missing runtime session header' });
+  }
+  return streamSessionCheckpoint(res).catch(next);
+});
+router.post('/session/restore', (req: Request, res: Response, next: NextFunction) => {
+  if (!bindSessionFromHeader(req)) {
+    return res.status(409).json({ message: 'Missing runtime session header' });
+  }
+  return restoreSessionCheckpoint(req, res).catch(next);
+});
+/**
+ * Input delivery for backends whose sandbox cannot reach the file server.
+ *
+ * These are deliberately NOT session-scoped: the cache they fill is keyed by
+ * (storage session, object id) and lives outside any workspace, so the same
+ * mechanism serves stateful sessions and stateless one-shots alike. The
+ * workspace is still only ever written by the normal priming path. The routes
+ * are nevertheless Lambda-runner-only: Lambda's Runtime API supplies the
+ * external bearer boundary, while ordinary shared runners must not expose an
+ * unauthenticated cache-write surface.
+ */
+function requireSessionInputDeliveryTarget(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): Response | void {
+  if (!config.session_workspace_enabled) {
+    return res.status(404).json({ message: 'Not Found' });
+  }
+  next();
+}
+
+/* No global body parser exists (see index.ts), so the probe installs its own.
+ * A ref list is tiny — a few hundred bytes per entry — but bound it anyway. */
+router.post(
+  '/session/inputs/probe',
+  requireSessionInputDeliveryTarget,
+  express.json({ limit: '1mb' }),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const refs = (req.body as { refs?: Array<{ cache_key?: unknown }> })?.refs;
+      if (!Array.isArray(refs)) {
+        return res.status(400).json({ message: 'refs must be an array' });
+      }
+      if (refs.length > SESSION_INPUT_CACHE_MAX_OBJECTS) {
+        return res.status(400).json({
+          message: `refs exceeds the ${SESSION_INPUT_CACHE_MAX_OBJECTS}-object limit`,
+        });
+      }
+      const missing: Array<{ cache_key: string }> = [];
+      const seen = new Set<string>();
+      for (const ref of refs) {
+        if (typeof ref?.cache_key !== 'string' || !/^[0-9a-f]{64}$/.test(ref.cache_key)) {
+          return res.status(400).json({ message: 'each ref requires a valid cache_key' });
+        }
+        if (seen.has(ref.cache_key)) {
+          return res.status(400).json({ message: 'refs contains a duplicate cache_key' });
+        }
+        seen.add(ref.cache_key);
+        if (!(await hasCachedInput('', '', ref.cache_key))) {
+          missing.push({ cache_key: ref.cache_key });
+        }
+      }
+      return res.status(200).json({ missing });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
+router.post(
+  '/session/inputs',
+  requireSessionInputDeliveryTarget,
+  async (req: Request, res: Response) => {
+    try {
+      const expandedHeader = req.get('x-codeapi-input-expanded-bytes');
+      let expectedBytes: number | undefined;
+      if (expandedHeader !== undefined) {
+        if (!/^(0|[1-9][0-9]*)$/.test(expandedHeader)) {
+          return res.status(400).json({ message: 'invalid expanded input byte count' });
+        }
+        expectedBytes = Number(expandedHeader);
+        if (
+          !Number.isSafeInteger(expectedBytes)
+          || expectedBytes > config.input_cache_max_bytes
+        ) {
+          return res.status(400).json({ message: 'invalid expanded input byte count' });
+        }
+      }
+      const stored = await storeCachedInputs(
+        req,
+        config.input_cache_max_bytes,
+        expectedBytes,
+      );
+      await pruneInputCache(config.input_cache_max_bytes).catch((err) => {
+        logger.warn({ err }, 'Failed to prune session input cache');
+      });
+      return res.status(200).json({ stored });
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to store session inputs');
+      return res.status(500).json({ message: 'session input delivery failed' });
+    }
+  },
+);
 
 export default router;

@@ -3,25 +3,24 @@ import { Worker } from 'bullmq';
 import type * as t from './types';
 import { filterSystemLogs, applySystemReplacements, getAxiosErrorDetails, sandboxErrorMessageFromAxios } from './utils';
 import { jobProcessingDuration, jobsCompleted, jobsFailed, activeJobs, workerRunning } from './metrics';
-import { Jobs, Queues } from './enum';
+import { Queues } from './enum';
 import { connection } from './queue';
-import { env } from './config';
+import { env, jobDeadlineAtMs } from './config';
 import { summarizeSandboxResponse, summarizeText } from './execution-log';
 import { createGatewayEgressGrant, restoreGatewaySandboxResult, revokeGatewayEgressGrant } from './egress-gateway-client';
 import { refreshEgressGrantClaims } from './sandbox-egress';
 import { buildSandboxExecuteRequest } from './sandbox-dispatch';
+import { prepareInputDelivery } from './runtime-session/input-delivery';
+import { SessionFilesError } from './runtime-session/files';
+import { resolveRuntimeSessionForJob } from './runtime-session/job-policy';
+import { getSandboxBackend, SandboxBackendError, type SandboxRawResponse } from './sandbox-backend';
 import { isSyntheticPrincipalSource } from './auth/synthetic';
-import { injectTraceHeaders, withSpan, withTraceContext } from './telemetry';
+import { withSpan, withTraceContext } from './telemetry';
+import { workerDeadlineFailure } from './worker-error';
 import logger from './logger';
 
 const { INSTANCE_ID } = env;
 const WORKER_ID = `${INSTANCE_ID}-${process.pid}`;
-
-type SandboxLogResponse = t.ExecuteResponse & {
-  session_id: string;
-  files?: t.FileRefs;
-  run?: t.ExecuteResponse['run'];
-};
 
 function isAbortError(error: unknown): boolean {
   return axios.isAxiosError(error) && (error.name === 'AbortError' || error.code === 'ERR_CANCELED');
@@ -44,12 +43,20 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
   activeJobs.inc({ language });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), env.JOB_TIMEOUT);
+  const deadlineAtMs = jobDeadlineAtMs(job.timestamp, env.JOB_TIMEOUT);
+  const remainingBudgetMs = Math.max(0, deadlineAtMs - Date.now());
+  const timer = remainingBudgetMs > 0
+    ? setTimeout(() => controller.abort(), remainingBudgetMs)
+    : undefined;
+  if (remainingBudgetMs === 0) controller.abort();
   let egressGrantId: string | undefined;
   let egressGrantTokenForRestore: string | undefined;
   let revokeReason = 'completed';
 
   try {
+    if (controller.signal.aborted) {
+      throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
+    }
     let sandboxPayload = payload;
     let executionManifestClaims = job.data.executionManifestClaims;
     let egressGrantToken = job.data.egressGrantToken;
@@ -71,8 +78,9 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         : undefined;
     }
 
+    const delivery = prepareInputDelivery(payload, sandboxPayload);
     const sandboxRequest = buildSandboxExecuteRequest({
-      payload: sandboxPayload,
+      payload: delivery.payload,
       egressGrantToken,
       executionManifestClaims,
       executionManifestPrivateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,
@@ -81,32 +89,65 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
     });
     egressGrantTokenForRestore = egressGrantToken;
 
-    const response = await withSpan('codeapi.sandbox.execute', {
-      'http.request.method': 'POST',
-      'url.path': `/${Jobs.execute}`,
-      'codeapi.language': language,
-    }, () => axios.post<SandboxLogResponse>(
-        `${env.SANDBOX_ENDPOINT}/${Jobs.execute}`,
-        sandboxRequest.body,
-        {
-          headers: injectTraceHeaders(sandboxRequest.headers),
-          signal: controller.signal,
-        }
-      ), 'CLIENT');
+    const runtimeSession = resolveRuntimeSessionForJob({
+      workerMode: env.RUNTIME_SESSION_MODE,
+      workerBackend: env.SANDBOX_BACKEND,
+      runtimeSessionMode: job.data.runtimeSessionMode,
+      runtimeSessionId: job.data.runtimeSessionId,
+      runtimeSessionExemption: job.data.runtimeSessionExemption,
+      isSynthetic: isSyntheticJob,
+    });
 
-    if (response.status !== 200) {
-      throw new Error('Error from sandbox');
-    }
-
-    const responseData = egressGrantTokenForRestore
-      ? await restoreGatewaySandboxResult({
+    /* Stateful Lambda runs this inside its session commit barrier. The worker
+     * still invokes it unconditionally as the HTTP/stateless fallback; marking
+     * the transformed object makes that second call an idempotent no-op. */
+    const resultRestoreToken = egressGrantTokenForRestore;
+    const finalizedSandboxResults = new WeakSet<SandboxRawResponse>();
+    const finalizeSandboxResult = async (result: SandboxRawResponse): Promise<SandboxRawResponse> => {
+      if (
+        resultRestoreToken === undefined ||
+        resultRestoreToken.length === 0 ||
+        finalizedSandboxResults.has(result)
+      ) {
+        return result;
+      }
+      const restored = await restoreGatewaySandboxResult({
         grantId: egressGrantId,
-        egressGrantToken: egressGrantTokenForRestore,
-        result: response.data,
+        egressGrantToken: resultRestoreToken,
+        result,
         isSynthetic: isSyntheticJob,
         signal: controller.signal,
-      })
-      : response.data;
+      });
+      finalizedSandboxResults.add(restored);
+      return restored;
+    };
+
+    const responseRaw = await getSandboxBackend().execute(
+      {
+        body: sandboxRequest.body,
+        headers: sandboxRequest.headers,
+        inputDelivery: delivery.refs,
+      },
+      {
+        executionId: job.data.executionId ?? '',
+        language,
+        isSynthetic: isSyntheticJob,
+        signal: controller.signal,
+        deadlineAtMs,
+        tenantId: job.data.tenantId,
+        canonicalUserId: job.data.canonicalUserId,
+        runtimeSessionId: runtimeSession.runtimeSessionId,
+        runtimeSessionMode: runtimeSession.runtimeSessionMode,
+        /* Stateful backends run this as a commit barrier after user code but
+         * before checkpointing/reusing the mutated workspace. Stateless/HTTP
+         * paths retain the worker-owned fallback immediately below. */
+        sessionResultFinalizer: resultRestoreToken !== undefined && resultRestoreToken.length > 0
+          ? finalizeSandboxResult
+          : undefined,
+      },
+    );
+
+    const responseData = await finalizeSandboxResult(responseRaw);
 
     if (!isSyntheticJob) {
       logger.info('Sandbox response', summarizeSandboxResponse(responseData));
@@ -150,11 +191,25 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
     return result;
   } catch (error) {
-    revokeReason = isAbortError(error) ? 'timeout' : 'failed';
+    revokeReason = controller.signal.aborted || isAbortError(error) ? 'timeout' : 'failed';
     const errorDetails = getAxiosErrorDetails(error);
     logger.error('Error processing job', errorDetails);
 
-    if (isAbortError(error)) {
+    const deadlineFailure = workerDeadlineFailure(
+      error,
+      controller.signal.aborted,
+      env.JOB_TIMEOUT,
+    );
+    if (deadlineFailure) {
+      throw deadlineFailure;
+    } else if (error instanceof SandboxBackendError) {
+      throw new Error(`${error.code}: ${error.message}`);
+    } else if (error instanceof SessionFilesError) {
+      /* BullMQ serializes Error rather than preserving custom prototypes.
+       * Carry the stable code in the message so the public router can map the
+       * input failure without confusing it with MicroVM health. */
+      throw new Error(`${error.code}: ${error.message}`);
+    } else if (isAbortError(error)) {
       throw new Error(`Job timed out after ${env.JOB_TIMEOUT}ms`);
     } else if (axios.isAxiosError(error)) {
       /** Preserve error message from sandbox */
@@ -174,7 +229,7 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         logger.error('Failed to revoke egress grant', { grantId: egressGrantId, error: getAxiosErrorDetails(error) });
       });
     }
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     endTimer();
     activeJobs.dec({ language });
   }

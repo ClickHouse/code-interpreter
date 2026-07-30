@@ -194,6 +194,57 @@ export const ptcReplayStaleCleanups = new Counter({
   help: 'Stale executions reaped by the periodic cleanup sweep',
 });
 
+export const microvmLaunches = new Counter({
+  name: 'codeapi_microvm_launches_total',
+  help: 'Lambda MicroVM launch attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmLaunchDuration = new Histogram({
+  name: 'codeapi_microvm_launch_duration_seconds',
+  help: 'Time from RunMicrovm to a healthy RUNNING MicroVM',
+  buckets: [0.5, 1, 2, 5, 10, 20, 40, 60],
+});
+
+export const microvmTerminations = new Counter({
+  name: 'codeapi_microvm_terminations_total',
+  help: 'Lambda MicroVM terminations by reason',
+  labelNames: ['reason'] as const,
+});
+
+export const microvmThrottleEvents = new Counter({
+  name: 'codeapi_microvm_throttle_events_total',
+  help: 'Control-plane throttle waits/errors by operation',
+  labelNames: ['op'] as const,
+});
+
+export const runtimeSessionLockContention = new Counter({
+  name: 'codeapi_runtime_session_lock_contention_total',
+  help: 'Runtime session lock waits that timed out, by mode',
+  labelNames: ['mode'] as const,
+});
+
+export const microvmCheckpoints = new Counter({
+  name: 'codeapi_microvm_checkpoints_total',
+  help: 'Session workspace checkpoint attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmRestores = new Counter({
+  name: 'codeapi_microvm_restores_total',
+  help: 'Session workspace restore attempts by outcome',
+  labelNames: ['outcome'] as const,
+});
+
+export const microvmCheckpointBytes = new Histogram({
+  name: 'codeapi_microvm_checkpoint_bytes',
+  help: 'Size of stored session workspace checkpoints',
+  buckets: [
+    1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024,
+    256 * 1024 * 1024, 512 * 1024 * 1024,
+  ],
+});
+
 // -- Helpers for serving metrics --
 
 export async function metricsHandler(_req: unknown, res: { set: (key: string, value: string) => void; send: (data: string) => void }): Promise<void> {

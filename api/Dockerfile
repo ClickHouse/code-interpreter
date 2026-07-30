@@ -121,8 +121,8 @@ COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /sandbox_api
 
-COPY api/package.json ./
-RUN bun install
+COPY api/package.json api/bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY api/tsconfig.json ./
 COPY api/src ./src
@@ -147,6 +147,27 @@ RUN rm -f /usr/bin/nsenter /usr/bin/unshare /usr/bin/chroot /usr/sbin/chroot \
 
 COPY api/src/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
+
+# ============================================================================
+# Stage 2b: AWS Lambda MicroVM container base image
+#
+# Lambda MicroVM IS the VM boundary: no libkrun launcher, no guest kernel.
+# This target is pushed to a same-account ECR repo and referenced by the
+# FROM line of the code-artifact Dockerfile that Lambda builds on top of
+# the AL2023 MicroVM base image (see scripts/build-lambda-microvm-artifact.sh).
+# Inbound traffic defaults to port 8080; lifecycle/build hooks are served
+# by the same app at /aws/lambda-microvms/runtime/v1/*.
+# ============================================================================
+FROM sandbox-build AS lambda-microvm-runner
+
+COPY --from=package-builder /pkgs /pkgs
+
+ENV PORT=8080 \
+    SANDBOX_PACKAGES_DIRECTORY=/pkgs \
+    SANDBOX_SESSION_WORKSPACE_ENABLED=true
+
+EXPOSE 8080/tcp
+ENTRYPOINT ["/sandbox_api/entrypoint.sh"]
 
 # ============================================================================
 # Stage 3: Build the Rust launcher binary (Fedora for libkrun ABI)

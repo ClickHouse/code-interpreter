@@ -12,12 +12,13 @@ import { internalServiceHeaders } from '../internal-service-auth';
 import { resolveSessionKey, resolveOutputBucketSessionKey, SessionKeyResolutionError, parseUploadSessionKeyInput, type SessionKeyInput } from '../session-key';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from '../queue';
 import { sleep, getAxiosErrorDetails, publicExecutionFailure } from '../utils';
-import { env, planLimits, resolveLanguage } from '../config';
+import { env, jobCompletionWaitTimeoutMs, planLimits, resolveLanguage } from '../config';
 import { createPayload } from '../payload';
 import { summarizeRequestedFiles } from '../execution-log';
 import { getCredentialId, getPrincipalOrReject } from '../auth/principal';
 import { isSyntheticPrincipalSource } from '../auth/synthetic';
 import { getExecutionIdentity } from '../execution-identity';
+import { resolveRuntimeSessionIdForExecRequest, RuntimeSessionHintError } from '../runtime-session/id';
 import { jobsSubmitted } from '../metrics';
 import { captureTraceCarrier, withSpan } from '../telemetry';
 import { Jobs, Languages } from '../enum';
@@ -26,6 +27,11 @@ import { prepareSandboxJobSecurity } from '../sandbox-egress';
 import logger from '../logger';
 
 const { INSTANCE_ID } = env;
+const JOB_COMPLETION_WAIT_TIMEOUT_MS = jobCompletionWaitTimeoutMs(
+  env.JOB_TIMEOUT,
+  env.LAMBDA_MICROVM_LAUNCH_TIMEOUT_MS,
+  env.EGRESS_GATEWAY_REVOKE_TIMEOUT_MS,
+);
 
 const UPLOAD_TIMEOUT_MS = 30_000;
 /* Batch cap sized for skill-priming uploads: a single skill (e.g. pptx)
@@ -133,6 +139,25 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
     return res.status(400).json({ error: `Unsupported language: ${rawLang}` });
   }
 
+  let runtimeSessionId: string | undefined;
+  try {
+    runtimeSessionId = resolveRuntimeSessionIdForExecRequest({
+      mode: env.RUNTIME_SESSION_MODE,
+      storageNamespace: identity.storageNamespace,
+      canonicalUserId: identity.canonicalUserId,
+      runtimeSessionHint: body.runtime_session_hint,
+      isSynthetic: isSyntheticRequest,
+    });
+  } catch (error) {
+    if (error instanceof RuntimeSessionHintError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+  const runtimeSessionMode: t.RuntimeSessionMode = runtimeSessionId == null
+    ? 'stateless'
+    : env.RUNTIME_SESSION_MODE;
+
   let authorizedFiles: t.RequestFile[];
   try {
     authorizedFiles = await authorizeRequestedFiles({
@@ -219,6 +244,8 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
         executionId: execution_id,
         tenantId: identity.storageNamespace,
         canonicalUserId: identity.canonicalUserId,
+        ...(runtimeSessionId != null ? { runtimeSessionId } : {}),
+        runtimeSessionMode,
         executionManifestClaims: sandboxSecurity.executionManifestClaims,
         egressGrantClaims: sandboxSecurity.egressGrantClaims,
         egressGrantToken: sandboxSecurity.egressGrantToken,
@@ -251,7 +278,7 @@ router.post('/exec', executionLimiter, async (req: t.AuthenticatedRequest, res) 
       'messaging.system': 'bullmq',
       'messaging.destination.name': queueName,
       'codeapi.language': language,
-    }, () => job.waitUntilFinished(queueEvents, env.JOB_TIMEOUT), 'CONSUMER');
+    }, () => job.waitUntilFinished(queueEvents, JOB_COMPLETION_WAIT_TIMEOUT_MS), 'CONSUMER');
 
     if (!isSyntheticRequest) {
       logger.info('Execution completed', { session_id, user_id });
