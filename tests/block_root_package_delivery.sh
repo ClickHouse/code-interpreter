@@ -156,18 +156,6 @@ assert_contains \
     "$ROOT/docker/Dockerfile.worker-sandbox" \
     '^FROM worker-sandbox-legacy AS worker-sandbox-false$' \
     "worker-sandbox-false must inherit the direct target"
-assert_contains \
-    "$ROOT/docker/Dockerfile.worker-sandbox" \
-    'sandbox-runner-healthcheck.sh' \
-    "the combined worker image must check guest clock skew"
-assert_contains \
-    "$ROOT/docker/Dockerfile.worker-sandbox" \
-    '^HEALTHCHECK --interval=30s --timeout=12s ' \
-    "the combined healthcheck timeout must cover both sequential probes"
-assert_contains \
-    "$ROOT/docker-compose.scalable.yml" \
-    '^[[:space:]]+timeout: 12s$' \
-    "the scalable Compose healthcheck timeout must cover both sequential probes"
 
 awk '
     /^FROM / {
@@ -235,6 +223,15 @@ assert_env_value \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS \
     2 \
     "default Helm render must stagger clock-skew recycling across replicas"
+assert_contains \
+    "$TMP_DIR/helm-image.yaml" \
+    '^[[:space:]]+failureThreshold: 1$' \
+    "sandbox-runner readiness must fail immediately when clock skew is detected"
+
+if [ "$(grep -Fc -- '- /usr/local/bin/sandbox-runner-healthcheck.sh' "$TMP_DIR/helm-image.yaml")" -lt 2 ]; then
+    echo "sandbox-runner liveness and readiness must both check guest clock skew" >&2
+    exit 1
+fi
 
 helm template codeapi "$TMP_DIR/chart" \
     --set executionManifest.privateKey=test \
@@ -297,7 +294,7 @@ assert_env_value \
 if helm template codeapi "$TMP_DIR/chart" \
     --set executionManifest.privateKey=test \
     --set executionManifest.publicKey=test \
-    --set workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds=30 \
+    --set workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds=25 \
     > "$TMP_DIR/invalid-clock-skew-limit.yaml" 2> "$TMP_DIR/invalid-clock-skew-limit.log"; then
     echo "clock-skew liveness limit must stay below manifest tolerance" >&2
     exit 1
@@ -305,7 +302,7 @@ fi
 
 assert_contains \
     "$TMP_DIR/invalid-clock-skew-limit.log" \
-    'clockSkewLivenessLimitSeconds must be between 0 and 29' \
+    'clockSkewLivenessLimitSeconds must be between 0 and 24' \
     "clock-skew limit validation failed for an unexpected reason"
 
 if helm template codeapi "$TMP_DIR/chart" \

@@ -5,6 +5,7 @@ fd_limit="${SANDBOX_RUNNER_FD_LIVENESS_LIMIT:-40000}"
 clock_skew_limit_seconds="${SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS:-10}"
 clock_skew_jitter_seconds="${SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS:-2}"
 timeout_seconds="${SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS:-5}"
+manifest_clock_tolerance_seconds=30
 port="${PORT:-2000}"
 url="${SANDBOX_RUNNER_HEALTHCHECK_URL:-http://127.0.0.1:${port}/api/v2/runtimes}"
 
@@ -27,9 +28,18 @@ validate_non_negative_integer \
 validate_non_negative_integer \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS \
     "$clock_skew_jitter_seconds"
+validate_non_negative_integer \
+    SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS \
+    "$timeout_seconds"
 
-if [ "$clock_skew_limit_seconds" -ge 30 ]; then
-    echo "SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS must be less than the 30-second execution-manifest tolerance" >&2
+if [ "$timeout_seconds" -eq 0 ]; then
+    echo "SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be greater than zero" >&2
+    exit 2
+fi
+
+if [ "$clock_skew_limit_seconds" -gt 0 ] && \
+    [ $((clock_skew_limit_seconds + timeout_seconds)) -ge "$manifest_clock_tolerance_seconds" ]; then
+    echo "SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS plus SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be less than the ${manifest_clock_tolerance_seconds}-second execution-manifest tolerance" >&2
     exit 2
 fi
 
@@ -88,6 +98,12 @@ guest_date=$(printf '%s\n' "$response_headers" | awk '
 
 if [ -z "$guest_date" ]; then
     echo "sandbox-runner unhealthy: guest response is missing the HTTP Date header" >&2
+    exit 1
+fi
+
+http_date_pattern='^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT$'
+if ! [[ "$guest_date" =~ $http_date_pattern ]]; then
+    echo "sandbox-runner unhealthy: guest returned an invalid HTTP Date header: ${guest_date}" >&2
     exit 1
 fi
 

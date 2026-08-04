@@ -130,6 +130,15 @@ grep -F 'guest returned an invalid HTTP Date header' "$TMP_DIR/malformed.log" >/
 
 if run_check \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=10 \
+    TEST_GUEST_DATE=now \
+    TEST_GUEST_SECONDS=100 2> "$TMP_DIR/non-http-date.log"; then
+    echo "healthcheck accepted a GNU-date-parseable value that is not an HTTP-date" >&2
+    exit 1
+fi
+grep -F 'guest returned an invalid HTTP Date header: now' "$TMP_DIR/non-http-date.log" >/dev/null
+
+if run_check \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=10 \
     TEST_CURL_FAIL=true \
     TEST_GUEST_SECONDS=100; then
     echo "healthcheck accepted a failed guest request" >&2
@@ -150,11 +159,20 @@ fi
 grep -F 'invalid SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS: invalid' "$TMP_DIR/invalid.log" >/dev/null
 
 if run_check \
-    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=30 \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=25 \
     TEST_GUEST_SECONDS=100 2> "$TMP_DIR/unsafe-limit.log"; then
-    echo "healthcheck accepted a limit at the manifest tolerance" >&2
+    echo "healthcheck accepted a limit without request-latency headroom" >&2
     exit 1
 fi
-grep -F 'must be less than the 30-second execution-manifest tolerance' "$TMP_DIR/unsafe-limit.log" >/dev/null
+grep -F 'plus SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be less than the 30-second execution-manifest tolerance' "$TMP_DIR/unsafe-limit.log" >/dev/null
+
+if run_check \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=10 \
+    SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS=0 \
+    TEST_GUEST_SECONDS=100 2> "$TMP_DIR/zero-timeout.log"; then
+    echo "healthcheck accepted a zero request timeout" >&2
+    exit 1
+fi
+grep -F 'SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be greater than zero' "$TMP_DIR/zero-timeout.log" >/dev/null
 
 echo "sandbox-runner healthcheck checks passed"

@@ -37,8 +37,8 @@ Split runtime deployments:
 {{- end }}
 {{- $clockSkewLimit := int $clockSkewLimitValue }}
 {{- $clockSkewJitter := int $clockSkewJitterValue }}
-{{- if or (lt $clockSkewLimit 0) (ge $clockSkewLimit 30) }}
-{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be between 0 and 29 so it stays below the 30-second execution-manifest tolerance" }}
+{{- if or (lt $clockSkewLimit 0) (ge $clockSkewLimit 25) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be between 0 and 24 so the 5-second healthcheck timeout stays below the 30-second execution-manifest tolerance" }}
 {{- end }}
 {{- if or (lt $clockSkewJitter 0) (and (gt $clockSkewLimit 0) (ge $clockSkewJitter $clockSkewLimit)) }}
 {{- fail "workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds must be non-negative and less than clockSkewLivenessLimitSeconds when the clock-skew guard is enabled" }}
@@ -382,14 +382,15 @@ spec:
                 - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 60
             periodSeconds: 30
-            timeoutSeconds: 5
+            timeoutSeconds: 7
           readinessProbe:
-            httpGet:
-              path: /api/v2/health
-              port: sandbox
+            exec:
+              command:
+                - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 5
+            timeoutSeconds: 7
+            failureThreshold: 1
           resources:
             {{- $sandboxResources := deepCopy .Values.workerSandbox.resources }}
             {{- if $useKvmDevicePlugin }}
