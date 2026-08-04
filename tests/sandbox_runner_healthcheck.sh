@@ -27,7 +27,12 @@ cat > "$TMP_DIR/bin/date" <<'EOF'
 set -euo pipefail
 
 if [[ "$#" -eq 2 && "$1" == "-u" && "$2" == "+%s" ]]; then
-    printf '%s\n' "${TEST_HOST_SECONDS:?}"
+    if [[ -e "${TEST_HOST_SAMPLE_STATE:?}" ]]; then
+        printf '%s\n' "${TEST_HOST_AFTER_SECONDS:?}"
+    else
+        : > "$TEST_HOST_SAMPLE_STATE"
+        printf '%s\n' "${TEST_HOST_BEFORE_SECONDS:?}"
+    fi
     exit 0
 fi
 
@@ -54,11 +59,14 @@ EOF
 chmod +x "$TMP_DIR/bin/curl" "$TMP_DIR/bin/date" "$TMP_DIR/bin/cksum"
 
 run_check() {
+    rm -f "$TMP_DIR/host-sample"
     env \
         PATH="$TMP_DIR/bin:$PATH" \
         SANDBOX_RUNNER_FD_LIVENESS_LIMIT=0 \
         SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS=0 \
-        TEST_HOST_SECONDS=100 \
+        TEST_HOST_BEFORE_SECONDS=100 \
+        TEST_HOST_AFTER_SECONDS=100 \
+        TEST_HOST_SAMPLE_STATE="$TMP_DIR/host-sample" \
         TEST_GUEST_DATE='Tue, 04 Aug 2026 08:00:00 GMT' \
         "$@" \
         bash "$ROOT/docker/sandbox-runner-healthcheck.sh"
@@ -67,6 +75,14 @@ run_check() {
 run_check \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=10 \
     TEST_GUEST_SECONDS=91
+
+# A guest timestamp inside the host interval is healthy even when either
+# individual host sample differs by more than the configured limit.
+run_check \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=1 \
+    TEST_HOST_BEFORE_SECONDS=100 \
+    TEST_HOST_AFTER_SECONDS=104 \
+    TEST_GUEST_SECONDS=102
 
 if run_check \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=10 \
@@ -111,6 +127,14 @@ if run_check \
     exit 1
 fi
 grep -F 'guest returned an invalid HTTP Date header' "$TMP_DIR/malformed.log" >/dev/null
+
+if run_check \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=10 \
+    TEST_CURL_FAIL=true \
+    TEST_GUEST_SECONDS=100; then
+    echo "healthcheck accepted a failed guest request" >&2
+    exit 1
+fi
 
 run_check \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=0 \

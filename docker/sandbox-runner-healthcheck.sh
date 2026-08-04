@@ -50,8 +50,8 @@ if [ "$clock_skew_limit_seconds" -gt 0 ] && [ "$clock_skew_jitter_seconds" -gt 0
     fi
 
     # Pods from one rollout have nearly identical ages and drift rates. Give
-    # each pod a stable threshold within the configured range so they recycle
-    # across different days instead of all restarting together.
+    # each pod a stable threshold within the configured range to reduce the
+    # chance that same-age replicas restart together.
     jitter_key="${HOSTNAME:-sandbox-runner}"
     jitter_checksum=$(printf '%s' "$jitter_key" | cksum)
     jitter_checksum="${jitter_checksum%% *}"
