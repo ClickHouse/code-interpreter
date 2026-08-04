@@ -15,6 +15,11 @@ if [[ "${TEST_CURL_FAIL:-false}" == "true" ]]; then
     exit 22
 fi
 
+if [[ -n "${TEST_EXPECTED_URL:-}" && "${!#}" != "$TEST_EXPECTED_URL" ]]; then
+    printf 'unexpected healthcheck URL: %s\n' "${!#}" >&2
+    exit 2
+fi
+
 printf 'HTTP/1.1 200 OK\r\n'
 if [[ -n "${TEST_GUEST_DATE:-}" ]]; then
     printf 'Date: %s\r\n' "$TEST_GUEST_DATE"
@@ -68,6 +73,7 @@ run_check() {
         TEST_HOST_AFTER_SECONDS=100 \
         TEST_HOST_SAMPLE_STATE="$TMP_DIR/host-sample" \
         TEST_GUEST_DATE='Tue, 04 Aug 2026 08:00:00 GMT' \
+        TEST_EXPECTED_URL='http://127.0.0.1:2000/api/v2/health' \
         "$@" \
         bash "$ROOT/docker/sandbox-runner-healthcheck.sh"
 }
