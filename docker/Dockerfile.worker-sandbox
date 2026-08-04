@@ -235,7 +235,8 @@ COPY --from=launcher-builder /launcher/target/release/sandbox-launcher /usr/loca
 # --- Launcher entrypoint (DNS resolution + socat relay before VM boot) ---
 COPY launcher/entrypoint.sh /usr/local/bin/launcher-entrypoint.sh
 COPY docker/start-direct-sandbox.sh /usr/local/bin/start-direct-sandbox.sh
-RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh
+COPY docker/sandbox-runner-healthcheck.sh /usr/local/bin/sandbox-runner-healthcheck.sh
+RUN chmod +x /usr/local/bin/launcher-entrypoint.sh /usr/local/bin/start-direct-sandbox.sh /usr/local/bin/sandbox-runner-healthcheck.sh
 
 # --- Worker ---
 WORKDIR /worker
@@ -253,7 +254,9 @@ WORKDIR /
 EXPOSE 2000 3113
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -f http://localhost:3113/health || exit 1
+  CMD /usr/local/bin/sandbox-runner-healthcheck.sh \
+    && curl -fsS --max-time 5 http://localhost:3113/health >/dev/null \
+    || exit 1
 
 CMD ["/supervisor.sh"]
 

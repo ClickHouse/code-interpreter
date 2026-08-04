@@ -27,6 +27,14 @@ Split runtime deployments:
 {{- if and (not $packagesFromPvc) (not .Values.workerSandbox.kvmEnabled) }}
 {{- fail "workerSandbox.packages.source=image requires workerSandbox.kvmEnabled=true because the baked runner boots from a libkrun block root image" }}
 {{- end }}
+{{- $clockSkewLimit := int .Values.workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds }}
+{{- $clockSkewJitter := int .Values.workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds }}
+{{- if or (lt $clockSkewLimit 0) (ge $clockSkewLimit 30) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be between 0 and 29 so it stays below the 30-second execution-manifest tolerance" }}
+{{- end }}
+{{- if or (lt $clockSkewJitter 0) (and (gt $clockSkewLimit 0) (ge $clockSkewJitter $clockSkewLimit)) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds must be non-negative and less than clockSkewLivenessLimitSeconds when the clock-skew guard is enabled" }}
+{{- end }}
 {{- range .Values.workerSandbox.sandboxExtraEnv }}
 {{- $name := .name | default "" }}
 {{- if and $name (or (regexMatch "(?i)(SECRET|TOKEN|PASSWORD|KEY)" $name) (hasPrefix "REDIS_" $name) (hasPrefix "AWS_" $name) (hasPrefix "S3_" $name) (hasPrefix "MINIO_" $name) (hasPrefix "CODEAPI_" $name) (eq $name "FILE_SERVER_URL") (eq $name "TOOL_CALL_SERVER_URL")) }}
@@ -258,6 +266,10 @@ spec:
               value: {{ .Values.workerSandbox.launcher.filterVsockEnotconn | quote }}
             - name: SANDBOX_RUNNER_FD_LIVENESS_LIMIT
               value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | quote }}
+            - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS
+              value: {{ .Values.workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds | quote }}
+            - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS
+              value: {{ .Values.workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds | quote }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL

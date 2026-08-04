@@ -221,7 +221,11 @@ services:
     deploy:
       replicas: 3  # Scale based on queue depth
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3113/health"]
+      test:
+        - CMD-SHELL
+        - >-
+          /usr/local/bin/sandbox-runner-healthcheck.sh &&
+          curl -fsS --max-time 5 http://localhost:3113/health >/dev/null
       interval: 10s
       timeout: 5s
       retries: 3

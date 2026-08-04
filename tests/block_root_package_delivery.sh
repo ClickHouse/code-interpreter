@@ -36,6 +36,23 @@ assert_not_contains() {
     fi
 }
 
+assert_env_value() {
+    local file="$1"
+    local name="$2"
+    local expected="$3"
+    local message="$4"
+    if ! awk -v name="$name" -v expected="$expected" '
+        $0 ~ "- name: " name {
+            getline
+            if ($0 ~ "value: \\\"" expected "\\\"") found = 1
+        }
+        END { exit found ? 0 : 1 }
+    ' "$file"; then
+        echo "$message" >&2
+        exit 1
+    fi
+}
+
 assert_compose_mode() {
     local compose_file="$1"
     local service="$2"
@@ -139,6 +156,10 @@ assert_contains \
     "$ROOT/docker/Dockerfile.worker-sandbox" \
     '^FROM worker-sandbox-legacy AS worker-sandbox-false$' \
     "worker-sandbox-false must inherit the direct target"
+assert_contains \
+    "$ROOT/docker/Dockerfile.worker-sandbox" \
+    'sandbox-runner-healthcheck.sh' \
+    "the combined worker image must check guest clock skew"
 
 awk '
     /^FROM / {
@@ -196,6 +217,16 @@ assert_not_contains \
     "$TMP_DIR/helm-image.yaml" \
     'app.kubernetes.io/component: package-init' \
     "default Helm render must not create package-init"
+assert_env_value \
+    "$TMP_DIR/helm-image.yaml" \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS \
+    10 \
+    "default Helm render must keep clock skew below the manifest tolerance"
+assert_env_value \
+    "$TMP_DIR/helm-image.yaml" \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS \
+    2 \
+    "default Helm render must stagger clock-skew recycling across replicas"
 
 helm template codeapi "$TMP_DIR/chart" \
     --set executionManifest.privateKey=test \
@@ -242,6 +273,46 @@ assert_contains \
     "$TMP_DIR/helm-no-fd-liveness.yaml" \
     'value: "0"' \
     "fdLivenessLimit=0 must reach the healthcheck instead of reverting to 40000"
+
+helm template codeapi "$TMP_DIR/chart" \
+    --set executionManifest.privateKey=test \
+    --set executionManifest.publicKey=test \
+    --set workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds=0 \
+    > "$TMP_DIR/helm-no-clock-skew-liveness.yaml"
+
+assert_env_value \
+    "$TMP_DIR/helm-no-clock-skew-liveness.yaml" \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS \
+    0 \
+    "clockSkewLivenessLimitSeconds=0 must reach the healthcheck instead of reverting to 10"
+
+if helm template codeapi "$TMP_DIR/chart" \
+    --set executionManifest.privateKey=test \
+    --set executionManifest.publicKey=test \
+    --set workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds=30 \
+    > "$TMP_DIR/invalid-clock-skew-limit.yaml" 2> "$TMP_DIR/invalid-clock-skew-limit.log"; then
+    echo "clock-skew liveness limit must stay below manifest tolerance" >&2
+    exit 1
+fi
+
+assert_contains \
+    "$TMP_DIR/invalid-clock-skew-limit.log" \
+    'clockSkewLivenessLimitSeconds must be between 0 and 29' \
+    "clock-skew limit validation failed for an unexpected reason"
+
+if helm template codeapi "$TMP_DIR/chart" \
+    --set executionManifest.privateKey=test \
+    --set executionManifest.publicKey=test \
+    --set workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds=10 \
+    > "$TMP_DIR/invalid-clock-skew-jitter.yaml" 2> "$TMP_DIR/invalid-clock-skew-jitter.log"; then
+    echo "clock-skew liveness jitter must stay below the configured limit" >&2
+    exit 1
+fi
+
+assert_contains \
+    "$TMP_DIR/invalid-clock-skew-jitter.log" \
+    'clockSkewLivenessJitterSeconds must be non-negative and less than clockSkewLivenessLimitSeconds' \
+    "clock-skew jitter validation failed for an unexpected reason"
 
 if helm template codeapi "$TMP_DIR/chart" \
     --set executionManifest.privateKey=test \
