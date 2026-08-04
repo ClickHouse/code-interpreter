@@ -150,6 +150,12 @@ run_check \
     TEST_GUEST_DATE= \
     TEST_GUEST_SECONDS=100
 
+# Compose and standalone Docker callers only observe health status, so the
+# clock-skew guard stays disabled unless an orchestrator explicitly opts in.
+run_check \
+    TEST_GUEST_DATE= \
+    TEST_GUEST_SECONDS=100
+
 if run_check \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=invalid \
     TEST_GUEST_SECONDS=100 2> "$TMP_DIR/invalid.log"; then

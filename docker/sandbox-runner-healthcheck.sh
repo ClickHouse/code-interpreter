@@ -2,7 +2,7 @@
 set -euo pipefail
 
 fd_limit="${SANDBOX_RUNNER_FD_LIVENESS_LIMIT:-40000}"
-clock_skew_limit_seconds="${SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS:-10}"
+clock_skew_limit_seconds="${SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS:-0}"
 clock_skew_jitter_seconds="${SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS:-2}"
 timeout_seconds="${SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS:-5}"
 manifest_clock_tolerance_seconds=30
