@@ -160,6 +160,14 @@ assert_contains \
     "$ROOT/docker/Dockerfile.worker-sandbox" \
     'sandbox-runner-healthcheck.sh' \
     "the combined worker image must check guest clock skew"
+assert_contains \
+    "$ROOT/docker/Dockerfile.worker-sandbox" \
+    '^HEALTHCHECK --interval=30s --timeout=12s ' \
+    "the combined healthcheck timeout must cover both sequential probes"
+assert_contains \
+    "$ROOT/docker-compose.scalable.yml" \
+    '^[[:space:]]+timeout: 12s$' \
+    "the scalable Compose healthcheck timeout must cover both sequential probes"
 
 awk '
     /^FROM / {
@@ -303,6 +311,20 @@ assert_contains \
 if helm template codeapi "$TMP_DIR/chart" \
     --set executionManifest.privateKey=test \
     --set executionManifest.publicKey=test \
+    --set workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds=29.5 \
+    > "$TMP_DIR/fractional-clock-skew-limit.yaml" 2> "$TMP_DIR/fractional-clock-skew-limit.log"; then
+    echo "clock-skew liveness limit must reject fractional values" >&2
+    exit 1
+fi
+
+assert_contains \
+    "$TMP_DIR/fractional-clock-skew-limit.log" \
+    'clockSkewLivenessLimitSeconds must be a non-negative integer' \
+    "fractional clock-skew limit validation failed for an unexpected reason"
+
+if helm template codeapi "$TMP_DIR/chart" \
+    --set executionManifest.privateKey=test \
+    --set executionManifest.publicKey=test \
     --set workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds=10 \
     > "$TMP_DIR/invalid-clock-skew-jitter.yaml" 2> "$TMP_DIR/invalid-clock-skew-jitter.log"; then
     echo "clock-skew liveness jitter must stay below the configured limit" >&2
@@ -313,6 +335,20 @@ assert_contains \
     "$TMP_DIR/invalid-clock-skew-jitter.log" \
     'clockSkewLivenessJitterSeconds must be non-negative and less than clockSkewLivenessLimitSeconds' \
     "clock-skew jitter validation failed for an unexpected reason"
+
+if helm template codeapi "$TMP_DIR/chart" \
+    --set executionManifest.privateKey=test \
+    --set executionManifest.publicKey=test \
+    --set workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds=1.5 \
+    > "$TMP_DIR/fractional-clock-skew-jitter.yaml" 2> "$TMP_DIR/fractional-clock-skew-jitter.log"; then
+    echo "clock-skew liveness jitter must reject fractional values" >&2
+    exit 1
+fi
+
+assert_contains \
+    "$TMP_DIR/fractional-clock-skew-jitter.log" \
+    'clockSkewLivenessJitterSeconds must be a non-negative integer' \
+    "fractional clock-skew jitter validation failed for an unexpected reason"
 
 if helm template codeapi "$TMP_DIR/chart" \
     --set executionManifest.privateKey=test \
