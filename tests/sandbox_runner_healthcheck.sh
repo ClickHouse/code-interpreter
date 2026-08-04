@@ -165,6 +165,22 @@ fi
 grep -F 'invalid SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS: invalid' "$TMP_DIR/invalid.log" >/dev/null
 
 if run_check \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=08 \
+    TEST_GUEST_SECONDS=100 2> "$TMP_DIR/leading-zero.log"; then
+    echo "healthcheck accepted a non-canonical clock-skew limit" >&2
+    exit 1
+fi
+grep -F 'expected a canonical non-negative integer' "$TMP_DIR/leading-zero.log" >/dev/null
+
+if run_check \
+    SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=9223372036854775807 \
+    TEST_GUEST_SECONDS=100 2> "$TMP_DIR/overflow-limit.log"; then
+    echo "healthcheck accepted a clock-skew limit that could overflow arithmetic" >&2
+    exit 1
+fi
+grep -F 'plus SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be less than the 30-second execution-manifest tolerance' "$TMP_DIR/overflow-limit.log" >/dev/null
+
+if run_check \
     SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS=25 \
     TEST_GUEST_SECONDS=100 2> "$TMP_DIR/unsafe-limit.log"; then
     echo "healthcheck accepted a limit without request-latency headroom" >&2

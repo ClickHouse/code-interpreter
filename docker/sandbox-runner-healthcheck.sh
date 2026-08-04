@@ -14,8 +14,9 @@ validate_non_negative_integer() {
     local value="$2"
 
     case "$value" in
-        ''|*[!0-9]*)
-            echo "invalid ${name}: ${value}" >&2
+        0|[1-9]|[1-9][0-9]*) ;;
+        *)
+            echo "invalid ${name}: ${value} (expected a canonical non-negative integer)" >&2
             exit 2
             ;;
     esac
@@ -37,10 +38,19 @@ if [ "$timeout_seconds" -eq 0 ]; then
     exit 2
 fi
 
-if [ "$clock_skew_limit_seconds" -gt 0 ] && \
-    [ $((clock_skew_limit_seconds + timeout_seconds)) -ge "$manifest_clock_tolerance_seconds" ]; then
-    echo "SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS plus SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be less than the ${manifest_clock_tolerance_seconds}-second execution-manifest tolerance" >&2
-    exit 2
+if [ "$clock_skew_limit_seconds" -gt 0 ]; then
+    if [ "${#clock_skew_limit_seconds}" -gt 2 ] || \
+        [ "$clock_skew_limit_seconds" -ge "$manifest_clock_tolerance_seconds" ]; then
+        echo "SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS plus SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be less than the ${manifest_clock_tolerance_seconds}-second execution-manifest tolerance" >&2
+        exit 2
+    fi
+
+    remaining_tolerance_seconds=$((manifest_clock_tolerance_seconds - clock_skew_limit_seconds))
+    if [ "${#timeout_seconds}" -gt 2 ] || \
+        [ "$timeout_seconds" -ge "$remaining_tolerance_seconds" ]; then
+        echo "SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS plus SANDBOX_RUNNER_HEALTHCHECK_TIMEOUT_SECONDS must be less than the ${manifest_clock_tolerance_seconds}-second execution-manifest tolerance" >&2
+        exit 2
+    fi
 fi
 
 if [ "$clock_skew_limit_seconds" -gt 0 ] && ! command -v date >/dev/null 2>&1; then
@@ -50,7 +60,8 @@ fi
 
 effective_clock_skew_limit_seconds="$clock_skew_limit_seconds"
 if [ "$clock_skew_limit_seconds" -gt 0 ] && [ "$clock_skew_jitter_seconds" -gt 0 ]; then
-    if [ "$clock_skew_jitter_seconds" -ge "$clock_skew_limit_seconds" ]; then
+    if [ "${#clock_skew_jitter_seconds}" -gt 2 ] || \
+        [ "$clock_skew_jitter_seconds" -ge "$clock_skew_limit_seconds" ]; then
         echo "SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS must be less than SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS" >&2
         exit 2
     fi
