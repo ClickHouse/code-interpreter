@@ -65,6 +65,12 @@ export const config = {
   run_memory_limit: Number(process.env.SANDBOX_RUN_MEMORY_LIMIT ?? -1),
   max_concurrent_jobs: safeInt(process.env.SANDBOX_MAX_CONCURRENT_JOBS, 8),
   per_job_uids: (process.env.SANDBOX_PER_JOB_UIDS ?? 'true') === 'true',
+  /* Image-level enable for persistent session workspaces (stateful sessions).
+   * Only the Lambda MicroVM runner target sets this true; the K8s
+   * sandbox-runner image leaves it false so it is structurally incapable of
+   * session mode. An enabled runner additionally binds each request to a
+   * workspace through the authenticated X-Runtime-Session-Id header. */
+  session_workspace_enabled: (process.env.SANDBOX_SESSION_WORKSPACE_ENABLED ?? 'false') === 'true',
   job_uid_base: safeInt(process.env.SANDBOX_JOB_UID_BASE, 200000),
   job_gid_base: safeInt(process.env.SANDBOX_JOB_GID_BASE, 200000),
   job_uid_count: safeInt(
@@ -77,6 +83,25 @@ export const config = {
   nsjail_path: process.env.NSJAIL_PATH ?? '/usr/sbin/nsjail',
   nsjail_config: process.env.NSJAIL_CONFIG ?? '/sandbox_api/config/sandbox.cfg',
   execute_body_limit: process.env.SANDBOX_EXECUTE_BODY_LIMIT ?? '50mb',
+  /* Independent runner-side ceiling for streamed checkpoint restores. The
+   * control plane enforces the same default, but the receiver must not trust a
+   * caller-supplied Content-Length or upstream enforcement. */
+  checkpoint_max_bytes: safeInt(
+    process.env.SANDBOX_CHECKPOINT_MAX_BYTES,
+    512 * 1024 * 1024,
+  ),
+  /* Ceiling for the pushed input cache (session-inputs.ts). Eviction is
+   * always safe — a miss simply re-pushes on the next probe — so this is a
+   * disk guard, not a correctness knob. */
+  input_cache_max_bytes: safeInt(
+    process.env.SANDBOX_INPUT_CACHE_MAX_BYTES,
+    512 * 1024 * 1024,
+  ),
+  /* Bound both validation cost and per-request priming fan-out. The cache's
+   * unique-object cap is not enough because one object may be requested at
+   * many destinations. */
+  max_input_files: safeInt(process.env.SANDBOX_MAX_INPUT_FILES, 256),
+  prime_concurrency: safeInt(process.env.SANDBOX_PRIME_CONCURRENCY, 8),
   egress_gateway_url: egressGatewayUrl,
   file_server_url: process.env.FILE_SERVER_URL ?? '',
   max_nesting_depth: safeInt(process.env.SANDBOX_MAX_NESTING_DEPTH, 10),

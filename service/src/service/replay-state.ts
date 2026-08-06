@@ -31,7 +31,12 @@ import type * as t from '../types';
 import type { LCTool } from '../preamble';
 import { connection } from '../queue';
 import { env } from '../config';
-import { hashTag, scanKeys, stripHashTag } from '../redis-connection';
+import {
+    hashTag,
+    scanKeys,
+    stripHashTag,
+    type RedisClient,
+} from '../redis-connection';
 import { internalServiceHeaders } from '../internal-service-auth';
 import logger from '../logger';
 import {
@@ -234,7 +239,7 @@ export class ExecutionStateTooLargeError extends Error {
  * Lua runner, but its Lua coverage is a subset of real Redis (notably
  * partial `redis.call` arg parsing); the integration suite still runs
  * against a real Redis container so any divergence surfaces there. */
-type RedisWithScripts = Redis & {
+type RedisWithScripts = RedisClient & {
     releaseExecutionLockScript(lockKey: string, token: string): Promise<number>;
     setExecutionResultScript(
         stateKey: string,
@@ -252,8 +257,8 @@ type RedisWithScripts = Redis & {
 
 const SCRIPTS_REGISTERED = Symbol.for('replay-state.scriptsRegistered');
 
-function registerScripts(client: Redis): RedisWithScripts {
-    const tagged = client as Redis & { [SCRIPTS_REGISTERED]?: true };
+function registerScripts(client: RedisClient): RedisWithScripts {
+    const tagged = client as RedisClient & { [SCRIPTS_REGISTERED]?: true };
     if (tagged[SCRIPTS_REGISTERED]) return client as RedisWithScripts;
     client.defineCommand('releaseExecutionLockScript', {
         numberOfKeys: 1,

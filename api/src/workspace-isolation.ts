@@ -5,6 +5,7 @@ import * as path from 'path';
 import type { Dirent } from 'fs';
 import { config } from './config';
 import { logger } from './logger';
+import { SANDBOX_DIR_MODE } from './validation';
 
 export const SANDBOX_WORKSPACE_ROOT = '/tmp/sandbox';
 /* NsJail's bind-mount setup needs execute permission on the source path and
@@ -16,6 +17,12 @@ export const SANDBOX_READONLY_FILE_MODE = 0o444;
 export const SANDBOX_INSIDE_UID = 65534;
 export const SANDBOX_INSIDE_GID = 65534;
 export const WORKSPACE_ID_PREFIX = 'ws_';
+/* Fixed id for the single persistent session workspace (stateful mode). One
+ * per runner process — a session VM runs exactly one runtime session, whose
+ * executions serialize on the control-plane lock. Distinct from the random
+ * `ws_` per-job ids and kept in `activeWorkspaceIds` so the reaper never
+ * removes it mid-session. */
+export const SESSION_WORKSPACE_ID = 'session';
 const RETAINED_WORKSPACE_RETRY_MS = 5_000;
 
 export class SandboxWorkspaceIsolationError extends Error {
@@ -360,6 +367,51 @@ export async function createSandboxWorkspace(
   throw new SandboxWorkspaceIsolationError('Unable to allocate a unique sandbox workspace ID');
 }
 
+/**
+ * Idempotently ensures the single persistent session workspace exists and is
+ * owned by `identity`. Unlike `createSandboxWorkspace`, the directory is
+ * stable (`SESSION_WORKSPACE_ID`) and its contents are preserved across calls
+ * — reused by every execution in a stateful session. Registered in
+ * `activeWorkspaceIds` so the stale-workspace reaper skips it.
+ */
+export async function ensureSessionWorkspace(
+  identity: SandboxJobIdentity,
+  root = SANDBOX_WORKSPACE_ROOT,
+): Promise<SandboxWorkspaceLease> {
+  if (identity.perJobUid) assertWorkspaceOwnershipCapability();
+  await prepareWorkspaceRoot(root);
+  const dir = path.join(root, SESSION_WORKSPACE_ID);
+  try {
+    await fsp.mkdir(dir, { mode: SANDBOX_WORKSPACE_MODE });
+    await applySandboxPathPermissions(dir, identity, SANDBOX_WORKSPACE_MODE);
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') {
+      try { await fsp.rm(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      throw error;
+    }
+    /* Already present from a prior job in this session — keep contents,
+     * only (re)assert ownership so the pinned identity can read/write. */
+    await applySandboxPathPermissions(dir, identity, SANDBOX_WORKSPACE_MODE);
+  }
+  activeWorkspaceIds.add(SESSION_WORKSPACE_ID);
+  return { workspaceId: SESSION_WORKSPACE_ID, dir, identity };
+}
+
+/** Tears down the persistent session workspace (session reset / VM terminate). */
+export async function resetSessionWorkspace(root = SANDBOX_WORKSPACE_ROOT): Promise<boolean> {
+  const dir = path.join(root, SESSION_WORKSPACE_ID);
+  try {
+    await fsp.rm(dir, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    logger.error({ dir, err: error }, 'Failed to reset session workspace');
+    await quarantineWorkspace(dir);
+    return false;
+  } finally {
+    activeWorkspaceIds.delete(SESSION_WORKSPACE_ID);
+  }
+}
+
 async function quarantineWorkspace(dir: string): Promise<void> {
   try {
     const st = await fsp.lstat(dir);
@@ -529,4 +581,59 @@ export function fallbackSandboxIdentity(): SandboxJobIdentity {
     gid: SANDBOX_INSIDE_GID,
     perJobUid: false,
   };
+}
+
+/**
+ * Creates every directory from `root` (exclusive) to `target` (inclusive) one
+ * component at a time, refusing to descend through a symlink.
+ * `fsp.mkdir(dir, { recursive: true })` would instead follow a symlinked
+ * ancestor a prior session turn planted and create directories OUTSIDE the
+ * workspace as root — so any privileged write into a PERSISTENT session
+ * workspace (input priming, pushed file delivery) must build the path with
+ * no-follow semantics first. Fresh per-job workspaces can never contain such a
+ * link, so callers may skip it there.
+ *
+ * Pass `identity` to give directories this call creates the sandbox dir mode
+ * and ownership; without it they inherit the runner's (root) ownership, which
+ * would leave the sandbox UID unable to write inside them.
+ */
+export async function ensureDirNoFollow(
+  root: string,
+  target: string,
+  identity?: SandboxJobIdentity,
+): Promise<void> {
+  const rel = path.relative(root, target);
+  if (!rel || rel === '.') return;
+  if (rel === '..' || rel.startsWith('..' + path.sep)) {
+    throw new SandboxWorkspaceIsolationError(`Workspace path escapes the sandbox: ${target}`);
+  }
+  let cursor = root;
+  for (const part of rel.split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, part);
+    const st = await fsp.lstat(cursor).catch(() => null);
+    if (st == null) {
+      /* Parent is already validated as a real dir; create just this component
+       * (non-recursive, so it can't follow a link). Tolerate a concurrent
+       * sibling prime having just created it. */
+      let created = true;
+      await fsp.mkdir(cursor).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== 'EEXIST') throw err;
+        created = false;
+      });
+      if (created && identity) {
+        await applySandboxPathPermissions(cursor, identity, SANDBOX_DIR_MODE);
+      }
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new SandboxWorkspaceIsolationError(
+        `Refusing to write through symlinked workspace path: ${path.relative(root, cursor)}`,
+      );
+    }
+    if (!st.isDirectory()) {
+      throw new SandboxWorkspaceIsolationError(
+        `Workspace ancestor is not a directory: ${path.relative(root, cursor)}`,
+      );
+    }
+  }
 }

@@ -121,8 +121,8 @@ COPY --from=node:22-slim /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /sandbox_api
 
-COPY api/package.json ./
-RUN bun install
+COPY api/package.json api/bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY api/tsconfig.json ./
 COPY api/src ./src
@@ -149,6 +149,27 @@ COPY api/src/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
 
 # ============================================================================
+# Stage 2b: AWS Lambda MicroVM container base image
+#
+# Lambda MicroVM IS the VM boundary: no libkrun launcher, no guest kernel.
+# This target is pushed to a same-account ECR repo and referenced by the
+# FROM line of the code-artifact Dockerfile that Lambda builds on top of
+# the AL2023 MicroVM base image (see scripts/build-lambda-microvm-artifact.sh).
+# Inbound traffic defaults to port 8080; lifecycle/build hooks are served
+# by the same app at /aws/lambda-microvms/runtime/v1/*.
+# ============================================================================
+FROM sandbox-build AS lambda-microvm-runner
+
+COPY --from=package-builder /pkgs /pkgs
+
+ENV PORT=8080 \
+    SANDBOX_PACKAGES_DIRECTORY=/pkgs \
+    SANDBOX_SESSION_WORKSPACE_ENABLED=true
+
+EXPOSE 8080/tcp
+ENTRYPOINT ["/sandbox_api/entrypoint.sh"]
+
+# ============================================================================
 # Stage 3: Build the Rust launcher binary (Fedora for libkrun ABI)
 # ============================================================================
 FROM fedora:43 AS launcher-builder
@@ -170,10 +191,12 @@ RUN cargo build --release
 #
 # Split into:
 #   - sandbox-runner-base : everything except the guest rootfs copy
-#   - sandbox-runner      : default target; copies rootfs without packages
-#                           (packages come from a runtime PVC mount)
+#   - sandbox-runner      : legacy/direct target; copies rootfs without
+#                           packages (packages come from a runtime PVC mount)
 #   - sandbox-runner-baked: copies rootfs AND bakes /pkgs from package-builder
 #                           (no PVC needed; runner can spread across nodes)
+#   - sandbox-runner-{true,false}: Compose aliases selected by KVM_ENABLED
+#   - sandbox-runner-default: final alias for the safe baked KVM image
 # ============================================================================
 FROM fedora:43 AS sandbox-runner-base
 
@@ -232,3 +255,12 @@ COPY --from=sandbox-build / /sandbox-rootfs/
 RUN sed -i '/^cgroup_mem_swap_max/d' /sandbox-rootfs/sandbox_api/config/sandbox.cfg
 
 RUN mkdir -p /host-packages
+
+# Compose derives these aliases from KVM_ENABLED so existing no-KVM overrides
+# keep selecting the directory-root image automatically.
+FROM sandbox-runner-baked AS sandbox-runner-true
+FROM sandbox-runner AS sandbox-runner-false
+
+# Keep the safe KVM image as the Dockerfile default. Direct NsJail and legacy
+# virtio-fs deployments can still select --target sandbox-runner explicitly.
+FROM sandbox-runner-true AS sandbox-runner-default

@@ -120,6 +120,9 @@ workerSandbox:
         pullPolicy: IfNotPresent
 
     sandboxImage:
+        # With packages.source=image, build the api/Dockerfile default (or
+        # sandbox-runner-baked). With source=pvc/direct mode, build
+        # --target sandbox-runner under the same configured repository/tag.
         repository: codeapi-sandbox-runner
         tag: latest
         pullPolicy: IfNotPresent
@@ -241,9 +244,18 @@ workerSandbox:
         jobUidCount: null
         workspaceReaperMaxAgeSeconds: 3600
 
-    # Language runtime packages (mount from host or PVC)
+    # Language runtime package delivery
     packages:
-        # Use a PVC for packages
+        # image (default): boot a baked /pkgs tree from a read-only ext4 block root.
+        # This avoids long-lived virtio-fs inode handles exhausting the launcher FD
+        # limit. Requires kvmEnabled=true and sandboxImage built from the
+        # sandbox-runner-baked target (the api/Dockerfile default).
+        #
+        # pvc: legacy compatibility mode. Mount a host/PVC package tree through
+        # virtio-fs and recycle runners with the FD liveness guard before exhaustion.
+        source: image
+
+        # Used only when source=pvc.
         persistence:
             enabled: true
             size: 10Gi
@@ -252,7 +264,7 @@ workerSandbox:
             # If you have pre-built packages, specify the existing claim
             existingClaim: ''
 
-        # Init job to populate packages on first install
+        # Used only when source=pvc. Populates packages on first install.
         # Runs as a Helm pre-install/pre-upgrade hook
         # Compiles Python from source and downloads Node/Bun binaries
         initJob:

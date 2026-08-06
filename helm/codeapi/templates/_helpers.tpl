@@ -172,6 +172,14 @@ Redis port
 {{- define "codeapi.redis.port" -}}
 {{- if .Values.redis.enabled }}
 {{- "6379" }}
+{{- else if and .Values.redis.cluster.enabled .Values.redis.cluster.nodes }}
+{{- $firstNode := .Values.redis.cluster.nodes | splitList "," | first }}
+{{- $parts := $firstNode | splitList ":" }}
+{{- if gt (len $parts) 1 }}
+{{- index $parts 1 }}
+{{- else }}
+{{- "6379" }}
+{{- end }}
 {{- else }}
 {{- .Values.redis.external.port | default "6379" }}
 {{- end }}

@@ -124,6 +124,7 @@ services:
         build:
           context: .
           dockerfile: api/Dockerfile
+          target: sandbox-runner-${KVM_ENABLED:-true}
         container_name: sandbox-runner
         restart: always
         privileged: false
@@ -135,6 +136,9 @@ services:
             - ${SANDBOX_PACKAGES_PATH:-./data/pkgs}:/host-packages:ro
         environment:
             - KVM_ENABLED=${KVM_ENABLED:-true}
+            # The direct path uses /host-packages itself. The KVM path must not
+            # hand that directory to libkrun as a long-lived virtio-fs share.
+            - LAUNCHER_PACKAGES_HOST=/disabled-host-packages
             - CODEAPI_HARDENED_SANDBOX_MODE=${CODEAPI_HARDENED_SANDBOX_MODE:-true}
             - EGRESS_GATEWAY_URL=http://egress_gateway:3190
             - SANDBOX_EXECUTE_BODY_LIMIT=${SANDBOX_EXECUTE_BODY_LIMIT:-50mb}
@@ -161,7 +165,7 @@ services:
             egress_gateway:
                 condition: service_healthy
         healthcheck:
-            test: ["CMD-SHELL", "curl -fsS http://localhost:2000/api/v2/runtimes >/dev/null || exit 1"]
+            test: ["CMD", "/usr/local/bin/sandbox-runner-healthcheck.sh"]
             interval: 5s
             timeout: 3s
             retries: 60

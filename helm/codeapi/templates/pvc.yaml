@@ -12,7 +12,7 @@ If using the initJob to populate packages:
 - The init job writes packages to the PVC
 - Worker pods then mount the PVC (read-only at container level)
 */}}
-{{- if and .Values.workerSandbox.enabled .Values.workerSandbox.packages.persistence.enabled (not .Values.workerSandbox.packages.persistence.existingClaim) }}
+{{- if and .Values.workerSandbox.enabled (eq (.Values.workerSandbox.packages.source | default "image") "pvc") .Values.workerSandbox.packages.persistence.enabled (not .Values.workerSandbox.packages.persistence.existingClaim) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

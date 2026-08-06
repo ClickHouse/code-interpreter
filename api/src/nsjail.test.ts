@@ -187,6 +187,119 @@ exit 0
       await fsp.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  test('stderr overflow truncates with an in-band marker instead of killing the job', async () => {
+    const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'nsjail-stderr-overflow-'));
+    const fakeNsJail = path.join(tmp, 'fake-nsjail.sh');
+    const cfg = path.join(tmp, 'sandbox.cfg');
+    const submissionDir = path.join(tmp, 'submission');
+    await fsp.mkdir(submissionDir);
+    await fsp.writeFile(cfg, '');
+    await fsp.writeFile(
+      fakeNsJail,
+      `#!/bin/sh
+log_path=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--log" ]; then
+    shift
+    log_path="$1"
+  fi
+  shift || break
+done
+if [ -n "$log_path" ]; then
+  printf '[I][test] Executing "/bin/bash" for noisy child\\n' > "$log_path"
+fi
+head -c 3000 /dev/zero | tr '\\0' 'e' 1>&2
+printf 'survived the noise\\n'
+exit 0
+`,
+      { mode: 0o755 },
+    );
+
+    const originalNsJailPath = config.nsjail_path;
+    const originalNsJailConfig = config.nsjail_config;
+    config.nsjail_path = fakeNsJail;
+    config.nsjail_config = cfg;
+    try {
+      const result = await execute({
+        command: ['/bin/bash', '/pkgs/bash/5.2.0/run', 'main.sh'],
+        envVars: {},
+        submissionDir,
+        pkgdir: '/pkgs/bash/5.2.0',
+        timeout: 5000,
+        memoryLimit: -1,
+        outputMaxSize: 1024,
+        identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.stdout).toBe('survived the noise\n');
+      expect(result.message).toBe('stderr truncated at 1024 bytes');
+      expect(result.stderr.endsWith('\n[sandbox] stderr truncated at 1024 bytes\n')).toBe(true);
+      expect(result.stderr.length).toBeLessThanOrEqual(
+        1024 + '\n[sandbox] stderr truncated at 1024 bytes\n'.length,
+      );
+    } finally {
+      config.nsjail_path = originalNsJailPath;
+      config.nsjail_config = originalNsJailConfig;
+      await fsp.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('kill reasons surface as an in-band [sandbox] marker on stderr', async () => {
+    const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'nsjail-kill-marker-'));
+    const fakeNsJail = path.join(tmp, 'fake-nsjail.sh');
+    const cfg = path.join(tmp, 'sandbox.cfg');
+    const submissionDir = path.join(tmp, 'submission');
+    await fsp.mkdir(submissionDir);
+    await fsp.writeFile(cfg, '');
+    await fsp.writeFile(
+      fakeNsJail,
+      `#!/bin/sh
+log_path=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--log" ]; then
+    shift
+    log_path="$1"
+  fi
+  shift || break
+done
+if [ -n "$log_path" ]; then
+  printf '[I][test] Executing "/bin/bash" for slow child\\n' > "$log_path"
+  printf '[W][test] run time >= time limit\\n' >> "$log_path"
+fi
+exit 137
+`,
+      { mode: 0o755 },
+    );
+
+    const originalNsJailPath = config.nsjail_path;
+    const originalNsJailConfig = config.nsjail_config;
+    config.nsjail_path = fakeNsJail;
+    config.nsjail_config = cfg;
+    try {
+      const result = await execute({
+        command: ['/bin/bash', '/pkgs/bash/5.2.0/run', 'main.sh'],
+        envVars: {},
+        submissionDir,
+        pkgdir: '/pkgs/bash/5.2.0',
+        timeout: 5000,
+        memoryLimit: -1,
+        outputMaxSize: 1024,
+        identity: { slot: 0, uid: 65534, gid: 65534, perJobUid: false },
+      });
+
+      expect(result.status).toBe('TO');
+      expect(result.message).toBe('Time limit exceeded');
+      expect(result.stderr.endsWith('\n[sandbox] Time limit exceeded\n')).toBe(true);
+      expect(result.output.endsWith('\n[sandbox] Time limit exceeded\n')).toBe(true);
+    } finally {
+      config.nsjail_path = originalNsJailPath;
+      config.nsjail_config = originalNsJailConfig;
+      await fsp.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('renderJobConfigOverlay', () => {

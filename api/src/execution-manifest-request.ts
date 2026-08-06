@@ -48,6 +48,21 @@ function assertManifestBodyHashMatches(
   options: ManifestBodyHashOptions = {},
 ): void {
   if (!manifest.execute_body_sha256) {
+    /* input_cache_key selects runner-local bytes and is deliberately absent
+     * from the coarse input-file claim tuple. It is therefore safe only when
+     * the whole execute body is signed; never admit it through the rolling
+     * legacy no-body-hash grace. */
+    const hasInputCacheSelector = Array.isArray(body.files) && body.files.some(
+      file => file != null
+        && typeof file === 'object'
+        && typeof (file as TFile).input_cache_key === 'string',
+    );
+    if (hasInputCacheSelector) {
+      throw new ExecutionManifestError(
+        'scope_mismatch',
+        'Execution manifest body hash is required for input cache selectors',
+      );
+    }
     const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000);
     /* Updated sandbox pods can receive still-valid manifests from older
      * service workers during a rolling deploy. Keep that compatibility window

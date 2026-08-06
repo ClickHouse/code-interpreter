@@ -888,16 +888,26 @@ app.delete('/sessions/:session_id/objects/:fileId', async (req, res) => {
     }
 });
 
-const port = process.env.FILE_SERVER_PORT ?? 3000;
+const port = Number(process.env.FILE_SERVER_PORT ?? 3000);
+/** Optional bind address. Deployments where only the co-located service-api
+ *  should reach the file server (push-model sandbox backends fetch input
+ *  bytes server-side) set this to 127.0.0.1 so the object routes are never
+ *  network-exposed. Unset preserves the historical all-interfaces bind. */
+const host = process.env.FILE_SERVER_HOST;
 let server: ReturnType<typeof app.listen> | undefined;
 let shuttingDown = false;
 
 async function startServer(): Promise<void> {
     try {
         await initializeStorage();
-        server = app.listen(port, () => {
-            logger.info(`[${INSTANCE_ID}] Server running on port ${port}`);
-        });
+        const onListen = () => {
+            logger.info(
+                `[${INSTANCE_ID}] Server running on ${host ?? '*'}:${port}`,
+            );
+        };
+        server = host
+            ? app.listen(port, host, onListen)
+            : app.listen(port, onListen);
     } catch (err) {
         logger.error('Critical: Could not initialize storage', { error: err });
         process.exit(1);

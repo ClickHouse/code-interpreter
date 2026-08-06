@@ -12,7 +12,9 @@ Code Interpreter (internally `codeapi`, the prefix used by its env vars, images,
 - **Worker Sandbox** - Executes code in NsJail (or libkrun microVM) sandboxes with resource limits
 - **File Server** - Manages file uploads/downloads via S3 (IRSA authentication)
 - **Tool Call Server** - Handles programmatic tool calls from within sandbox sessions
-- **Package Init** - One-time job that pre-installs language runtimes (Python, Node, Bun) onto a shared PVC
+- **Package Delivery** - Bakes Python, Node, and Bun into the default microVM
+  block-root image; a package-init PVC mode remains available for direct NsJail
+  development
 
 ## Architecture
 
@@ -55,6 +57,15 @@ public issue (see [CONTRIBUTING](CONTRIBUTING.md)).
 ```bash
 docker-compose up --build
 ```
+
+The default KVM Compose path builds `sandbox-runner-baked`: the guest root and
+`/pkgs` tree live in a read-only ext4 block image instead of a long-lived
+virtio-fs mount. The first image build takes longer because it compiles the
+language runtimes, but package-heavy workloads do not accumulate host file
+descriptors in the launcher.
+
+Setting `KVM_ENABLED=false` still selects the directory-root target and the
+host package mount automatically for direct NsJail development.
 
 Local Docker Compose files set `CODEAPI_INTERNAL_SERVICE_TOKEN` to a shared
 development value by default. Production deployments must override it with a

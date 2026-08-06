@@ -129,6 +129,124 @@ describe('sandbox error formatting', () => {
     });
   });
 
+  test('maps a busy runtime session (strict mode) to 409', () => {
+    const err = new Error('RUNTIME_SESSION_BUSY: Runtime session rt_abc is busy');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 409,
+      body: { error: 'runtime_session_busy', message: 'Runtime session is busy' },
+    });
+  });
+
+  test('maps MicroVM launch failures to 503', () => {
+    const err = new Error('MICROVM_LAUNCH_FAILED: MicroVM did not reach RUNNING within 60000ms');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 503,
+      body: { error: 'microvm_launch_failed', message: 'Sandbox launch failed' },
+    });
+  });
+
+  test('maps a recycled dirty session to a retryable public failure', () => {
+    const failure = publicExecutionFailure(
+      new Error('MICROVM_UNHEALTHY: Runtime session rt_private workspace was dirty and has been recycled'),
+    );
+    expect(failure).toEqual({
+      status: 503,
+      body: {
+        error: 'microvm_unhealthy',
+        message: 'Sandbox runtime is unavailable',
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain('rt_private');
+  });
+
+  test('maps oversized input delivery to 413', () => {
+    const err = new Error('SESSION_INPUT_TOO_LARGE: Session inputs exceed the 536870912-byte budget');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 413,
+      body: {
+        error: 'session_input_too_large',
+        message: 'Input files exceed the delivery limit',
+      },
+    });
+  });
+
+  test('maps unavailable input objects to 422 without exposing object details', () => {
+    const failure = publicExecutionFailure(
+      new Error('SESSION_INPUT_UNAVAILABLE: Failed to fetch private/customer-list.csv from file-server.internal'),
+    );
+    expect(failure).toEqual({
+      status: 422,
+      body: {
+        error: 'session_input_unavailable',
+        message: 'One or more input files are unavailable',
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain('customer-list.csv');
+    expect(JSON.stringify(failure)).not.toContain('file-server.internal');
+  });
+
+  test('maps input source outages to 502 rather than MicroVM unavailability', () => {
+    const err = new Error('SESSION_INPUT_SOURCE_FAILED: upstream request failed with status 503');
+    expect(publicExecutionFailure(err)).toEqual({
+      status: 502,
+      body: {
+        error: 'session_input_source_failed',
+        message: 'Input file service is unavailable',
+      },
+    });
+  });
+
+  test('maps an input-delivery deadline to a sanitized 504', () => {
+    const failure = publicExecutionFailure(
+      new Error('SESSION_INPUT_ABORTED: Fetching private/customer-list.csv timed out'),
+    );
+    expect(failure).toEqual({
+      status: 504,
+      body: {
+        error: 'session_input_aborted',
+        message: 'Input delivery timed out',
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain('customer-list.csv');
+  });
+
+  test('maps worker and BullMQ deadline fallbacks to sanitized 504s', () => {
+    expect(publicExecutionFailure(new Error('Job timed out after 300000ms'))).toEqual({
+      status: 504,
+      body: {
+        error: 'execution_timeout',
+        message: 'Execution timed out',
+      },
+    });
+
+    const bullmqFailure = publicExecutionFailure(
+      new Error(
+        'Job wait execute timed out before finishing, no finish notification arrived after 370000ms (id=private-session-id)',
+      ),
+    );
+    expect(bullmqFailure).toEqual({
+      status: 504,
+      body: {
+        error: 'execution_timeout',
+        message: 'Execution timed out',
+      },
+    });
+    expect(JSON.stringify(bullmqFailure)).not.toContain('private-session-id');
+  });
+
+  test('does not expose AWS identifiers embedded in backend failures', () => {
+    const arn = 'arn:aws:iam::123456789012:role/private-microvm-exec';
+    const failure = publicExecutionFailure(
+      new Error(`MICROVM_LAUNCH_FAILED: Access denied while passing ${arn} to mvm-secret-123`),
+    );
+    expect(failure).toEqual({
+      status: 503,
+      body: { error: 'microvm_launch_failed', message: 'Sandbox launch failed' },
+    });
+    expect(JSON.stringify(failure)).not.toContain('123456789012');
+    expect(JSON.stringify(failure)).not.toContain('mvm-secret-123');
+  });
+
   test('maps sandbox request guard failures to public bad requests', () => {
     const axiosErr = {
       message: 'Request failed with status code 400',

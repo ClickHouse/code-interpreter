@@ -5,6 +5,7 @@ import * as path from 'path';
 import { config } from './config';
 import {
   SANDBOX_WORKSPACE_MODE,
+  SESSION_WORKSPACE_ID,
   SandboxJobUidPool,
   applySandboxPathPermissionsNoFollow,
   assertWorkspaceOwnershipCapability,
@@ -14,15 +15,19 @@ import {
   compatibilityModeForSkippedChown,
   createSandboxWorkspace,
   createWorkspaceId,
+  ensureSessionWorkspace,
   prepareWorkspaceRoot,
   quarantineModeForUid,
   reapStaleWorkspaces,
+  resetSessionWorkspace,
   retainWorkspaceCleanupUntilRemoved,
   retainedWorkspaceCleanupCount,
   retryRetainedWorkspaceCleanups,
   sandboxJobUidPool,
   workspaceOwnershipCapabilityErrors,
 } from './workspace-isolation';
+
+const nonRootIdentity = { slot: 0, uid: 65534, gid: 65534, perJobUid: false } as const;
 
 const tmpRoots: string[] = [];
 const savedPerJobUids = config.per_job_uids;
@@ -98,6 +103,46 @@ describe('sandbox UID slot pool', () => {
     expect(pool.acquire()).not.toBeNull();
     expect(pool.acquire()).not.toBeNull();
     expect(pool.acquire()).toBeNull();
+  });
+});
+
+describe('persistent session workspace', () => {
+  test('ensureSessionWorkspace uses a stable id and preserves contents across calls', async () => {
+    config.per_job_uids = false;
+    const root = await mkroot('session-ws-');
+    const first = await ensureSessionWorkspace(nonRootIdentity, root);
+    expect(first.workspaceId).toBe(SESSION_WORKSPACE_ID);
+    expect(first.dir).toBe(path.join(root, SESSION_WORKSPACE_ID));
+
+    await fsp.writeFile(path.join(first.dir, 'state.txt'), 'kept');
+    const second = await ensureSessionWorkspace(nonRootIdentity, root);
+    expect(second.dir).toBe(first.dir);
+    expect(await fsp.readFile(path.join(second.dir, 'state.txt'), 'utf8')).toBe('kept');
+  });
+
+  test('the reaper never removes the active session workspace', async () => {
+    config.per_job_uids = false;
+    const root = await mkroot('session-ws-reaper-');
+    const lease = await ensureSessionWorkspace(nonRootIdentity, root);
+    await fsp.writeFile(path.join(lease.dir, 'keep.txt'), 'x');
+    const removed = await reapStaleWorkspaces({ root, removeAll: true });
+    expect(removed).toBe(0);
+    expect(await fsp.readFile(path.join(lease.dir, 'keep.txt'), 'utf8')).toBe('x');
+  });
+
+  test('resetSessionWorkspace wipes the directory and unprotects it from the reaper', async () => {
+    config.per_job_uids = false;
+    const root = await mkroot('session-ws-reset-');
+    const lease = await ensureSessionWorkspace(nonRootIdentity, root);
+    await fsp.writeFile(path.join(lease.dir, 'gone.txt'), 'x');
+
+    expect(await resetSessionWorkspace(root)).toBe(true);
+    await expect(fsp.access(lease.dir)).rejects.toBeDefined();
+
+    /* After reset a leftover dir with the same name is reapable again. */
+    await fsp.mkdir(lease.dir, { recursive: true });
+    const removed = await reapStaleWorkspaces({ root, removeAll: true });
+    expect(removed).toBe(1);
   });
 });
 
