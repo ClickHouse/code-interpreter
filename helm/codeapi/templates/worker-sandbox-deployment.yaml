@@ -27,6 +27,22 @@ Split runtime deployments:
 {{- if and (not $packagesFromPvc) (not .Values.workerSandbox.kvmEnabled) }}
 {{- fail "workerSandbox.packages.source=image requires workerSandbox.kvmEnabled=true because the baked runner boots from a libkrun block root image" }}
 {{- end }}
+{{- $clockSkewLimitValue := toString .Values.workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds }}
+{{- $clockSkewJitterValue := toString .Values.workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds }}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)$" $clockSkewLimitValue) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be a non-negative integer" }}
+{{- end }}
+{{- if not (regexMatch "^(0|[1-9][0-9]*)$" $clockSkewJitterValue) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds must be a non-negative integer" }}
+{{- end }}
+{{- $clockSkewLimit := int $clockSkewLimitValue }}
+{{- $clockSkewJitter := int $clockSkewJitterValue }}
+{{- if or (lt $clockSkewLimit 0) (ge $clockSkewLimit 25) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessLimitSeconds must be between 0 and 24 so the 5-second healthcheck timeout stays below the 30-second execution-manifest tolerance" }}
+{{- end }}
+{{- if or (lt $clockSkewJitter 0) (and (gt $clockSkewLimit 0) (ge $clockSkewJitter $clockSkewLimit)) }}
+{{- fail "workerSandbox.sandboxRunner.clockSkewLivenessJitterSeconds must be non-negative and less than clockSkewLivenessLimitSeconds when the clock-skew guard is enabled" }}
+{{- end }}
 {{- range .Values.workerSandbox.sandboxExtraEnv }}
 {{- $name := .name | default "" }}
 {{- if and $name (or (regexMatch "(?i)(SECRET|TOKEN|PASSWORD|KEY)" $name) (hasPrefix "REDIS_" $name) (hasPrefix "AWS_" $name) (hasPrefix "S3_" $name) (hasPrefix "MINIO_" $name) (hasPrefix "CODEAPI_" $name) (eq $name "FILE_SERVER_URL") (eq $name "TOOL_CALL_SERVER_URL")) }}
@@ -258,6 +274,10 @@ spec:
               value: {{ .Values.workerSandbox.launcher.filterVsockEnotconn | quote }}
             - name: SANDBOX_RUNNER_FD_LIVENESS_LIMIT
               value: {{ .Values.workerSandbox.sandboxRunner.fdLivenessLimit | quote }}
+            - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_LIMIT_SECONDS
+              value: {{ $clockSkewLimit | quote }}
+            - name: SANDBOX_RUNNER_CLOCK_SKEW_LIVENESS_JITTER_SECONDS
+              value: {{ $clockSkewJitter | quote }}
             - name: EGRESS_GATEWAY_URL
               value: "http://{{ include "codeapi.fullname" . }}-egress-gateway:{{ .Values.egressGateway.service.port }}"
             - name: SANDBOX_LOG_LEVEL
@@ -362,14 +382,15 @@ spec:
                 - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 60
             periodSeconds: 30
-            timeoutSeconds: 5
+            timeoutSeconds: 7
           readinessProbe:
-            httpGet:
-              path: /api/v2/health
-              port: sandbox
+            exec:
+              command:
+                - /usr/local/bin/sandbox-runner-healthcheck.sh
             initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 5
+            timeoutSeconds: 7
+            failureThreshold: 1
           resources:
             {{- $sandboxResources := deepCopy .Values.workerSandbox.resources }}
             {{- if $useKvmDevicePlugin }}
