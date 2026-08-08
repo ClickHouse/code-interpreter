@@ -692,6 +692,7 @@ export class Job {
   egressGrantToken?: string;
   toolCallSocketEnabled: boolean;
   isSynthetic: boolean;
+  reportMemoryPeak: boolean;
   outputSessionId: string;
 
   private log: Logger;
@@ -732,6 +733,7 @@ export class Job {
     egress_grant?: string;
     tool_call_socket_enabled?: boolean;
     is_synthetic?: boolean;
+    report_memory_peak?: boolean;
     /* Injected when this VM is bound to a stateful runtime session. */
     session?: SessionWorkspace | null;
   }) {
@@ -769,6 +771,7 @@ export class Job {
     this.egressGrantToken = opts.egress_grant;
     this.toolCallSocketEnabled = opts.tool_call_socket_enabled === true;
     this.isSynthetic = opts.is_synthetic === true;
+    this.reportMemoryPeak = opts.report_memory_peak === true;
   }
 
   /** Marks a persistent workspace unusable after a post-prime failure. Returns
@@ -1506,6 +1509,7 @@ export class Job {
       identity: this.sandboxIdentity(),
       enableToolCallSocket: this.toolCallSocketEnabled && script === 'run',
       suppressSuccessLogs: this.isSynthetic,
+      trackMemoryPeak: this.reportMemoryPeak,
     });
   }
 
