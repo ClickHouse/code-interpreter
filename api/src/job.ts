@@ -35,6 +35,7 @@ import {
   SANDBOX_DIR_MODE,
   SANDBOX_FILE_MODE,
   ValidationError,
+  hasRunnableSource,
   isDirkeep,
   isValidPathShape,
   validateFilePath,
@@ -47,6 +48,7 @@ export {
   SANDBOX_DIR_MODE,
   SANDBOX_FILE_MODE,
   ValidationError,
+  hasRunnableSource,
   isDirkeep,
   checkPathShape,
   isValidPathShape,
@@ -1533,7 +1535,9 @@ export class Job {
     const codeFiles = this.files.filter(
       f => !isDirkeep(f.name) && (!f.encoding || f.encoding === 'utf8'),
     );
-    if (this.runtime.language !== 'file' && codeFiles.length === 0) {
+    /* The request gate rejects this before priming (see hasRunnableSource);
+     * this stays as the invariant for callers that build a Job directly. */
+    if (!hasRunnableSource(this.files, this.runtime.language)) {
       throw new ValidationError('files must include at least one runnable source file');
     }
     this.entryPointName = codeFiles[0]?.name;

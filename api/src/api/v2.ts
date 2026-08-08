@@ -8,6 +8,7 @@ import {
   Job,
   SessionWorkspaceDirtyError,
   ValidationError,
+  hasRunnableSource,
   validateFilePath,
 } from '../job';
 import { EXECUTION_MANIFEST_HEADER, ExecutionManifestError, type ExecutionManifestClaims } from '../execution-manifest';
@@ -267,11 +268,14 @@ function getJob(
     throw { message: `${language}-${version} runtime is unknown` };
   }
 
-  if (
-    rt.language !== 'file' &&
-    !files.some(file => !file.encoding || file.encoding === 'utf8')
-  ) {
-    throw { message: 'files must include at least one utf8 encoded file' };
+  /* Reject a request with nothing runnable BEFORE anything is primed. This
+   * gate used to count a lone `.dirkeep` as a utf8 source, so such a request
+   * reached prime(), had its files written into the session workspace and its
+   * priming metadata recorded, and only then failed the stricter check in
+   * Job.execute — leaving the rejected request's writes visible to the next
+   * execution. Both sides now ask `hasRunnableSource`. */
+  if (!hasRunnableSource(files, rt.language)) {
+    throw { message: 'files must include at least one runnable source file' };
   }
 
   validateConstraints(body, rt);
@@ -543,16 +547,12 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       metricsOutcome = 'success';
       return res.status(200).json(result);
     } catch (error) {
-      /* A ValidationError is a deterministic rejection of the REQUEST, not
-       * evidence that the workspace is in an unknown state: nothing ran, so the
-       * workspace holds exactly the inputs priming wrote. Treating it as dirty
-       * (below) answered a caller error with `session_workspace_dirty`, which
-       * the control plane reads as a recycle signal — costing a restore and
-       * hiding the 400 the caller needed to fix its request. */
-      if (error instanceof ValidationError) {
-        metricsOutcome = 'validation_error';
-        return res.status(400).json({ message: error.message });
-      }
+      /* Deliberately BEFORE the ValidationError branch below: once priming has
+       * completed, the workspace has been written to, so any later failure —
+       * including a validation one — leaves state the next execute must not
+       * inherit silently. Requests with nothing runnable are rejected up front
+       * (see `hasRunnableSource`), so reaching here with a ValidationError
+       * means files really were primed and dirty is the honest answer. */
       if (primeCompleted && job?.markSessionDirty('execution failed after input priming')) {
         metricsOutcome = 'execution_error';
         logger.error({ job: job.uuid, err: error }, 'Session execution left workspace state unknown');
