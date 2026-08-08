@@ -7,6 +7,7 @@ import * as path from 'path';
 import { config } from '../config';
 import { Job } from '../job';
 import { loadPackage } from '../runtime';
+import { ValidationError } from '../validation';
 import {
   getBoundSessionWorkspace,
   resetSessionWorkspaceStateForTests,
@@ -124,6 +125,37 @@ describe('per-request session binding', () => {
         message: 'Runner is bound to a different runtime session',
       });
       expect(getBoundSessionWorkspace()?.runtimeSessionId).toBe('rt_bound_once');
+    } finally {
+      Job.prototype.prime = originalPrime;
+      Job.prototype.execute = originalExecute;
+      Job.prototype.cleanup = originalCleanup;
+    }
+  });
+
+  test('a validation failure after priming answers 400 instead of the recycle signal', async () => {
+    config.session_workspace_enabled = true;
+    config.require_execution_manifest = false;
+
+    const originalPrime = Job.prototype.prime;
+    const originalExecute = Job.prototype.execute;
+    const originalCleanup = Job.prototype.cleanup;
+
+    /* Priming succeeds, then execution rejects the REQUEST. Nothing ran, so the
+     * workspace holds exactly what priming wrote — reporting
+     * `session_workspace_dirty` here would cost a needless restore and hide the
+     * 400 the caller needs to fix its request. */
+    Job.prototype.prime = async function primeWithoutFilesystem(): Promise<void> {};
+    Job.prototype.execute = async function executeRejectingRequest() {
+      throw new ValidationError('files must include at least one utf8 encoded file');
+    };
+    Job.prototype.cleanup = async function cleanupWithoutFilesystem(): Promise<void> {};
+
+    try {
+      const response = await execute('rt_validation_after_prime');
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error?: string; message?: string };
+      expect(body.error).toBeUndefined();
+      expect(body.message).toBe('files must include at least one utf8 encoded file');
     } finally {
       Job.prototype.prime = originalPrime;
       Job.prototype.execute = originalExecute;

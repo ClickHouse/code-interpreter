@@ -1447,13 +1447,29 @@ export class Job {
     else await fsp.mkdir(parentDir, { recursive: true });
     await this.secureAncestors(parentDir, operation.submissionDir, operation.identity);
     throwIfAborted(operation.signal);
-    /* In a persistent session workspace a prior turn could have left a symlink
-     * (or a directory) squatting this path; the default writeFile would follow
-     * the symlink and clobber its target as root. Remove whatever is there
-     * first (unlink never follows a link) so we always write a fresh regular
-     * file. A fresh per-job workspace has nothing here. */
-    if (this.session) await fsp.rm(filePath, { force: true, recursive: true });
-    await fsp.writeFile(filePath, content);
+    if (this.session) {
+      /* Mirrors the by-reference prime above. A prior turn could have left a
+       * symlink (or directory) squatting this path, and writeFile would follow
+       * the link and clobber its target as root — so clear anything that is
+       * NOT a regular file (unlink never follows a link). A regular file is
+       * LEFT in place and replaced by the rename below, so a write that fails
+       * partway cannot erase the previous turn's bytes and force a
+       * recycle/restore. A fresh per-job workspace has nothing here. */
+      const existing = await fsp.lstat(filePath).catch(() => null);
+      if (existing && !existing.isFile()) {
+        await fsp.rm(filePath, { force: true, recursive: true });
+      }
+      const tempPath = path.join(operation.submissionDir, `.tmp-${nanoid()}`);
+      try {
+        await fsp.writeFile(tempPath, content, { mode: SANDBOX_FILE_MODE });
+        await fsp.rename(tempPath, filePath);
+      } catch (error) {
+        try { await fsp.unlink(tempPath); } catch { /* may not exist */ }
+        throw error;
+      }
+    } else {
+      await fsp.writeFile(filePath, content);
+    }
     await this.applySandboxFilePermissions(filePath, false, operation.identity);
 
     const hash = crypto.createHash('sha256').update(content).digest('hex');

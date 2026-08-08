@@ -543,6 +543,16 @@ router.post('/execute', express.json({ limit: config.execute_body_limit }), asyn
       metricsOutcome = 'success';
       return res.status(200).json(result);
     } catch (error) {
+      /* A ValidationError is a deterministic rejection of the REQUEST, not
+       * evidence that the workspace is in an unknown state: nothing ran, so the
+       * workspace holds exactly the inputs priming wrote. Treating it as dirty
+       * (below) answered a caller error with `session_workspace_dirty`, which
+       * the control plane reads as a recycle signal — costing a restore and
+       * hiding the 400 the caller needed to fix its request. */
+      if (error instanceof ValidationError) {
+        metricsOutcome = 'validation_error';
+        return res.status(400).json({ message: error.message });
+      }
       if (primeCompleted && job?.markSessionDirty('execution failed after input priming')) {
         metricsOutcome = 'execution_error';
         logger.error({ job: job.uuid, err: error }, 'Session execution left workspace state unknown');
@@ -624,28 +634,55 @@ router.get('/runtimes', (_req: Request, res: Response) => {
  * silently continues with an empty workspace (checkpoint state lost on expiry).
  * Returns false (→ fail closed) when this request carries no valid header, so a
  * headerless/malformed request never operates on a stale prior session. */
-function bindSessionFromHeader(req: Request): boolean {
-  const binding = parseSessionBindingFromHeader(req.headers[RUNTIME_SESSION_ID_HEADER]);
-  if (!binding) return false;
-  /* A REJECTED bind (this runner is already pinned to a different session)
-   * must fail the request too — proceeding would run checkpoint/restore/file
-   * delivery for the requested session against the previously bound session's
-   * workspace. */
-  return bindSessionWorkspace(binding) != null;
+type SessionBindFailure = { status: number; body: Record<string, string> };
+
+/* Distinguishes the two ways a bind can fail, because the control plane acts on
+ * them differently: a missing/malformed header is a caller error, while a
+ * REJECTED bind means this runner is pinned to a DIFFERENT session and must be
+ * recycled. Collapsing both into one generic 409 (as this did) hid the conflict
+ * and left the VM in service. `session_workspace_dirty` is the established
+ * recycle signal — the same code /execute returns for this condition. */
+function bindSessionFromHeader(req: Request): SessionBindFailure | null {
+  let binding;
+  try {
+    binding = parseSessionBindingFromHeader(req.headers[RUNTIME_SESSION_ID_HEADER]);
+  } catch (error) {
+    /* A duplicated or malformed header throws SessionWorkspaceBindingError; it
+     * is a bad request, not a session conflict. */
+    return {
+      status: 400,
+      body: { message: error instanceof Error ? error.message : 'Invalid runtime session header' },
+    };
+  }
+  if (!binding) {
+    return { status: 409, body: { message: 'Missing runtime session header' } };
+  }
+  if (bindSessionWorkspace(binding) == null) {
+    return {
+      status: 409,
+      body: {
+        error: 'session_workspace_dirty',
+        message: 'Runner is bound to a different runtime session',
+      },
+    };
+  }
+  return null;
 }
 
 /* Express 4 (pinned) does NOT auto-forward rejected route-handler promises, so
  * `.catch(next)` is required or a rejection (e.g. session.ownership()) hangs the
  * request and surfaces as an unhandled rejection instead of a 5xx. */
 router.get('/session/checkpoint', (req: Request, res: Response, next: NextFunction) => {
-  if (!bindSessionFromHeader(req)) {
-    return res.status(409).json({ message: 'Missing runtime session header' });
+  const failure = bindSessionFromHeader(req);
+  if (failure) {
+    return res.status(failure.status).json(failure.body);
   }
   return streamSessionCheckpoint(res).catch(next);
 });
 router.post('/session/restore', (req: Request, res: Response, next: NextFunction) => {
-  if (!bindSessionFromHeader(req)) {
-    return res.status(409).json({ message: 'Missing runtime session header' });
+  const failure = bindSessionFromHeader(req);
+  if (failure) {
+    return res.status(failure.status).json(failure.body);
   }
   return restoreSessionCheckpoint(req, res).catch(next);
 });
