@@ -200,15 +200,6 @@ workerSandbox:
     # Restart a sandbox-runner before launcher/VMM host-side fd retention can
     # exhaust the process file descriptor limit. Set 0 to disable.
     fdLivenessLimit: 40000
-    # Restart a sandbox-runner when its microVM guest wall clock differs from
-    # the host by this many seconds. This must remain comfortably below the
-    # 30-second execution-manifest clock tolerance; the chart reserves the
-    # five-second probe timeout and accepts at most 24. Set 0 to disable.
-    clockSkewLivenessLimitSeconds: 10
-    # Subtract a stable 0..N-second offset from each pod's clock-skew limit so
-    # replicas created together do not all recycle at once. Must be less than
-    # clockSkewLivenessLimitSeconds.
-    clockSkewLivenessJitterSeconds: 2
     inheritSharedScheduling: true
     nodeSelector: {}
     tolerations: []
