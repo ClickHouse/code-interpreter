@@ -361,6 +361,7 @@ router.post('/upload', uploadLimiter, async (req: t.AuthenticatedRequest, res: R
     const bb = busboy({
       headers: req.headers,
       limits: { fileSize: planFileSize },
+      defParamCharset: 'utf8',
       preservePath: true,
     });
 
@@ -558,6 +559,7 @@ router.post('/upload/batch', uploadLimiter, async (req: t.AuthenticatedRequest, 
     const bb = busboy({
       headers: req.headers,
       limits: { fileSize: planFileSize, files: MAX_BATCH_FILES },
+      defParamCharset: 'utf8',
       preservePath: true,
     });
 
