@@ -3,9 +3,7 @@ import { Router } from 'express';
 import type * as t from '../types';
 import { checkServiceShutDown, checkServiceStartUp } from '../lifecycle';
 import { env } from '../config';
-import { executionLimiter } from '../middleware/limits';
 import { getPrincipalOrReject } from '../auth/principal';
-import { getExecutionIdentity } from '../execution-identity';
 import {
   NpmUnitValidationError,
   validateNpmUnitRequest,
@@ -23,16 +21,16 @@ const router = Router();
 
 function responseStatus(body: NpmUnitResponse): number {
   if (!('error' in body)) return 200;
-  if (body.error === 'not_found') return 404;
+  if (body.error === 'not_publicly_fetchable') return 404;
   if (body.error === 'too_large' || body.error === 'decompression_limit') return 413;
   if (body.error === 'integrity_mismatch' || body.error === 'unsafe_entry' || body.error === 'parse_failed') return 422;
   if (body.error === 'timeout') return 504;
-  if (body.error === 'invalid_request') return 400;
+  if (body.error === 'invalid_request' || body.error === 'unsupported_registry') return 400;
   if (body.error === 'disabled') return 503;
   return body.retryable ? 503 : 502;
 }
 
-router.post('/sandbox/npm-unit', executionLimiter, async (req: t.AuthenticatedRequest, res) => {
+router.post('/sandbox/npm-unit', async (req: t.AuthenticatedRequest, res) => {
   const principal = getPrincipalOrReject(req, res);
   if (!principal) return;
   if (!env.NPM_UNIT_ENABLED) {
@@ -60,15 +58,14 @@ router.post('/sandbox/npm-unit', executionLimiter, async (req: t.AuthenticatedRe
 
   let request: NpmUnitRequest;
   try {
-    request = validateNpmUnitRequest(req.body, env.NPM_REGISTRY_ORIGIN);
+    request = validateNpmUnitRequest(req.body);
   } catch (error) {
     if (error instanceof NpmUnitValidationError) {
-      return res.status(400).json({ error: 'invalid_request', message: error.message, retryable: false });
+      return res.status(400).json({ error: error.code, message: error.message, retryable: false });
     }
     throw error;
   }
 
-  const identity = getExecutionIdentity(req, principal.userId);
   const executionId = nanoid();
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -78,9 +75,6 @@ router.post('/sandbox/npm-unit', executionLimiter, async (req: t.AuthenticatedRe
     const result = await dispatchNpmUnitOverHttp(buildNpmUnitDispatchRequest({
       request,
       executionId,
-      tenantId: identity.storageNamespace,
-      canonicalUserId: identity.canonicalUserId,
-      principalSource: identity.principalSource,
     }), controller.signal);
     if (res.writableEnded || controller.signal.aborted) return;
     return res.status(responseStatus(result)).json(result);

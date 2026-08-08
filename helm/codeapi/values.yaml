@@ -57,10 +57,9 @@ executionManifest:
 
 # Opt-in stateless indexing of an exact npm package tarball. The egress gateway
 # alone receives public HTTPS access, and it accepts only short-lived,
-# body-bound capabilities for the configured registry URL.
+# body-bound capabilities for the fixed anonymous public npm registry.
 npmUnit:
   enabled: false
-  registryOrigin: "https://registry.npmjs.org"
   tarballMaxBytes: 33554432
   fetchTimeoutMs: 15000
   fetchTokenTtlSeconds: 120

@@ -71,8 +71,6 @@ spec:
               value: {{ .Values.egressGrant.ttlSeconds | quote }}
             - name: CODEAPI_NPM_UNIT_ENABLED
               value: {{ .Values.npmUnit.enabled | quote }}
-            - name: CODEAPI_NPM_REGISTRY_ORIGIN
-              value: {{ .Values.npmUnit.registryOrigin | quote }}
             - name: CODEAPI_NPM_UNIT_DISPATCH_URL
               value: "http://{{ include "codeapi.fullname" . }}-service-worker:{{ .Values.workerSandbox.healthPort }}/internal/npm-unit"
             # Server config

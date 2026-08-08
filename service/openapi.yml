@@ -202,6 +202,20 @@ components:
         tarballBytes: { type: integer, minimum: 0 }
         unpackedBytes: { type: integer, minimum: 0 }
         peakRssBytes: { type: integer, minimum: 0 }
+        cgroupPeakBytes:
+          type: integer
+          minimum: 0
+          description: Peak memory charged to the fresh per-request cgroup, including descendants.
+        wallMs: { type: integer, minimum: 0 }
+
+    NpmUnitFailureUsage:
+      type: object
+      description: Parent-observed usage may be partial when the jailed process is terminated.
+      properties:
+        tarballBytes: { type: integer, minimum: 0 }
+        unpackedBytes: { type: integer, minimum: 0 }
+        peakRssBytes: { type: integer, minimum: 0 }
+        cgroupPeakBytes: { type: integer, minimum: 0 }
         wallMs: { type: integer, minimum: 0 }
 
     NpmUnitSuccess:
@@ -267,24 +281,24 @@ components:
       properties:
         error:
           type: string
-          enum: [integrity_mismatch, not_found, registry_unavailable, too_large, decompression_limit, timeout, unsafe_entry, parse_failed, invalid_request, disabled, sandbox_unavailable]
+          enum: [integrity_mismatch, not_publicly_fetchable, registry_unavailable, too_large, decompression_limit, timeout, unsafe_entry, parse_failed, invalid_request, unsupported_registry, disabled, sandbox_unavailable]
         message: { type: string }
         retryable: { type: boolean }
         rejected:
           $ref: '#/components/schemas/NpmUnitRejected'
         usage:
-          $ref: '#/components/schemas/NpmUnitUsage'
+          $ref: '#/components/schemas/NpmUnitFailureUsage'
 
 paths:
   /sandbox/npm-unit:
     post:
       summary: Index an exact npm package declaration surface
       description: >-
-        Fetches one registry tarball through a short-lived exact-package
+        Fetches one anonymously readable tarball from registry.npmjs.org through a short-lived exact-package
         capability, verifies SHA-512 before decompression, and parses only
         TypeScript declarations in a fresh network-disabled sandbox. The
-        request is dispatched synchronously without a persisted job or result;
-        the feature is disabled by default.
+        request carries no tenant context and is dispatched synchronously
+        without a persisted job or result; the feature is disabled by default.
       operationId: indexNpmUnit
       requestBody:
         required: true

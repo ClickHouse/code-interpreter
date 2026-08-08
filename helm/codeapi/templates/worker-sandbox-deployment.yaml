@@ -176,8 +176,6 @@ spec:
               value: {{ .Values.egressGrant.ttlSeconds | quote }}
             - name: CODEAPI_NPM_UNIT_ENABLED
               value: {{ .Values.npmUnit.enabled | quote }}
-            - name: CODEAPI_NPM_REGISTRY_ORIGIN
-              value: {{ .Values.npmUnit.registryOrigin | quote }}
             - name: NPM_UNIT_CONCURRENCY
               value: {{ .Values.npmUnit.concurrency | quote }}
             - name: NPM_UNIT_REQUEST_TIMEOUT

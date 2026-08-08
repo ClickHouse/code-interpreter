@@ -199,7 +199,6 @@ beforeEach(() => {
   env.EGRESS_GATEWAY_MAX_NESTING_DEPTH = 10;
   env.EGRESS_LEDGER_REQUIRED = false;
   env.NPM_UNIT_ENABLED = true;
-  env.NPM_REGISTRY_ORIGIN = 'https://registry.npmjs.org';
   env.NPM_TARBALL_MAX_BYTES = 1024;
   env.NPM_FETCH_TIMEOUT_MS = 1000;
   env.NPM_FETCH_TOKEN_TTL_SECONDS = 60;
@@ -251,6 +250,7 @@ describe('egress gateway routes', () => {
     expect(Buffer.from(await fetched.arrayBuffer())).toEqual(tarball);
     expect(upstreamCalls.map(call => call.url)).toEqual([request.resolved]);
     expect(upstreamCalls[0].init.redirect).toBe('manual');
+    expect(upstreamCalls[0].init.headers).toEqual({ Accept: 'application/octet-stream' });
   });
 
   test('refuses off-registry npm URLs before minting or fetching', async () => {
@@ -274,10 +274,11 @@ describe('egress gateway routes', () => {
     });
 
     expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'unsupported_registry', retryable: false });
     expect(upstreamCalls).toHaveLength(0);
   });
 
-  test('refuses cross-origin npm redirects and oversized tarballs', async () => {
+  test('refuses every npm redirect and oversized tarballs', async () => {
     const tarball = Buffer.from('x');
     const integrity = `sha512-${crypto.createHash('sha512').update(tarball).digest('base64')}`;
     const request = {
@@ -317,6 +318,34 @@ describe('egress gateway routes', () => {
     });
     expect(oversized.status).toBe(413);
     expect(await oversized.json()).toMatchObject({ error: 'too_large', retryable: false });
+  });
+
+  test.each([401, 403, 404])('reports anonymous registry HTTP %d without claiming whether a package exists', async status => {
+    const tarball = Buffer.from('x');
+    const request = {
+      name: 'pkg',
+      version: '1.2.3',
+      integrity: `sha512-${crypto.createHash('sha512').update(tarball).digest('base64')}`,
+      resolved: 'https://registry.npmjs.org/pkg/-/pkg-1.2.3.tgz',
+      keep: [...NPM_UNIT_KEEP],
+    };
+    const mint = await gatewayFetch('/internal/npm-tarball-tokens', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [INTERNAL_SERVICE_TOKEN_HEADER]: INTERNAL_TOKEN,
+      },
+      body: JSON.stringify({ executionId: 'exec_npm', request }),
+    });
+    const { fetchToken } = await mint.json() as { fetchToken: string };
+
+    upstreamResponse = new Response(null, { status });
+    const fetched = await gatewayFetch('/npm/tarball', {
+      headers: { [NPM_FETCH_TOKEN_HEADER]: fetchToken },
+    });
+
+    expect(fetched.status).toBe(404);
+    expect(await fetched.json()).toMatchObject({ error: 'not_publicly_fetchable', retryable: false });
   });
 
   test('protects internal grant create, restore, and revoke routes', async () => {

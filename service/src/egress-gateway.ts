@@ -570,7 +570,7 @@ app.post('/internal/npm-tarball-tokens', express.json({ limit: '32kb' }), requir
     if (!executionId || executionId.length > 256) {
       return res.status(400).json({ error: 'invalid_request', message: 'executionId is required', retryable: false });
     }
-    const request = validateNpmUnitRequest(req.body?.request, env.NPM_REGISTRY_ORIGIN);
+    const request = validateNpmUnitRequest(req.body?.request);
     const issuedAt = Math.floor(Date.now() / 1000);
     const expiresAt = issuedAt + env.NPM_FETCH_TOKEN_TTL_SECONDS;
     const fetchToken = sealNpmTarballToken({
@@ -587,7 +587,7 @@ app.post('/internal/npm-tarball-tokens', express.json({ limit: '32kb' }), requir
     return res.status(201).json({ fetchToken, expiresAt });
   } catch (error) {
     if (error instanceof NpmUnitValidationError) {
-      return res.status(400).json({ error: 'invalid_request', message: error.message, retryable: false });
+      return res.status(400).json({ error: error.code, message: error.message, retryable: false });
     }
     return sendEgressError(req, res, error);
   }
@@ -611,31 +611,23 @@ class NpmTarballLimitTransform extends Transform {
 }
 
 async function fetchRegistryTarball(
-  initialUrl: string,
+  url: string,
   signal: AbortSignal,
 ): Promise<globalThis.Response> {
-  let current = new URL(initialUrl);
-  const allowedOrigin = current.origin;
-  for (let redirects = 0; redirects <= 3; redirects++) {
-    const upstream = await fetch(current, {
-      method: 'GET',
-      headers: { Accept: 'application/octet-stream' },
-      redirect: 'manual',
-      signal,
-    });
-    if (upstream.status < 300 || upstream.status >= 400) return upstream;
-    const location = upstream.headers.get('location');
+  const upstream = await fetch(url, {
+    method: 'GET',
+    /* Deliberately omit Authorization, Cookie, npm tokens, and caller
+     * headers. Anonymous readability from the one fixed public registry is
+     * the proof that a tarball is eligible for this globally reusable parse. */
+    headers: { Accept: 'application/octet-stream' },
+    redirect: 'manual',
+    signal,
+  });
+  if (upstream.status >= 300 && upstream.status < 400) {
     await upstream.body?.cancel().catch(() => {});
-    if (!location || redirects === 3) {
-      throw new Error('npm_registry_redirect_limit');
-    }
-    const next = new URL(location, current);
-    if (next.protocol !== 'https:' || next.origin !== allowedOrigin || next.username || next.password) {
-      throw new Error('npm_registry_cross_origin_redirect');
-    }
-    current = next;
+    throw new Error('npm_registry_redirect_refused');
   }
-  throw new Error('npm_registry_redirect_limit');
+  return upstream;
 }
 
 app.get('/npm/tarball', async (req, res) => {
@@ -655,16 +647,20 @@ app.get('/npm/tarball', async (req, res) => {
       integrity: capability.integrity,
       resolved: capability.resolved,
       keep: ['**/*.d.ts', 'package.json'],
-    }, env.NPM_REGISTRY_ORIGIN);
+    });
     const maxBytes = Math.min(capability.max_bytes, env.NPM_TARBALL_MAX_BYTES);
     const controller = new AbortController();
     timeout = setTimeout(() => controller.abort(), env.NPM_FETCH_TIMEOUT_MS);
     req.once('aborted', () => controller.abort());
     const upstream = await fetchRegistryTarball(request.resolved, controller.signal);
 
-    if (upstream.status === 404) {
+    if (upstream.status === 401 || upstream.status === 403 || upstream.status === 404) {
       await upstream.body?.cancel().catch(() => {});
-      return res.status(404).json({ error: 'not_found', message: 'Package tarball was not found', retryable: false });
+      return res.status(404).json({
+        error: 'not_publicly_fetchable',
+        message: 'Package tarball is not anonymously fetchable from the public npm registry',
+        retryable: false,
+      });
     }
     if (!upstream.ok) {
       await upstream.body?.cancel().catch(() => {});
@@ -704,6 +700,9 @@ app.get('/npm/tarball', async (req, res) => {
     );
     return;
   } catch (error) {
+    if (!res.headersSent && error instanceof NpmUnitValidationError) {
+      return res.status(400).json({ error: error.code, message: error.message, retryable: false });
+    }
     if ((error as Error)?.name === 'AbortError') {
       if (!res.headersSent) {
         return res.status(503).json({ error: 'registry_unavailable', message: 'Registry request timed out', retryable: true });
@@ -713,11 +712,11 @@ app.get('/npm/tarball', async (req, res) => {
     }
     if (!res.headersSent && !(error instanceof EgressGrantError)) {
       const message = (error as Error)?.message ?? '';
-      const policyRefusal = message === 'npm_registry_cross_origin_redirect';
+      const policyRefusal = message === 'npm_registry_redirect_refused';
       return res.status(policyRefusal ? 502 : 503).json({
         error: 'registry_unavailable',
         message: policyRefusal
-          ? 'Registry redirect left the configured origin'
+          ? 'Public npm registry redirects are not permitted'
           : 'Registry request failed',
         retryable: !policyRefusal,
       });

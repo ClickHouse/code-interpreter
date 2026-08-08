@@ -1,5 +1,4 @@
 import axios from 'axios';
-import crypto from 'crypto';
 import { env } from './config';
 import { createGatewayNpmTarballToken } from './egress-gateway-client';
 import {
@@ -9,7 +8,6 @@ import {
   type ExecutionManifestClaims,
 } from './execution-manifest';
 import { internalServiceHeaders } from './internal-service-auth';
-import { isSyntheticPrincipalSource } from './auth/synthetic';
 import {
   NpmUnitValidationError,
   validateNpmUnitRequest,
@@ -23,32 +21,17 @@ import logger from './logger';
 
 export interface NpmUnitDispatchRequest {
   executionId: string;
-  tenantLabel: string;
-  userLabel: string;
-  principalSource: string;
   request: NpmUnitRequest;
 }
 
 const EXECUTION_ID_RE = /^[A-Za-z0-9_-]{10,64}$/;
-const TENANT_LABEL_RE = /^tenant:[A-Za-z0-9_-]{32}$/;
-const USER_LABEL_RE = /^user:[A-Za-z0-9_-]{32}$/;
-
-function opaqueLabel(prefix: string, value: string): string {
-  return `${prefix}:${crypto.createHash('sha256').update(value, 'utf8').digest('base64url').slice(0, 32)}`;
-}
 
 export function buildNpmUnitDispatchRequest(args: {
   executionId: string;
-  tenantId: string;
-  canonicalUserId: string;
-  principalSource: string;
   request: NpmUnitRequest;
 }): NpmUnitDispatchRequest {
   return {
     executionId: args.executionId,
-    tenantLabel: opaqueLabel('tenant', args.tenantId),
-    userLabel: opaqueLabel('user', args.canonicalUserId),
-    principalSource: args.principalSource,
     request: args.request,
   };
 }
@@ -65,15 +48,12 @@ export function validateNpmUnitDispatchRequest(value: unknown): NpmUnitDispatchR
     throw new NpmUnitValidationError('dispatch body must be an object');
   }
   const body = value as Record<string, unknown>;
-  const allowed = new Set(['executionId', 'tenantLabel', 'userLabel', 'principalSource', 'request']);
+  const allowed = new Set(['executionId', 'request']);
   const unknown = Object.keys(body).filter(key => !allowed.has(key));
   if (unknown.length > 0) throw new NpmUnitValidationError(`unknown dispatch field: ${unknown[0]}`);
   return {
     executionId: requiredString(body.executionId, 'executionId', EXECUTION_ID_RE),
-    tenantLabel: requiredString(body.tenantLabel, 'tenantLabel', TENANT_LABEL_RE),
-    userLabel: requiredString(body.userLabel, 'userLabel', USER_LABEL_RE),
-    principalSource: requiredString(body.principalSource, 'principalSource'),
-    request: validateNpmUnitRequest(body.request, env.NPM_REGISTRY_ORIGIN),
+    request: validateNpmUnitRequest(body.request),
   };
 }
 
@@ -115,7 +95,7 @@ export async function processNpmUnitDispatch(
     input = validateNpmUnitDispatchRequest(raw);
   } catch (error) {
     return {
-      error: 'invalid_request',
+      error: error instanceof NpmUnitValidationError ? error.code : 'invalid_request',
       message: error instanceof Error ? error.message : 'invalid dispatch request',
       retryable: false,
     };
@@ -154,11 +134,9 @@ export async function processNpmUnitDispatch(
       'codeapi.language': 'npm-unit',
       'codeapi.dispatch_mode': 'direct',
     }, async () => {
-      const isSynthetic = isSyntheticPrincipalSource(input.principalSource);
       const { fetchToken } = await createGatewayNpmTarballToken({
         executionId: input.executionId,
         request: input.request,
-        isSynthetic,
         signal: controller.signal,
       });
       const body: Record<string, unknown> = {
@@ -172,19 +150,23 @@ export async function processNpmUnitDispatch(
           v: EXECUTION_MANIFEST_VERSION,
           operation: 'npm-unit',
           exec_id: input.executionId,
-          tenant_id: input.tenantLabel,
-          user_id: input.userLabel,
-          session_key: opaqueLabel('session', input.executionId),
+          /* npm-unit is a public, stateless pure-function route. These
+           * execution-scoped labels satisfy the common manifest schema
+           * without carrying tenant- or user-correlated data into the
+           * sandbox control plane. */
+          tenant_id: `npm-unit:${input.executionId}`,
+          user_id: `npm-unit:${input.executionId}`,
+          session_key: `npm-unit:${input.executionId}`,
           input_files: [],
           read_sessions: [],
-          output_session_id: opaqueLabel('output', input.executionId),
+          output_session_id: `npm-unit:${input.executionId}`,
           max_upload_bytes: 0,
           max_output_files: 0,
           max_requests: 1,
           iat: now,
           exp: now + env.EXECUTION_MANIFEST_TTL_SECONDS,
           execute_body_sha256: executionManifestBodySha256(body),
-          principal_source: input.principalSource,
+          principal_source: 'npm-unit',
         };
         body.execution_manifest = signExecutionManifestWithKey(claims, {
           privateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,

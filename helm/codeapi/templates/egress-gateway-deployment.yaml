@@ -52,8 +52,6 @@ spec:
               value: {{ printf "%.0f" (.Values.egressGateway.config.maxToolCallBytes | float64) | quote }}
             - name: CODEAPI_NPM_UNIT_ENABLED
               value: {{ .Values.npmUnit.enabled | quote }}
-            - name: CODEAPI_NPM_REGISTRY_ORIGIN
-              value: {{ .Values.npmUnit.registryOrigin | quote }}
             - name: CODEAPI_NPM_TARBALL_MAX_BYTES
               value: {{ .Values.npmUnit.tarballMaxBytes | quote }}
             - name: CODEAPI_NPM_FETCH_TIMEOUT_MS

@@ -1,5 +1,6 @@
 export const NPM_UNIT_KEEP = ['**/*.d.ts', 'package.json'] as const;
 export const NPM_FETCH_TOKEN_HEADER = 'X-CodeAPI-Npm-Fetch-Token';
+export const PUBLIC_NPM_REGISTRY_ORIGIN = 'https://registry.npmjs.org';
 
 const NPM_NAME_SEGMENT_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const EXACT_SEMVER_RE =
@@ -16,7 +17,7 @@ export interface NpmUnitRequest {
 
 export type NpmUnitFailureCode =
   | 'integrity_mismatch'
-  | 'not_found'
+  | 'not_publicly_fetchable'
   | 'registry_unavailable'
   | 'too_large'
   | 'decompression_limit'
@@ -25,11 +26,11 @@ export type NpmUnitFailureCode =
   | 'parse_failed';
 
 export interface NpmUnitFailure {
-  error: NpmUnitFailureCode | 'invalid_request' | 'disabled' | 'sandbox_unavailable';
+  error: NpmUnitFailureCode | 'invalid_request' | 'unsupported_registry' | 'disabled' | 'sandbox_unavailable';
   message: string;
   retryable: boolean;
   rejected?: NpmUnitRejected;
-  usage?: NpmUnitUsage;
+  usage?: Partial<NpmUnitUsage>;
 }
 
 export interface NpmUnitRejected {
@@ -44,6 +45,8 @@ export interface NpmUnitUsage {
   tarballBytes: number;
   unpackedBytes: number;
   peakRssBytes: number;
+  /** Peak bytes charged to the per-request cgroup, including descendants. */
+  cgroupPeakBytes?: number;
   wallMs: number;
 }
 
@@ -86,7 +89,10 @@ export interface NpmUnitSuccess {
 export type NpmUnitResponse = NpmUnitSuccess | NpmUnitFailure;
 
 export class NpmUnitValidationError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code: 'invalid_request' | 'unsupported_registry' = 'invalid_request',
+  ) {
     super(message);
     this.name = 'NpmUnitValidationError';
   }
@@ -125,27 +131,12 @@ function assertIntegrity(integrity: unknown): asserts integrity is string {
   }
 }
 
-function normalizedRegistryOrigin(raw: string): URL {
-  let registry: URL;
-  try {
-    registry = new URL(raw);
-  } catch {
-    throw new NpmUnitValidationError('The configured npm registry origin is invalid');
-  }
-  if (registry.protocol !== 'https:' || registry.username || registry.password || registry.search || registry.hash) {
-    throw new NpmUnitValidationError('The configured npm registry must be an HTTPS origin');
-  }
-  registry.pathname = registry.pathname.replace(/\/+$/, '');
-  return registry;
-}
-
-export function canonicalNpmTarballUrl(name: string, version: string, registryOrigin: string): string {
+export function canonicalNpmTarballUrl(name: string, version: string): string {
   assertNpmName(name);
   assertExactVersion(version);
-  const registry = normalizedRegistryOrigin(registryOrigin);
+  const registry = new URL(PUBLIC_NPM_REGISTRY_ORIGIN);
   const baseName = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
-  const registryPrefix = registry.pathname === '/' ? '' : registry.pathname;
-  registry.pathname = `${registryPrefix}/${name}/-/${baseName}-${version}.tgz`;
+  registry.pathname = `/${name}/-/${baseName}-${version}.tgz`;
   return registry.toString();
 }
 
@@ -153,7 +144,6 @@ function assertResolvedUrl(
   resolved: unknown,
   name: string,
   version: string,
-  registryOrigin: string,
 ): asserts resolved is string {
   if (typeof resolved !== 'string' || resolved.length > 2048) {
     throw new NpmUnitValidationError('resolved must be the package tarball URL');
@@ -162,9 +152,15 @@ function assertResolvedUrl(
   let expected: URL;
   try {
     actual = new URL(resolved);
-    expected = new URL(canonicalNpmTarballUrl(name, version, registryOrigin));
+    expected = new URL(canonicalNpmTarballUrl(name, version));
   } catch {
     throw new NpmUnitValidationError('resolved must be a valid registry tarball URL');
+  }
+  if (actual.origin !== PUBLIC_NPM_REGISTRY_ORIGIN) {
+    throw new NpmUnitValidationError(
+      `resolved must use the anonymous public npm registry at ${PUBLIC_NPM_REGISTRY_ORIGIN}`,
+      'unsupported_registry',
+    );
   }
   let actualPath: string;
   let expectedPath: string;
@@ -176,14 +172,13 @@ function assertResolvedUrl(
   }
   if (
     actual.protocol !== 'https:' ||
-    actual.origin !== expected.origin ||
     actual.username ||
     actual.password ||
     actual.search ||
     actual.hash ||
     actualPath !== expectedPath
   ) {
-    throw new NpmUnitValidationError('resolved must exactly match name@version on the configured registry');
+    throw new NpmUnitValidationError('resolved must exactly match name@version on the public npm registry');
   }
 }
 
@@ -197,7 +192,7 @@ function assertKeep(keep: unknown): asserts keep is NpmUnitRequest['keep'] {
   }
 }
 
-export function validateNpmUnitRequest(raw: unknown, registryOrigin: string): NpmUnitRequest {
+export function validateNpmUnitRequest(raw: unknown): NpmUnitRequest {
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new NpmUnitValidationError('Request body must be an object');
   }
@@ -210,13 +205,13 @@ export function validateNpmUnitRequest(raw: unknown, registryOrigin: string): Np
   assertNpmName(body.name);
   assertExactVersion(body.version);
   assertIntegrity(body.integrity);
-  assertResolvedUrl(body.resolved, body.name, body.version, registryOrigin);
+  assertResolvedUrl(body.resolved, body.name, body.version);
   assertKeep(body.keep);
   return {
     name: body.name,
     version: body.version,
     integrity: body.integrity,
-    resolved: canonicalNpmTarballUrl(body.name, body.version, registryOrigin),
+    resolved: canonicalNpmTarballUrl(body.name, body.version),
     keep: [...NPM_UNIT_KEEP],
   };
 }

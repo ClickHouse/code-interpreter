@@ -33,8 +33,21 @@ function failure(
   error: string,
   message: string,
   retryable: boolean,
+  usage?: Record<string, number>,
 ): Response {
-  return res.status(status).json({ error, message, retryable });
+  return res.status(status).json({ error, message, retryable, ...(usage ? { usage } : {}) });
+}
+
+function parentObservedUsage(
+  started: number,
+  tarballBytes: number,
+  cgroupPeakBytes: number | null | undefined,
+): Record<string, number> {
+  return {
+    tarballBytes,
+    ...(cgroupPeakBytes == null ? {} : { cgroupPeakBytes }),
+    wallMs: Math.round(performance.now() - started),
+  };
 }
 
 function validateBody(raw: unknown): NpmUnitSandboxBody {
@@ -122,7 +135,8 @@ async function gatewayError(response: globalThis.Response): Promise<{ error: str
 }
 
 function publicStatus(error: string, retryable: boolean): number {
-  if (error === 'not_found') return 404;
+  if (error === 'not_publicly_fetchable') return 404;
+  if (error === 'unsupported_registry' || error === 'invalid_request') return 400;
   if (error === 'too_large' || error === 'decompression_limit') return 413;
   if (error === 'integrity_mismatch' || error === 'unsafe_entry' || error === 'parse_failed') return 422;
   if (error === 'timeout') return 504;
@@ -225,17 +239,21 @@ router.post('/npm-unit', express.json({ limit: '64kb' }), async (req: Request, r
       timeouts: { compile: 0, run: config.npm_unit_run_timeout },
       cpu_times: { compile: 0, run: config.npm_unit_cpu_time },
       memory_limits: { compile: config.npm_unit_memory_limit, run: config.npm_unit_memory_limit },
+      report_memory_peak: true,
     });
     await job.prime();
     const result = await job.execute();
     const run = result.run ?? result.compile;
-    if (run?.status === 'TO') return failure(res, 504, 'timeout', 'Package parsing exceeded the wall-clock limit', false);
+    const observedUsage = parentObservedUsage(started, tarball.length, run?.memory);
+    if (run?.status === 'TO') {
+      return failure(res, 504, 'timeout', 'Package parsing exceeded the wall-clock limit', false, observedUsage);
+    }
     if (run?.message === 'Out of memory' || run?.signal === 'SIGKILL') {
-      return failure(res, 413, 'too_large', 'Package parsing exceeded the sandbox resource limit', false);
+      return failure(res, 413, 'too_large', 'Package parsing exceeded the sandbox resource limit', false, observedUsage);
     }
     if (!run || run.code !== 0) {
       logger.warn({ executionId: body.execution_id, status: run?.status, code: run?.code }, 'npm unit worker failed');
-      return failure(res, 422, 'parse_failed', 'Package surface could not be parsed', false);
+      return failure(res, 422, 'parse_failed', 'Package surface could not be parsed', false, observedUsage);
     }
     let response: Record<string, unknown>;
     try {
@@ -246,6 +264,9 @@ router.post('/npm-unit', express.json({ limit: '64kb' }), async (req: Request, r
     const usage = response.usage;
     if (usage && typeof usage === 'object') {
       (usage as Record<string, unknown>).wallMs = Math.round(performance.now() - started);
+      if (run.memory != null) {
+        (usage as Record<string, unknown>).cgroupPeakBytes = run.memory;
+      }
     }
     if (typeof response.error === 'string') {
       const retryable = response.retryable === true;
