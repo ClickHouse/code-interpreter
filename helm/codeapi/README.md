@@ -45,6 +45,34 @@ to a values file.
 is publicly known (the same keypair is hardcoded in the unit tests), so never
 use it outside local development.
 
+## Stateless npm declaration indexing (opt in)
+
+Set `npmUnit.enabled=true` to expose `POST /v1/sandbox/npm-unit`. The route
+accepts one exact `name@version`, one SHA-512 SRI digest, the canonical tarball
+URL on `npmUnit.registryOrigin`, and the fixed keep set
+`["**/*.d.ts", "package.json"]`. It returns deterministic declaration symbols,
+imports, rejection counters, and resource usage without running package code,
+install scripts, or `tsc`.
+
+The feature is off by default because enabling it gives only the egress-gateway
+public TCP/443 access. Kubernetes NetworkPolicy still excludes private,
+loopback, link-local, carrier-grade NAT, benchmark, multicast, and reserved
+IPv4 ranges. At the application layer the worker mints a short-lived encrypted
+capability for the exact registry tarball, cross-origin redirects are refused,
+the tarball is byte-capped in transit, and the parse stage runs in a fresh
+network-disabled NsJail with route-specific memory, CPU, wall-clock,
+decompression, entry, file, retained-byte, and response limits.
+
+The route is a synchronous API → service-worker → sandbox request and never
+creates a BullMQ job or persists an npm-unit result. Capacity is fail-fast: a
+busy dispatcher returns a retryable structured failure instead of retaining a
+background job after the caller disconnects.
+
+The main tuning values live under `npmUnit`; defaults are 8 concurrent requests, a
+32 MiB compressed tarball, 64 MiB decompressed archive, 384 MiB cgroup memory,
+and 15 seconds of parse time. Rebuild the sandbox/package image when enabling
+the route so the pinned `web-tree-sitter` and grammar WASM assets are present.
+
 ## Production deployment notes
 
 This chart deploys the full service stack on a single cluster and is the

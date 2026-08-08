@@ -10,6 +10,7 @@
 import express, { json, Router } from 'express';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
+import npmUnitRouter from './service/npm-unit-router';
 import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-error-logger';
 import { localAuth } from './auth/local';
 import { pyQueue, otherQueue, pyQueueEvents, otherQueueEvents, connection } from './queue';
@@ -44,6 +45,7 @@ app.get('/v1/health', async (_, res) => {
 v1.use(localAuth);
 v1.use(serviceRouter);
 v1.use(programmaticRouter);
+v1.use(npmUnitRouter);
 app.use('/v1', v1);
 app.use(requestNotFoundLogger);
 app.use(requestErrorLogger);

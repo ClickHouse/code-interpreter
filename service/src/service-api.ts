@@ -4,6 +4,7 @@ import { apiKeyAuth } from './middleware/auth';
 import { requestErrorLogger, requestNotFoundLogger } from './middleware/request-error-logger';
 import serviceRouter from './service/router';
 import programmaticRouter from './service/programmatic-router';
+import npmUnitRouter from './service/npm-unit-router';
 import { connection } from './queue';
 import { env } from './config';
 import logger from './logger';
@@ -30,6 +31,7 @@ v1.use(apiKeyAuth);
 
 v1.use(serviceRouter);
 v1.use(programmaticRouter);
+v1.use(npmUnitRouter);
 
 app.use('/v1', v1);
 app.use(requestNotFoundLogger);
